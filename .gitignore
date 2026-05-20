@@ -1,0 +1,14 @@
+# Video assets
+assets/clips/*.mp4
+*.mp4
+
+# Local data caches and databases
+data/*.db
+data/*.csv
+
+# System / IDE files
+.DS_Store
+.idea/
+.vscode/
+target/
+build/
