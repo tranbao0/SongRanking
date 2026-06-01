@@ -1,0 +1,58 @@
+{
+  "font_bold":    "C:/Windows/Fonts/arialbd.ttf",
+  "font_regular": "C:/Windows/Fonts/arial.ttf",
+
+  "bar": {
+    "height": 130,
+    "color":  "black@0.80"
+  },
+
+  "rank": {
+    "x": 20,
+    "y_offset": 10,
+    "fontsize": 54,
+    "color": "FFD700"
+  },
+
+  "title": {
+    "x": 150,
+    "y_offset": 14,
+    "fontsize": 48,
+    "color": "white"
+  },
+
+  "stats": {
+    "y_offset": 80,
+    "peak": {
+      "label_x": 20,
+      "value_x":  140,
+      "fontsize":  32,
+      "label_color": "white",
+      "value_color": "00E5FF"
+    },
+    "years": {
+      "label_x": 260,
+      "value_x":  570,
+      "fontsize":  32,
+      "label_color": "white",
+      "value_color": "69FF47"
+    },
+    "views": {
+      "label_x": 640,
+      "value_x":  760,
+      "fontsize":  32,
+      "label_color": "white",
+      "value_color": "FFD700"
+    }
+  },
+
+  "new_entry_badge": {
+    "x": "iw-210",
+    "y": "ih-130",
+    "width":  190,
+    "height": 130,
+    "bg_color":   "3333CC@0.90",
+    "text_color": "white",
+    "fontsize": 38
+  }
+}

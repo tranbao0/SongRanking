@@ -4,7 +4,7 @@ assets/clips/*.mp4
 
 # Local data caches and databases
 data/*.db
-data/*.csv
+assets/clips/_concat_list.txt
 
 # System / IDE files
 .DS_Store
