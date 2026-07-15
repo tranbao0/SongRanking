@@ -20,7 +20,7 @@ def _font(path):
     return path.replace(":/", "\\:/")
 
 
-def build_vf(style, *, rank, title, artist, peak, years_on_chart, views, is_new_entry=False, views_gained=None):
+def build_vf(style, *, rank, title, artist, peak, years_on_chart, views, is_new_entry=False, views_gained=None, rank_change=""):
     """
     Build and return the full ffmpeg -vf filter string for the bottom-bar overlay.
 
@@ -94,6 +94,18 @@ def build_vf(style, *, rank, title, artist, peak, years_on_chart, views, is_new_
          f":x={s['views']['value_x']}:y=H-{bh}+{s['y_offset']}"
          f":fontsize={s['views']['fontsize']}:fontcolor={s['views']['value_color']}"),
     ]
+
+    # ── Rank change indicator (↑ / ↓ / −, omitted on first run) ────────────
+    if rank_change:
+        rc = style["rank_change"]
+        color_map = {"↑": rc["color_up"], "↓": rc["color_down"], "−": rc["color_same"]}
+        rc_color = color_map.get(rank_change, rc["color_same"])
+        parts.append(
+            f"drawtext=fontfile='{fb}'"
+            f":text='{_esc(rank_change)}'"
+            f":x={rc['x']}:y=H-{bh}+{rc['y_offset']}"
+            f":fontsize={rc['fontsize']}:fontcolor={rc_color}"
+        )
 
     # ── Views gained (only when last_views was available) ───────────────────
     if views_gained is not None:

@@ -19,7 +19,7 @@ import sys
 import os
 
 OUTPUT_FILE = "data/songs.csv"
-FIELDNAMES  = ["rank", "title", "artist", "url", "peak", "is_new_entry", "start", "end", "years_on_chart", "last_views"]
+FIELDNAMES  = ["rank", "title", "artist", "url", "peak", "is_new_entry", "start", "end", "years_on_chart", "last_views", "last_rank"]
 
 
 def clean_url(url):
@@ -89,6 +89,7 @@ def prompt_song_details(rank_default, title, artist, url):
         "end":          end,
         "years_on_chart": "",
         "last_views":     "",
+        "last_rank":      "",
     }
 
 

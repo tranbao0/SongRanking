@@ -46,6 +46,15 @@
     }
   },
 
+  "rank_change": {
+    "x": 115,
+    "y_offset": 20,
+    "fontsize": 30,
+    "color_up":   "00FF88",
+    "color_down": "FF4444",
+    "color_same": "AAAAAA"
+  },
+
   "views_delta": {
     "x": 960,
     "fontsize": 32,

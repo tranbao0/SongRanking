@@ -6,6 +6,13 @@ assets/clips/*.mp4
 data/*.db
 assets/clips/_concat_list.txt
 
+# API keys and secrets
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+
 # System / IDE files
 .DS_Store
 .idea/

@@ -44,29 +44,46 @@ def pre_fetch_all(songs):
     # Sort descending: rank 1 = most views
     enriched.sort(key=lambda s: s["_meta"]["views"], reverse=True)
 
-    # Assign view-count-based ranks (override CSV rank)
+    # Assign view-count-based ranks and compute rank change vs last run
     for i, song in enumerate(enriched):
-        song["rank"] = str(i + 1)
+        new_rank = i + 1
+        song["rank"] = str(new_rank)
+
+        raw_last_rank = song.get("last_rank", "").strip()
+        if raw_last_rank:
+            last_rank = int(raw_last_rank)
+            if new_rank < last_rank:
+                song["_rank_change"] = "↑"
+            elif new_rank > last_rank:
+                song["_rank_change"] = "↓"
+            else:
+                song["_rank_change"] = "−"
+        else:
+            song["_rank_change"] = ""  # first run — no prior rank
 
     print()
     return enriched
 
 
-def save_views(songs, csv_path):
-    """Write current view counts into last_views for the next run."""
+def save_run_state(songs, csv_path):
+    """Write current views and ranks into last_views/last_rank for the next run."""
     views_map = {s["url"]: s["_meta"]["views"] for s in songs}
+    rank_map  = {s["url"]: s["rank"] for s in songs}
 
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
         fieldnames = list(reader.fieldnames or [])
 
-    if "last_views" not in fieldnames:
-        fieldnames.append("last_views")
+    for col in ("last_views", "last_rank"):
+        if col not in fieldnames:
+            fieldnames.append(col)
 
     for row in rows:
-        if row.get("url") in views_map:
-            row["last_views"] = str(views_map[row["url"]])
+        url = row.get("url")
+        if url in views_map:
+            row["last_views"] = str(views_map[url])
+            row["last_rank"]  = str(rank_map[url])
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -75,7 +92,8 @@ def save_views(songs, csv_path):
 
 
 def process_song(style, rank, title, artist, url, peak, is_new_entry,
-                 views, years_on_chart, views_gained=None, start="00:01:00", end="00:01:15"):
+                 views, years_on_chart, views_gained=None, rank_change="",
+                 start="00:01:00", end="00:01:15"):
     print(f"--- Processing Rank {rank}: {title} ---")
 
     slug       = safe_filename(title)
@@ -101,6 +119,7 @@ def process_song(style, rank, title, artist, url, peak, is_new_entry,
         peak=peak, years_on_chart=years_on_chart,
         views=views, is_new_entry=is_new_entry,
         views_gained=views_gained,
+        rank_change=rank_change,
     )
     subprocess.run([
         "ffmpeg", "-i", raw_clip,
@@ -152,9 +171,11 @@ def main():
 
     print("Rankings by view count:")
     for s in ranked:
-        gained = s["_views_gained"]
-        gained_str = f"  (+{gained:,} gained)" if gained is not None else ""
-        print(f"  Rank {s['rank']}: {s['title']} — {s['_meta']['views']:,} views{gained_str}")
+        gained      = s["_views_gained"]
+        gained_str  = f"  (+{gained:,} gained)" if gained is not None else ""
+        change      = s["_rank_change"]
+        change_str  = f"  {change}" if change else "  (new)"
+        print(f"  Rank {s['rank']}{change_str}: {s['title']} — {s['_meta']['views']:,} views{gained_str}")
     print()
 
     # Process in countdown order so the final file plays rank N → rank 1
@@ -178,6 +199,7 @@ def main():
                 url=song["url"], peak=peak, is_new_entry=is_new_entry,
                 views=meta["views"], years_on_chart=years,
                 views_gained=song["_views_gained"],
+                rank_change=song["_rank_change"],
                 start=start, end=end,
             )
             completed.append(clip)
@@ -189,8 +211,8 @@ def main():
     if completed:
         concatenate_clips(completed)
 
-    save_views(ranked, DATA_FILE)
-    print("Updated last_views in CSV for next run.\n")
+    save_run_state(ranked, DATA_FILE)
+    print("Updated last_views and last_rank in CSV for next run.\n")
 
     if failed:
         print("\nFailed songs:")
