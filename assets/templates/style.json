@@ -61,13 +61,18 @@
     "color": "00FF88"
   },
 
-  "new_entry_badge": {
-    "x": "iw-210",
-    "y": "ih-130",
-    "width":  190,
-    "height": 130,
-    "bg_color":   "3333CC@0.90",
-    "text_color": "white",
-    "fontsize": 38
+  "badge": {
+    "x":          "iw-210",
+    "y":          "ih-130",
+    "width":      190,
+    "height":     130,
+    "text_color": "white"
+  },
+
+  "badge_types": {
+    "new_entry":        {"line1": "NEW",     "line2": "ENTRY",    "bg_color": "3333CC@0.90", "fontsize": 38},
+    "re_entry":         {"line1": "RE",      "line2": "ENTRY",    "bg_color": "7B00CC@0.90", "fontsize": 38},
+    "highest_increase": {"line1": "HIGHEST", "line2": "INCREASE", "bg_color": "CC6600@0.90", "fontsize": 28},
+    "highest_jump":     {"line1": "HIGHEST", "line2": "JUMP",     "bg_color": "006633@0.90", "fontsize": 32}
   }
 }
