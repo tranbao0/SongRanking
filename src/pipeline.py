@@ -32,8 +32,14 @@ def pre_fetch_all(songs):
         except subprocess.CalledProcessError as e:
             print(f"    WARNING: metadata fetch failed ({e}), skipping.")
             continue
-        print(f"    Views: {meta['views']:,}  |  Release year: {meta['release_year']}")
-        enriched.append({**song, "_meta": meta})
+
+        raw_last = song.get("last_views", "").strip()
+        last_views = int(raw_last) if raw_last else None
+        views_gained = meta["views"] - last_views if last_views is not None else None
+
+        gained_str = f"  |  +{views_gained:,} gained" if views_gained is not None else ""
+        print(f"    Views: {meta['views']:,}  |  Release year: {meta['release_year']}{gained_str}")
+        enriched.append({**song, "_meta": meta, "_views_gained": views_gained})
 
     # Sort descending: rank 1 = most views
     enriched.sort(key=lambda s: s["_meta"]["views"], reverse=True)
@@ -46,8 +52,30 @@ def pre_fetch_all(songs):
     return enriched
 
 
+def save_views(songs, csv_path):
+    """Write current view counts into last_views for the next run."""
+    views_map = {s["url"]: s["_meta"]["views"] for s in songs}
+
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        fieldnames = list(reader.fieldnames or [])
+
+    if "last_views" not in fieldnames:
+        fieldnames.append("last_views")
+
+    for row in rows:
+        if row.get("url") in views_map:
+            row["last_views"] = str(views_map[row["url"]])
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def process_song(style, rank, title, artist, url, peak, is_new_entry,
-                 views, years_on_chart, start="00:01:00", end="00:01:15"):
+                 views, years_on_chart, views_gained=None, start="00:01:00", end="00:01:15"):
     print(f"--- Processing Rank {rank}: {title} ---")
 
     slug       = safe_filename(title)
@@ -72,6 +100,7 @@ def process_song(style, rank, title, artist, url, peak, is_new_entry,
         rank=rank, title=title, artist=artist,
         peak=peak, years_on_chart=years_on_chart,
         views=views, is_new_entry=is_new_entry,
+        views_gained=views_gained,
     )
     subprocess.run([
         "ffmpeg", "-i", raw_clip,
@@ -123,7 +152,9 @@ def main():
 
     print("Rankings by view count:")
     for s in ranked:
-        print(f"  Rank {s['rank']}: {s['title']} — {s['_meta']['views']:,} views")
+        gained = s["_views_gained"]
+        gained_str = f"  (+{gained:,} gained)" if gained is not None else ""
+        print(f"  Rank {s['rank']}: {s['title']} — {s['_meta']['views']:,} views{gained_str}")
     print()
 
     # Process in countdown order so the final file plays rank N → rank 1
@@ -146,6 +177,7 @@ def main():
                 rank=song["rank"], title=song["title"], artist=song["artist"],
                 url=song["url"], peak=peak, is_new_entry=is_new_entry,
                 views=meta["views"], years_on_chart=years,
+                views_gained=song["_views_gained"],
                 start=start, end=end,
             )
             completed.append(clip)
@@ -156,6 +188,9 @@ def main():
     # Concatenate in the order they were processed (countdown N → 1)
     if completed:
         concatenate_clips(completed)
+
+    save_views(ranked, DATA_FILE)
+    print("Updated last_views in CSV for next run.\n")
 
     if failed:
         print("\nFailed songs:")

@@ -20,7 +20,7 @@ def _font(path):
     return path.replace(":/", "\\:/")
 
 
-def build_vf(style, *, rank, title, artist, peak, years_on_chart, views, is_new_entry=False):
+def build_vf(style, *, rank, title, artist, peak, years_on_chart, views, is_new_entry=False, views_gained=None):
     """
     Build and return the full ffmpeg -vf filter string for the bottom-bar overlay.
 
@@ -94,6 +94,18 @@ def build_vf(style, *, rank, title, artist, peak, years_on_chart, views, is_new_
          f":x={s['views']['value_x']}:y=H-{bh}+{s['y_offset']}"
          f":fontsize={s['views']['fontsize']}:fontcolor={s['views']['value_color']}"),
     ]
+
+    # ── Views gained (only when last_views was available) ───────────────────
+    if views_gained is not None:
+        vd = style["views_delta"]
+        sign = "+" if views_gained >= 0 else ""
+        delta_esc = _esc(f"{sign}{views_gained:,}")
+        parts.append(
+            f"drawtext=fontfile='{fb}'"
+            f":text='{delta_esc}'"
+            f":x={vd['x']}:y=H-{bh}+{s['y_offset']}"
+            f":fontsize={vd['fontsize']}:fontcolor={vd['color']}"
+        )
 
     # ── NEW ENTRY badge ──────────────────────────────────────────────────────
     # Rendered as a solid rectangle + two text lines.

@@ -46,6 +46,12 @@
     }
   },
 
+  "views_delta": {
+    "x": 960,
+    "fontsize": 32,
+    "color": "00FF88"
+  },
+
   "new_entry_badge": {
     "x": "iw-210",
     "y": "ih-130",

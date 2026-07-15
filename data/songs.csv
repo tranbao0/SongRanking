@@ -1,4 +1,4 @@
-rank,title,artist,url,peak,is_new_entry,start,end,years_on_chart
-1,GO,BLACKPINK,https://www.youtube.com/watch?v=2GJfWMYCWY0,1,true,00:01:00,00:01:15,
-2,JUMP,BLACKPINK,https://www.youtube.com/watch?v=CgCVZdcKcqY,2,true,00:01:00,00:01:15,
-3,DDU-DU DDU-DU,BLACKPINK,https://www.youtube.com/watch?v=IHNzOHi8sJs,3,true,00:01:00,00:01:15,
+rank,title,artist,url,peak,is_new_entry,start,end,years_on_chart,last_views
+1,GO,BLACKPINK,https://www.youtube.com/watch?v=2GJfWMYCWY0,1,true,00:01:00,00:01:15,,86441231
+2,JUMP,BLACKPINK,https://www.youtube.com/watch?v=CgCVZdcKcqY,2,true,00:01:00,00:01:15,,409106772
+3,DDU-DU DDU-DU,BLACKPINK,https://www.youtube.com/watch?v=IHNzOHi8sJs,3,true,00:01:00,00:01:15,,2398551773
