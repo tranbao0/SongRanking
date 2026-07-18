@@ -37,14 +37,14 @@ make update            # install all Python dependencies
 ## Commands
 
 ```bash
-make update                               # update all dependencies
+python run.py update                                # update all dependencies
 
-make csv                                  # rank and render all songs in CSV
-make csv LIMIT=10                         # top 10 from CSV only
+python run.py csv                                   # rank and render all songs in CSV
+python run.py csv --limit 10                        # top 10 from CSV only
 
-make search                               # search YouTube for "kpop songs", top 20
-make search Q="blackpink songs"           # custom query, top 20
-make search Q="blackpink songs" LIMIT=10  # custom query, top 10
+python run.py search                                # search YouTube for "kpop songs"
+python run.py search --q "blackpink songs"          # custom query, top 20
+python run.py search --q "blackpink songs" --limit 10  # custom query, top 10
 ```
 
 > **Note:** Video clips and databases are excluded from version control via `.gitignore` to avoid hitting GitHub file size limits.
