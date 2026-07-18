@@ -23,12 +23,28 @@ SongRanking/
 
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp)
 - [FFmpeg](https://ffmpeg.org/)
+- Python 3.10+
 
 ## Setup
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/SongRanking.git
 cd SongRanking
+cp .env.example .env   # add your GEMINI_API_KEY and YOUTUBE_API_KEY
+make update            # install all Python dependencies
+```
+
+## Commands
+
+```bash
+make update                               # update all dependencies
+
+make csv                                  # rank and render all songs in CSV
+make csv LIMIT=10                         # top 10 from CSV only
+
+make search                               # search YouTube for "kpop songs", top 20
+make search Q="blackpink songs"           # custom query, top 20
+make search Q="blackpink songs" LIMIT=10  # custom query, top 10
 ```
 
 > **Note:** Video clips and databases are excluded from version control via `.gitignore` to avoid hitting GitHub file size limits.

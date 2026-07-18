@@ -4,8 +4,23 @@ import os
 import re
 import argparse
 
-from metadata import fetch_metadata
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from overlay import load_style, build_vf
+
+# Use YouTube Data API if key is present, otherwise fall back to yt-dlp.
+_YT_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
+if _YT_API_KEY:
+    from youtube_api import fetch_metadata, search_kpop as _search_fn
+    print("[backend] YouTube Data API v3")
+else:
+    from metadata import fetch_metadata
+    from search import search_kpop as _search_fn
+    print("[backend] yt-dlp (no YOUTUBE_API_KEY set)")
 
 
 def safe_filename(text, max_len=50):
@@ -215,6 +230,8 @@ def save_run_state(songs, csv_path):
             "last_rank":     "",
         }
         row["rank"]       = str(rank_map[url])
+        row["title"]      = song["title"]
+        row["artist"]     = song["artist"]
         row["last_views"] = str(views_map[url])
         row["last_rank"]  = str(rank_map[url])
         row["peak"]       = str(peak_map[url])
@@ -244,17 +261,23 @@ def process_song(style, rank, title, artist, url, peak, entry_type,
     raw_clip   = f"{CLIPS_DIR}/raw_{slug}_rank{rank}.mp4"
     final_clip = f"{CLIPS_DIR}/final_{slug}_rank{rank}.mp4"
 
-    print("  Downloading clip...")
-    subprocess.run([
-        "yt-dlp",
-        "--download-sections", f"*{start}-{end}",
-        "-S", "res:1080,vcodec:h264,ext:mp4:m4a",
-        "--no-playlist",
-        "-o", raw_clip,
-        url,
-    ], check=True)
+    # ── Step 1: download clip ────────────────────────────────────────────────
+    print("  [1/2] Downloading clip...")
+    try:
+        subprocess.run([
+            "yt-dlp",
+            "--download-sections", f"*{start}-{end}",
+            "-S", "res:1080,vcodec:h264,ext:mp4:m4a",
+            "--extractor-args", "youtube:player_client=ios",
+            "--no-playlist",
+            "-o", raw_clip,
+            url,
+        ], check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"DOWNLOAD failed (yt-dlp exit {e.returncode})") from e
 
-    print("  Rendering overlay...")
+    # ── Step 2: burn overlay ─────────────────────────────────────────────────
+    print("  [2/2] Rendering overlay...")
     vf = build_vf(
         style,
         rank=rank, title=title, artist=artist,
@@ -263,13 +286,16 @@ def process_song(style, rank, title, artist, url, peak, entry_type,
         views_gained=views_gained,
         rank_change=rank_change,
     )
-    subprocess.run([
-        "ffmpeg", "-i", raw_clip,
-        "-vf", vf,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-        "-c:a", "copy",
-        "-y", final_clip,
-    ], check=True)
+    try:
+        subprocess.run([
+            "ffmpeg", "-i", raw_clip,
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+            "-c:a", "copy",
+            "-y", final_clip,
+        ], check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"OVERLAY failed (ffmpeg exit {e.returncode})") from e
 
     os.remove(raw_clip)
     print(f"  Done -> {final_clip}\n")
@@ -313,8 +339,8 @@ def main():
         help='Search YouTube for songs instead of reading songs.csv, e.g. "kpop songs 2024"',
     )
     parser.add_argument(
-        "--limit", type=int, default=20,
-        help="Number of songs to include when using --search (default: 20)",
+        "--limit", type=int, default=None,
+        help="Max songs to process. In search mode defaults to 20. In CSV mode processes all unless set.",
     )
     parser.add_argument(
         "--no-filter", dest="no_filter", action="store_true",
@@ -326,16 +352,32 @@ def main():
     style = load_style(STYLE_FILE)
 
     if args.search:
-        from search import search_kpop
-        print(f'Searching YouTube: "{args.search}" (fetching top {args.limit})...\n')
-        results = search_kpop(args.search, limit=args.limit, filter_mv=not args.no_filter)
+        from title_cleaner import clean_titles
+        search_limit = args.limit or 20
+        print(f'Searching YouTube: "{args.search}" (fetching top {search_limit})...\n')
+        results = _search_fn(args.search, limit=search_limit, filter_mv=not args.no_filter)
         if not results:
             print("No search results returned. Exiting.")
             return
         history = load_history(DATA_FILE)
         songs   = songs_from_search(results, history)
+        print("Cleaning up titles via AI...")
+        songs = clean_titles(songs)
+
+        # Merge in any CSV songs that weren't returned by the search
+        if os.path.exists(DATA_FILE):
+            csv_songs   = load_songs(DATA_FILE)
+            search_urls = {s["url"] for s in songs}
+            extra       = [s for s in csv_songs if s["url"] not in search_urls]
+            if extra:
+                print(f"  Merging {len(extra)} existing CSV song(s) into ranking.\n")
+                songs = songs + extra
     else:
         songs = load_songs(DATA_FILE)
+        if args.limit:
+            songs.sort(key=lambda s: int(s.get("rank") or 9999))
+            songs = songs[:args.limit]
+            print(f"  Using top {args.limit} songs from CSV.\n")
 
     ranked = pre_fetch_all(songs)
     determine_badges(ranked)
@@ -373,8 +415,8 @@ def main():
                 start=start, end=end,
             )
             completed.append(clip)
-        except subprocess.CalledProcessError as e:
-            print(f"  ERROR: Rank {song['rank']} ({song['title']}) failed — skipping. ({e})\n")
+        except (subprocess.CalledProcessError, RuntimeError) as e:
+            print(f"  ERROR: Rank {song['rank']} ({song['title']}) — {e}\n")
             failed.append((song["rank"], song["title"]))
 
     if completed:
