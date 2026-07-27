@@ -4,6 +4,7 @@ assets/clips/*.mp4
 
 # Local data caches and databases
 data/*.db
+data/.yt_dlp_update_check.json
 assets/clips/_concat_list.txt
 
 # API keys and secrets

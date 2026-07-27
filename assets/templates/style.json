@@ -2,77 +2,106 @@
   "font_bold":    "C:/Windows/Fonts/malgunbd.ttf",
   "font_regular": "C:/Windows/Fonts/malgun.ttf",
 
+  "canvas": {
+    "width":  1920,
+    "height": 1080,
+    "fps":    30
+  },
+
   "bar": {
-    "height": 130,
-    "color":  "black@0.80"
+    "solid_height": 180,
+    "fade_height":  90,
+    "color":        [8, 9, 18],
+    "opacity":      0.93,
+    "accent_line": {
+      "height":      3,
+      "color_left":  [124, 58, 237],
+      "color_right": [56, 189, 248],
+      "opacity":     0.85
+    },
+    "margin_left":  56,
+    "margin_right": 56,
+    "padding_top":  26
   },
 
   "rank": {
-    "x": 20,
-    "y_offset": 10,
-    "fontsize": 54,
-    "color": "FFD700"
+    "fontsize":        88,
+    "gradient_top":    [255, 244, 194],
+    "gradient_bottom": [255, 183, 46],
+    "shadow_color":    [0, 0, 0],
+    "shadow_alpha":    130,
+    "shadow_offset":   [0, 3]
+  },
+
+  "divider": {
+    "gap":    28,
+    "width":  2,
+    "color":  [255, 255, 255],
+    "alpha":  55
   },
 
   "title": {
-    "x": 150,
-    "y_offset": 14,
-    "fontsize": 48,
-    "color": "white"
+    "fontsize":        46,
+    "color":            [255, 255, 255],
+    "max_width_reserve": 260,
+    "separator":        "  •  ",
+    "separator_color":  [130, 134, 160],
+    "artist_fontsize":  27,
+    "artist_color":     [160, 165, 195]
   },
 
+  "row_gap": 22,
+
   "stats": {
-    "y_offset": 80,
-    "peak": {
-      "label_x": 20,
-      "value_x":  140,
-      "fontsize":  32,
-      "label_color": "white",
-      "value_color": "00E5FF"
-    },
-    "years": {
-      "label_x": 260,
-      "value_x":  570,
-      "fontsize":  32,
-      "label_color": "white",
-      "value_color": "69FF47"
-    },
-    "views": {
-      "label_x": 640,
-      "value_x":  760,
-      "fontsize":  32,
-      "label_color": "white",
-      "value_color": "FFD700"
-    }
+    "chip_height":   44,
+    "chip_gap":      14,
+    "chip_radius":   12,
+    "chip_bg_alpha": 26,
+    "chip_padding_x":16,
+    "dot_diameter":  9,
+    "dot_gap":       10,
+    "value_gap":     8,
+    "label_fontsize":19,
+    "value_fontsize":25,
+    "label_color":   [175, 178, 200],
+    "items": [
+      {"key": "peak",  "label": "PEAK",  "dot_color": [0, 229, 255],  "value_color": [0, 229, 255]},
+      {"key": "years", "label": "YEARS", "dot_color": [105, 255, 113],"value_color": [105, 255, 113]},
+      {"key": "views", "label": "VIEWS", "dot_color": [255, 215, 0],  "value_color": [255, 215, 0]}
+    ],
+    "delta_gap":       8,
+    "delta_fontsize":  18,
+    "delta_color_up":  [0, 255, 136],
+    "delta_color_down":[255, 68, 68]
   },
 
   "rank_change": {
-    "x": 115,
-    "y_offset": 20,
-    "fontsize": 30,
-    "color_up":   "00FF88",
-    "color_down": "FF4444",
-    "color_same": "AAAAAA"
-  },
-
-  "views_delta": {
-    "x": 960,
-    "fontsize": 32,
-    "color": "00FF88"
+    "chip_gap":      10,
+    "fontsize":      22,
+    "color_up":      [0, 255, 136],
+    "color_down":    [255, 68, 68],
+    "color_same":    [170, 170, 170]
   },
 
   "badge": {
-    "x":          "iw-210",
-    "y":          "ih-130",
-    "width":      190,
-    "height":     130,
-    "text_color": "white"
+    "diameter":       176,
+    "margin_right":   64,
+    "center_y_offset": 0,
+    "ring_color":     [255, 255, 255],
+    "ring_alpha":     140,
+    "ring_width":     3,
+    "glow_blur":      16,
+    "glow_alpha":     120,
+    "fontsize":       28,
+    "min_fontsize":   16,
+    "line_gap":       4,
+    "text_color":     [255, 255, 255]
   },
 
   "badge_types": {
-    "new_entry":        {"line1": "NEW",     "line2": "ENTRY",    "bg_color": "3333CC@0.90", "fontsize": 38},
-    "re_entry":         {"line1": "RE",      "line2": "ENTRY",    "bg_color": "7B00CC@0.90", "fontsize": 38},
-    "highest_increase": {"line1": "HIGHEST", "line2": "INCREASE", "bg_color": "CC6600@0.90", "fontsize": 28},
-    "highest_jump":     {"line1": "HIGHEST", "line2": "JUMP",     "bg_color": "006633@0.90", "fontsize": 32}
+    "new_entry":        {"line1": "NEW",     "line2": "ENTRY",    "gradient": [[79, 70, 229], [147, 51, 234]]},
+    "re_entry":         {"line1": "RE",      "line2": "ENTRY",    "gradient": [[147, 51, 234], [219, 39, 119]]},
+    "highest_increase": {"line1": "HIGHEST", "line2": "INCREASE", "gradient": [[234, 88, 12], [250, 204, 21]]},
+    "highest_jump":     {"line1": "HIGHEST", "line2": "JUMP",     "gradient": [[5, 150, 105], [16, 185, 129]]}
   }
 }
