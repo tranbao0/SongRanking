@@ -1,4 +1,4 @@
-# K-Pop Chart Video Automation Engine
+# Song Ranking Video Automation Engine
 
 An automated pipeline designed to fetch streaming/view metrics, sort track rankings, manage a local video asset library, and programmatically render compilation videos.
 
