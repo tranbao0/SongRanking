@@ -165,9 +165,20 @@ def build_overlay_image(style, *, rank, title, artist, peak, years_on_chart, vie
     rank_w, rank_h = _draw_gradient_text(img, draw, left_x, row1_y, rank_text, rank_font,
                                           _rgb(r["gradient_top"]), _rgb(r["gradient_bottom"]))
     row1_center_y = row1_y + rank_h / 2
+    next_x = left_x + rank_w
+
+    if rank_change:
+        rc = style["rank_change"]
+        rc_font = _font(fb, rc["fontsize"])
+        color_map = {"↑": rc["color_up"], "↓": rc["color_down"], "−": rc["color_same"]}
+        rc_h = _measure(draw, rc_font, rank_change)[3]
+        next_x += rc["chip_gap"]
+        rc_w, _ = _draw_text(draw, next_x, row1_center_y - rc_h / 2, rank_change, rc_font,
+                              _rgba(color_map.get(rank_change, rc["color_same"])))
+        next_x += rc_w
 
     d = style["divider"]
-    div_x = left_x + rank_w + d["gap"]
+    div_x = next_x + d["gap"]
     draw.line([(div_x, row1_center_y - rank_h * 0.4), (div_x, row1_center_y + rank_h * 0.4)],
               fill=_rgba(d["color"], d["alpha"]), width=d["width"])
 
@@ -261,15 +272,6 @@ def build_overlay_image(style, *, rank, title, artist, peak, years_on_chart, vie
             dh = _measure(draw, delta_font, extra_render)[3]
             _draw_text(draw, inner_x, cy - dh / 2, extra_render, delta_font, _rgba(delta_color))
         cx += w + st["chip_gap"]
-
-    # ── Rank-change chip (↑ / ↓ / −), placed after the last stat chip ──────
-    if rank_change:
-        rc = style["rank_change"]
-        color_map = {"↑": rc["color_up"], "↓": rc["color_down"], "−": rc["color_same"]}
-        rc_font = _font(fb, rc["fontsize"])
-        rh = _measure(draw, rc_font, rank_change)[3]
-        _draw_text(draw, cx + rc["chip_gap"], row2_y + chip_h / 2 - rh / 2, rank_change, rc_font,
-                    _rgba(color_map.get(rank_change, rc["color_same"])))
 
     # ── Entry badge: glowing gradient circle, bottom-right ─────────────────
     badge_types = style.get("badge_types", {})

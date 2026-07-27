@@ -12,7 +12,7 @@ try:
 except ImportError:
     pass
 
-from overlay import load_style, build_vf
+from overlay import load_style, build_overlay_image, build_filter_complex
 
 # Use YouTube Data API if key is present, otherwise fall back to yt-dlp.
 _YT_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
@@ -70,11 +70,12 @@ def detect_hw_encoder():
     return None
 
 
-def _build_encode_cmd(codec, raw_clip, vf, final_clip, fps=30):
+def _build_encode_cmd(codec, raw_clip, overlay_png, cw, ch, final_clip, fps=30):
     video_args = _HW_ENCODE_ARGS.get(codec, _CPU_ENCODE_ARGS)
     return [
-        "ffmpeg", "-i", raw_clip,
-        "-vf", vf,
+        "ffmpeg", "-i", raw_clip, "-i", overlay_png,
+        "-filter_complex", build_filter_complex(cw, ch),
+        "-map", "[vout]", "-map", "0:a",
         *video_args,
         # Force a constant, uniform frame rate on every clip. Source videos
         # come in at different native rates (e.g. 23.976fps vs 30fps) — the
@@ -365,11 +366,12 @@ def encode_song(style, raw_clip, rank, title, artist, peak, entry_type,
     sized to match actual hardware/software encode capacity, independently
     of how many downloads are in flight.
     """
-    slug       = safe_filename(title)
-    final_clip = f"{CLIPS_DIR}/final_{slug}_rank{rank}.mp4"
+    slug        = safe_filename(title)
+    final_clip  = f"{CLIPS_DIR}/final_{slug}_rank{rank}.mp4"
+    overlay_png = f"{CLIPS_DIR}/overlay_{slug}_rank{rank}.png"
 
     _log(f"  [rank {rank}] Rendering overlay...")
-    vf = build_vf(
+    img = build_overlay_image(
         style,
         rank=rank, title=title, artist=artist,
         peak=peak, years_on_chart=years_on_chart,
@@ -377,18 +379,23 @@ def encode_song(style, raw_clip, rank, title, artist, peak, entry_type,
         views_gained=views_gained,
         rank_change=rank_change,
     )
+    img.save(overlay_png)
+
+    cw  = style.get("canvas", {}).get("width", 1920)
+    ch  = style.get("canvas", {}).get("height", 1080)
     fps = style.get("canvas", {}).get("fps", 30)
 
-    result = subprocess.run(_build_encode_cmd(codec, raw_clip, vf, final_clip, fps),
+    result = subprocess.run(_build_encode_cmd(codec, raw_clip, overlay_png, cw, ch, final_clip, fps),
                              capture_output=True, text=True)
     if result.returncode != 0 and codec:
         _log(f"  [rank {rank}] GPU encode ({codec}) failed, falling back to CPU...")
-        result = subprocess.run(_build_encode_cmd(None, raw_clip, vf, final_clip, fps),
+        result = subprocess.run(_build_encode_cmd(None, raw_clip, overlay_png, cw, ch, final_clip, fps),
                                  capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"OVERLAY failed (ffmpeg exit {result.returncode}): {result.stderr[-500:]}")
 
     os.remove(raw_clip)
+    os.remove(overlay_png)
     _log(f"  [rank {rank}] Done -> {final_clip}")
     return final_clip
 
@@ -396,6 +403,36 @@ def encode_song(style, raw_clip, rank, title, artist, peak, entry_type,
 def load_songs(csv_path):
     with open(csv_path, newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
+
+
+def clean_csv_titles(csv_path):
+    """
+    Re-run AI title cleanup against every existing row in the CSV and
+    overwrite title/artist in place. --search only cleans rows freshly
+    returned by that search (rows merged in from a prior CSV are left
+    as-is), so this is the way to retroactively clean everything already
+    on the chart without deleting and re-searching.
+    """
+    from title_cleaner import clean_titles
+
+    if not os.path.exists(csv_path):
+        print(f"{csv_path} does not exist — nothing to clean.")
+        return
+
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        fieldnames = reader.fieldnames
+
+    print(f"Cleaning titles for {len(rows)} song(s) via AI...")
+    clean_titles(rows)
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Updated {csv_path} with cleaned titles.")
 
 
 def concatenate_clips(clip_paths, output_path="final_compilation.mp4"):
@@ -445,7 +482,15 @@ def main():
         "--encode-workers", type=int, default=3,
         help="Concurrent ffmpeg overlay encodes (CPU/GPU-bound, default: 3)",
     )
+    parser.add_argument(
+        "--clean-titles", action="store_true",
+        help="Re-run AI title cleanup on every row already in songs.csv, then exit (no video rendering).",
+    )
     args = parser.parse_args()
+
+    if args.clean_titles:
+        clean_csv_titles(DATA_FILE)
+        return
 
     os.makedirs(CLIPS_DIR, exist_ok=True)
     style = load_style(STYLE_FILE)

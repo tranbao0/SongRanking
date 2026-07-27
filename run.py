@@ -7,6 +7,7 @@ Usage:
   python run.py search
   python run.py search --q "blackpink songs"
   python run.py search --q "blackpink songs" --limit 10
+  python run.py clean
 """
 
 import json
@@ -62,7 +63,7 @@ def main():
     )
     parser.add_argument(
         "command",
-        choices=["csv", "search"],
+        choices=["csv", "search", "clean"],
         help="Command to run",
     )
     parser.add_argument("--q", metavar="QUERY", default="kpop songs",
@@ -94,6 +95,9 @@ def main():
         if args.limit:
             pipeline_args += ["--limit", str(args.limit)]
         cmd(pipeline_args + extra_args)
+
+    elif args.command == "clean":
+        cmd([sys.executable, "src/pipeline.py", "--clean-titles"])
 
 
 if __name__ == "__main__":
