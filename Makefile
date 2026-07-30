@@ -6,8 +6,8 @@ update:
 	pip install -U -r requirements.txt
 
 csv:
-	python src/pipeline.py $(if $(LIMIT),--limit $(LIMIT),)
+	python run.py csv $(if $(LIMIT),--limit $(LIMIT),)
 
 search:
-	python src/pipeline.py --search "$(Q)" $(if $(LIMIT),--limit $(LIMIT),)
+	python run.py search --q "$(Q)" $(if $(LIMIT),--limit $(LIMIT),)
 

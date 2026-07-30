@@ -17,12 +17,11 @@ import time
 import argparse
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+from pipeline import run_pipeline
+
 _YT_DLP_CHECK_CACHE = Path("data/.yt_dlp_update_check.json")
 _YT_DLP_CHECK_INTERVAL = 24 * 60 * 60  # re-check at most once/day
-
-
-def cmd(args):
-    subprocess.run(args, check=True)
 
 
 def ensure_yt_dlp_up_to_date():
@@ -70,34 +69,34 @@ def main():
                         help='Search query (search mode only, default: "kpop songs")')
     parser.add_argument("--limit", type=int, default=None,
                         help="Max songs to process")
-    parser.add_argument("--download-workers", type=int, default=None,
+    parser.add_argument("--no-filter", dest="no_filter", action="store_true",
+                        help="Skip MV duration/title filtering (search mode only)")
+    parser.add_argument("--download-workers", type=int, default=6,
                         help="Concurrent yt-dlp downloads (default: 6)")
-    parser.add_argument("--encode-workers", type=int, default=None,
+    parser.add_argument("--encode-workers", type=int, default=3,
                         help="Concurrent ffmpeg overlay encodes (default: 3)")
     args = parser.parse_args()
 
     ensure_yt_dlp_up_to_date()
 
-    extra_args = []
-    if args.download_workers:
-        extra_args += ["--download-workers", str(args.download_workers)]
-    if args.encode_workers:
-        extra_args += ["--encode-workers", str(args.encode_workers)]
-
     if args.command == "csv":
-        pipeline_args = [sys.executable, "src/pipeline.py"]
-        if args.limit:
-            pipeline_args += ["--limit", str(args.limit)]
-        cmd(pipeline_args + extra_args)
+        run_pipeline(
+            limit=args.limit,
+            download_workers=args.download_workers,
+            encode_workers=args.encode_workers,
+        )
 
     elif args.command == "search":
-        pipeline_args = [sys.executable, "src/pipeline.py", "--search", args.q]
-        if args.limit:
-            pipeline_args += ["--limit", str(args.limit)]
-        cmd(pipeline_args + extra_args)
+        run_pipeline(
+            search=args.q,
+            limit=args.limit,
+            no_filter=args.no_filter,
+            download_workers=args.download_workers,
+            encode_workers=args.encode_workers,
+        )
 
     elif args.command == "clean":
-        cmd([sys.executable, "src/pipeline.py", "--clean-titles"])
+        run_pipeline(clean_titles=True)
 
 
 if __name__ == "__main__":

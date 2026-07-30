@@ -34,7 +34,7 @@ def fetch_title_artist(url):
     """Use yt-dlp to get the video title and uploader without downloading."""
     result = subprocess.run(
         ["yt-dlp", "--no-playlist", "--print", "%(title)s|||%(uploader)s", url],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
     )
     raw = result.stdout.strip()
     if "|||" in raw:

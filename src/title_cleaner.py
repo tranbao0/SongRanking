@@ -35,6 +35,7 @@ like "HYBE LABELS", "HYBE LABELS and", "JYP Entertainment", "SM Entertainment", 
 "YG Entertainment", "Big Hit Music", and similar. Remove "Official" or "and X more".
 - Keep Korean characters exactly as-is.
 - If you cannot determine a clean title, return the original unchanged.
+- Be particularly careful with upload channel name versus artist name; if the artist is fictional, KEEP THE ARTIST NAME
 Return ONLY a JSON array — no markdown, no explanation. Each element: {{"title": "...", "artist": "..."}}.
 
 {entries}"""

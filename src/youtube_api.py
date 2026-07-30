@@ -8,9 +8,19 @@ Setup:
   pip install google-api-python-client python-dotenv
 """
 
+import concurrent.futures
 import os
 import re
-from datetime import date
+from datetime import date, datetime
+
+
+def _months_since(release_date: date) -> int:
+    """Whole months elapsed since `release_date` (minimum 1)."""
+    today = date.today()
+    months = (today.year - release_date.year) * 12 + (today.month - release_date.month)
+    if today.day < release_date.day:
+        months -= 1
+    return max(1, months)
 
 try:
     from dotenv import load_dotenv
@@ -85,17 +95,63 @@ def fetch_metadata(url: str) -> dict:
     if not items:
         raise ValueError(f"No video found for ID: {video_id}")
 
-    item         = items[0]
+    return _video_to_meta(items[0])
+
+
+def _video_to_meta(item: dict) -> dict:
     views        = int(item["statistics"].get("viewCount", 0))
     published    = item["snippet"].get("publishedAt", "")
-    release_year = int(published[:4]) if len(published) >= 4 else date.today().year
-    years_on_chart = max(1, date.today().year - release_year + 1)
-
+    release_date = datetime.strptime(published[:10], "%Y-%m-%d").date() if len(published) >= 10 else date.today()
+    release_year = release_date.year
     return {
-        "views":          views,
-        "release_year":   release_year,
-        "years_on_chart": years_on_chart,
+        "views":           views,
+        "release_year":    release_year,
+        "release_date":    release_date.strftime("%Y.%m.%d"),
+        "years_on_chart":  max(1, date.today().year - release_year + 1),
+        "months_on_chart": _months_since(release_date),
     }
+
+
+def batch_fetch_metadata(urls: list[str], max_workers: int = 10) -> dict[str, dict]:
+    """
+    Fetch metadata for many videos at once.
+
+    videos.list accepts up to 50 IDs per call and costs 1 quota unit
+    regardless of how many IDs are packed in, so chunking into groups of
+    50 cuts both request count and quota use by up to ~50x versus fetching
+    one video at a time. Chunks are additionally fetched concurrently
+    (each thread builds its own client, since the underlying httplib2
+    transport isn't thread-safe) so a 500-song list (10 chunks) resolves
+    in roughly one round-trip instead of ten sequential ones.
+
+    Returns {url: meta_dict}. URLs with no extractable video ID or with
+    no matching video (deleted/private) are omitted from the result.
+    """
+    url_by_id = {}
+    for url in urls:
+        try:
+            url_by_id[_extract_video_id(url)] = url
+        except ValueError:
+            continue
+
+    ids    = list(url_by_id.keys())
+    chunks = [ids[i:i + 50] for i in range(0, len(ids), 50)]
+
+    def _fetch_chunk(chunk):
+        youtube  = _get_client()
+        response = youtube.videos().list(
+            part="statistics,snippet",
+            id=",".join(chunk),
+        ).execute()
+        return response.get("items", [])
+
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for items in pool.map(_fetch_chunk, chunks):
+            for item in items:
+                url = url_by_id[item["id"]]
+                results[url] = _video_to_meta(item)
+    return results
 
 
 def search_kpop(query: str, limit: int = 50, filter_mv: bool = True) -> list[dict]:
@@ -135,20 +191,24 @@ def search_kpop(query: str, limit: int = 50, filter_mv: bool = True) -> list[dic
         vid_id       = item["id"]
         views        = int(item["statistics"].get("viewCount", 0))
         published    = item["snippet"].get("publishedAt", "")
-        release_year = int(published[:4]) if len(published) >= 4 else date.today().year
+        release_date = datetime.strptime(published[:10], "%Y-%m-%d").date() if len(published) >= 10 else date.today()
+        release_year = release_date.year
         years_on_chart = max(1, date.today().year - release_year + 1)
+        months_on_chart = _months_since(release_date)
         duration     = _parse_iso_duration(item["contentDetails"].get("duration", ""))
 
         songs.append({
-            "id":             vid_id,
-            "title":          item["snippet"]["title"],
-            "uploader":       item["snippet"]["channelTitle"],
-            "views":          views,
-            "upload_date":    published[:10],
-            "duration":       duration,
-            "release_year":   release_year,
-            "years_on_chart": years_on_chart,
-            "url":            f"https://www.youtube.com/watch?v={vid_id}",
+            "id":              vid_id,
+            "title":           item["snippet"]["title"],
+            "uploader":        item["snippet"]["channelTitle"],
+            "views":           views,
+            "upload_date":     published[:10],
+            "duration":        duration,
+            "release_year":    release_year,
+            "release_date":    release_date.strftime("%Y.%m.%d"),
+            "years_on_chart":  years_on_chart,
+            "months_on_chart": months_on_chart,
+            "url":             f"https://www.youtube.com/watch?v={vid_id}",
         })
 
     if filter_mv:

@@ -24,6 +24,15 @@ PRINT_TEMPLATE = (
     "|||%(view_count)s|||%(upload_date)s|||%(duration)s"
 )
 
+
+def _months_since(release_date: date) -> int:
+    """Whole months elapsed since `release_date` (minimum 1)."""
+    today = date.today()
+    months = (today.year - release_date.year) * 12 + (today.month - release_date.month)
+    if today.day < release_date.day:
+        months -= 1
+    return max(1, months)
+
 # Titles matching this pattern are almost certainly compilations, playlists,
 # or aggregator videos rather than individual official MVs.
 _BLOCKLIST = re.compile(
@@ -61,7 +70,8 @@ def _is_valid_mv(song: dict) -> bool:
 def search_kpop(query: str, limit: int = 50, filter_mv: bool = True) -> list[dict]:
     """
     Run yt-dlp search and return a list of result dicts.
-    Fields: id, title, uploader, views, upload_date, duration, url, years_on_chart
+    Fields: id, title, uploader, views, upload_date, duration, url, release_date,
+    years_on_chart, months_on_chart
 
     When filter_mv=True (default), removes compilations, playlists, and
     videos outside the typical MV duration range before returning.
@@ -78,7 +88,7 @@ def search_kpop(query: str, limit: int = 50, filter_mv: bool = True) -> list[dic
             "--no-warnings",
             "--print", PRINT_TEMPLATE,
         ],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
     )
 
     songs = []
@@ -99,23 +109,27 @@ def search_kpop(query: str, limit: int = 50, filter_mv: bool = True) -> list[dic
         except (ValueError, TypeError):
             duration = 0
 
-        if len(upload_date_raw) >= 4:
-            release_year = int(upload_date_raw[:4])
+        if len(upload_date_raw) == 8:
+            release_date = date(int(upload_date_raw[:4]), int(upload_date_raw[4:6]), int(upload_date_raw[6:8]))
         else:
-            release_year = date.today().year
+            release_date = date.today()
+        release_year = release_date.year
 
         years_on_chart = max(1, date.today().year - release_year + 1)
+        months_on_chart = _months_since(release_date)
 
         songs.append({
-            "id":             vid_id.strip(),
-            "title":          title.strip(),
-            "uploader":       uploader.strip(),
-            "views":          views,
-            "upload_date":    upload_date_raw.strip(),
-            "duration":       duration,
-            "release_year":   release_year,
-            "years_on_chart": years_on_chart,
-            "url":            f"https://www.youtube.com/watch?v={vid_id.strip()}",
+            "id":              vid_id.strip(),
+            "title":           title.strip(),
+            "uploader":        uploader.strip(),
+            "views":           views,
+            "upload_date":     upload_date_raw.strip(),
+            "duration":        duration,
+            "release_year":    release_year,
+            "release_date":    release_date.strftime("%Y.%m.%d"),
+            "years_on_chart":  years_on_chart,
+            "months_on_chart": months_on_chart,
+            "url":             f"https://www.youtube.com/watch?v={vid_id.strip()}",
         })
 
     if filter_mv:
