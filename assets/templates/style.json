@@ -8,6 +8,14 @@
     "fps":    30
   },
 
+  "transition": {
+    "video_type":       "fade",
+    "overlay_type":      "wiperight",
+    "overlay_exit_type": "wipeleft",
+    "overlay_duration":  0.5,
+    "duration":          1.0
+  },
+
   "bar": {
     "solid_height":   180,
     "fade_height":    90,

@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import concurrent.futures
 
 # Windows consoles/pipes default Python's stdout to the legacy locale codepage
@@ -15,7 +16,7 @@ except ImportError:
     pass
 
 from overlay import load_style
-from encoding import detect_hw_encoder, download_song, encode_song, concatenate_clips, _log
+from encoding import detect_hw_encoder, download_song, encode_song, encode_transition, concatenate_clips, _log
 from chart_state import (
     DATA_FILE, load_history, songs_from_search, pre_fetch_all,
     determine_badges, save_run_state, load_songs, clean_csv_titles,
@@ -41,6 +42,15 @@ _BADGE_LABELS = {
     "highest_jump":     "HIGHEST JUMP",
     "":                 "",
 }
+
+
+def _fmt_secs(s):
+    m, s = divmod(s, 60)
+    return f"{int(m)}m {s:.1f}s" if m else f"{s:.1f}s"
+
+
+def _avg(times):
+    return sum(times) / len(times) if times else 0.0
 
 
 def run_pipeline(search=None, limit=None, no_filter=False,
@@ -99,6 +109,9 @@ def run_pipeline(search=None, limit=None, no_filter=False,
     print()
 
     countdown = list(reversed(ranked))
+    n = len(countdown)
+    rank_to_index = {s["rank"]: i for i, s in enumerate(countdown)}
+    t_pipeline_start = time.monotonic()
 
     codec = detect_hw_encoder()
     if codec:
@@ -106,17 +119,28 @@ def run_pipeline(search=None, limit=None, no_filter=False,
     else:
         print("[encoder] No GPU encoder detected in this ffmpeg build — using CPU (libx264)\n")
 
+    transition_cfg      = style.get("transition", {})
+    video_transition     = transition_cfg.get("video_type", "fade")
+    transition_duration  = transition_cfg.get("duration", 1.0)
+    cw  = style.get("canvas", {}).get("width", 1920)
+    ch  = style.get("canvas", {}).get("height", 1080)
+    fps = style.get("canvas", {}).get("fps", 30)
+
     def _download(song):
-        return download_song(
+        t0 = time.monotonic()
+        raw_clip = download_song(
             song["rank"], song["title"], song["url"],
             start=song.get("start", "00:01:00"), end=song.get("end", "00:01:15"),
         )
+        dl_times[song["rank"]] = time.monotonic() - t0
+        return raw_clip
 
-    def _encode(song, raw_clip):
+    def _encode(song, raw_clip, head_trim, tail_trim):
         meta       = song["_meta"]
         entry_type = song["_entry_type"]
         peak       = song.get("peak", song["rank"])
-        return encode_song(
+        t0 = time.monotonic()
+        result = encode_song(
             style, raw_clip,
             rank=song["rank"], title=song["title"], artist=song["artist"],
             peak=peak, entry_type=entry_type,
@@ -124,14 +148,25 @@ def run_pipeline(search=None, limit=None, no_filter=False,
             months_on_chart=meta["months_on_chart"],
             views_gained=song["_views_gained"],
             rank_change=song["_rank_change"],
-            codec=codec,
+            codec=codec, head_trim=head_trim, tail_trim=tail_trim,
         )
+        enc_times[song["rank"]] = time.monotonic() - t0
+        return result
 
     # Two independently-sized pools connected by a pipeline: as each download
     # finishes it's immediately handed to the encode pool, so encoding for
     # earlier songs overlaps with downloading of later ones instead of the
-    # two stages being coupled to one shared worker count.
-    completed_by_rank, failed = {}, []
+    # two stages being coupled to one shared worker count. Every clip except
+    # the very first/last is trimmed on the side(s) touching a neighbor —
+    # that sliver is instead rendered by the transition stage below, which
+    # blends it into the adjacent clip. Trim amounts are decided from each
+    # song's fixed position in `countdown`, before any downloads finish, so
+    # this pipelining isn't held up waiting to learn the final success list.
+    completed_by_rank, raw_by_rank, failed = {}, {}, []
+    dl_times, enc_times, trans_times = {}, {}, {}
+    dl_done = enc_done = 0
+    dl_stage_start = time.monotonic()
+    enc_stage_start = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=download_workers) as dl_pool, \
          concurrent.futures.ThreadPoolExecutor(max_workers=encode_workers) as enc_pool:
 
@@ -146,25 +181,122 @@ def run_pipeline(search=None, limit=None, no_filter=False,
                 _log(f"  ERROR: Rank {song['rank']} ({song['title']}) — {e}\n")
                 failed.append((song["rank"], song["title"]))
                 continue
-            encode_future = enc_pool.submit(_encode, song, raw_clip)
+            dl_done += 1
+            _log(f"  [rank {song['rank']}] Downloaded in {dl_times[song['rank']]:.1f}s ({dl_done}/{n})")
+            raw_by_rank[song["rank"]] = raw_clip
+            idx = rank_to_index[song["rank"]]
+            head_trim = 0.0 if idx == 0 else transition_duration
+            tail_trim = 0.0 if idx == n - 1 else transition_duration
+            if enc_stage_start is None:
+                enc_stage_start = time.monotonic()
+            encode_future = enc_pool.submit(_encode, song, raw_clip, head_trim, tail_trim)
             encode_futures[encode_future] = song
+        dl_stage_end = time.monotonic()
 
         for future in concurrent.futures.as_completed(encode_futures):
             song = encode_futures[future]
             try:
-                completed_by_rank[song["rank"]] = future.result()
+                completed_by_rank[song["rank"]] = future.result()  # seg_clip path
             except RuntimeError as e:
                 _log(f"  ERROR: Rank {song['rank']} ({song['title']}) — {e}\n")
                 failed.append((song["rank"], song["title"]))
+                continue
+            enc_done += 1
+            _log(f"  [rank {song['rank']}] Encoded in {enc_times[song['rank']]:.1f}s ({enc_done}/{len(encode_futures)})")
+    enc_stage_end = time.monotonic()
 
-    # Reassemble in countdown order (highest rank number -> #1) regardless of completion order.
-    completed = [completed_by_rank[s["rank"]] for s in countdown if s["rank"] in completed_by_rank]
+    # Build the small boundary segment between every pair of adjacent songs
+    # that both survived download/encode — skipped where a neighbor failed,
+    # which just leaves a slightly earlier hard cut at that one boundary
+    # instead of a crossfade. These are cheap (~1s of output each) and run
+    # in their own parallel batch rather than one costly full-length re-encode.
+    transition_jobs = [
+        (countdown[i]["rank"], countdown[i + 1]["rank"])
+        for i in range(n - 1)
+        if countdown[i]["rank"] in completed_by_rank and countdown[i + 1]["rank"] in completed_by_rank
+    ]
 
-    if completed:
-        concatenate_clips(completed)
+    def _build_transition(rank_a, rank_b):
+        out_path = f"{CLIPS_DIR}/trans_rank{rank_a}_rank{rank_b}.mp4"
+        t0 = time.monotonic()
+        result = encode_transition(
+            raw_by_rank[rank_a], raw_by_rank[rank_b], cw, ch, fps, out_path,
+            codec=codec, video_transition=video_transition, duration=transition_duration,
+        )
+        trans_times[(rank_a, rank_b)] = time.monotonic() - t0
+        return result
+
+    transition_by_pair = {}
+    trans_stage_start = trans_stage_end = time.monotonic()
+    if transition_jobs:
+        print(f"Building {len(transition_jobs)} transition(s)...")
+        trans_stage_start = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=encode_workers) as trans_pool:
+            trans_futures = {trans_pool.submit(_build_transition, a, b): (a, b) for a, b in transition_jobs}
+            for future in concurrent.futures.as_completed(trans_futures):
+                pair = trans_futures[future]
+                try:
+                    transition_by_pair[pair] = future.result()
+                except RuntimeError as e:
+                    _log(f"  ERROR: Transition rank {pair[0]}->{pair[1]} — {e}\n")
+        trans_stage_end = time.monotonic()
+
+    # raw clips are only needed by the per-clip encode (its own overlay PNG
+    # is cleaned up inside encode_song already) and by the transitions
+    # touching them — both are done now, safe to clean up.
+    for raw_clip in raw_by_rank.values():
+        if os.path.exists(raw_clip):
+            os.remove(raw_clip)
+
+    # Reassemble in countdown order, interleaving each song's segment with
+    # the transition into its successor (when one was built).
+    segments = []
+    for i, song in enumerate(countdown):
+        rank = song["rank"]
+        if rank in completed_by_rank:
+            segments.append(completed_by_rank[rank])
+        if i < n - 1:
+            pair = (rank, countdown[i + 1]["rank"])
+            if pair in transition_by_pair:
+                segments.append(transition_by_pair[pair])
+
+    concat_time = 0.0
+    if segments:
+        t0 = time.monotonic()
+        # Full re-encode, not a stream copy: every seg_/trans_ file came from
+        # its own independent ffmpeg process, so each one injects its own
+        # SPS/PPS at its boundary even with identical settings. Stream-
+        # copying them together leaves those parameter-set changes embedded
+        # mid-stream, which most software decoders shrug off but which
+        # visibly breaks playback in players that lean on hardware decode
+        # (confirmed reproducing in VLC, Discord's embedded player, and
+        # mobile players — video freezes/blacks out right at each seam).
+        concatenate_clips(segments, codec=codec, cw=cw, ch=ch, fps=fps)
+        concat_time = time.monotonic() - t0
+        print("Compilation saved -> final_compilation.mp4\n")
 
     save_run_state(ranked, DATA_FILE)
     print("Updated CSV for next run.\n")
+
+    total_time = time.monotonic() - t_pipeline_start
+    dl_span    = dl_stage_end - dl_stage_start
+    enc_span   = enc_stage_end - enc_stage_start if enc_stage_start else 0.0
+    trans_span = trans_stage_end - trans_stage_start
+
+    print("=" * 55)
+    print("Run summary")
+    print("=" * 55)
+    print(f"Total time:       {_fmt_secs(total_time)}")
+    print(f"Download stage:   {_fmt_secs(dl_span)}  ({dl_span / total_time:.0%} of total)"
+          f"  [{len(dl_times)}/{n} songs, {download_workers} workers, avg {_avg(dl_times.values()):.1f}s/song]")
+    print(f"Encode stage:     {_fmt_secs(enc_span)}  ({enc_span / total_time:.0%} of total)"
+          f"  [{len(enc_times)}/{n} songs, {encode_workers} workers, avg {_avg(enc_times.values()):.1f}s/song]")
+    if transition_jobs:
+        print(f"Transition stage: {_fmt_secs(trans_span)}  ({trans_span / total_time:.0%} of total)"
+              f"  [{len(trans_times)}/{len(transition_jobs)} built, avg {_avg(trans_times.values()):.1f}s each]")
+    print(f"Final concat:     {_fmt_secs(concat_time)}  ({concat_time / total_time:.0%} of total)")
+    print("(Download/encode stages overlap by design — percentages won't sum to 100%.)")
+    print("=" * 55)
 
     if failed:
         print("\nFailed songs:")

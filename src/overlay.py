@@ -273,6 +273,78 @@ def build_filter_complex(cw, ch):
     )
 
 
+def build_bare_filter_complex(cw, ch):
+    """
+    Plain scale/pad with no overlay composited. Used for the brief bare
+    windows at the very start of the first song and the very end of the
+    last song — every other clip's bare edges are instead produced by
+    build_transition_filter_complex (interior boundary) or build_overlay_
+    phase_filter_complex (that clip's own wipe-in/fade-out window).
+    """
+    return (
+        f"[0:v]scale={cw}:{ch}:force_original_aspect_ratio=decrease,"
+        f"pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2:color=black[vout]"
+    )
+
+
+def build_overlay_phase_filter_complex(cw, ch, transition, duration, fps, reverse=False):
+    """
+    Wipes a clip's own overlay on (reverse=False) or off (reverse=True)
+    entirely within that clip's own footage — no neighboring clip involved.
+    Splits the scaled/padded video into a bare copy and an overlaid copy,
+    then xfades bare->overlaid (entry) or overlaid->bare (exit) across the
+    whole `duration`-second window (offset=0).
+
+    Inputs: 0 = clip video+audio (already trimmed to this window), 1 = the
+    clip's overlay PNG (looped for `duration`s). Audio is passed straight
+    through unfiltered — the overlay's visibility never affects the audio,
+    so there's nothing to blend there.
+    """
+    bg = (
+        f"[0:v]scale={cw}:{ch}:force_original_aspect_ratio=decrease,"
+        f"pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2:color=black,fps={fps},split=2[bg1][bg2]"
+    )
+    order = "[ov][bg2]" if reverse else "[bg2][ov]"
+    return (
+        f"{bg};"
+        # -loop'd image inputs default to 25fps regardless of the clip's
+        # native rate — forced to match here so xfade blends two streams
+        # with identical frame pacing instead of resampling one on the fly.
+        f"[1:v]fps={fps}[ovsrc];"
+        f"[bg1][ovsrc]overlay=0:0:format=auto[ov];"
+        f"{order}xfade=transition={transition}:duration={duration}:offset=0[vout]"
+    )
+
+
+def build_transition_filter_complex(cw, ch, video_transition, duration, fps=30):
+    """
+    Pure clip-to-clip crossfade between two adjacent clips' bare footage.
+    By the time footage reaches this boundary, each clip has already wiped
+    its own overlay off (see build_overlay_phase_filter_complex) during its
+    own encode, using up the `duration` seconds this transition sits
+    between — so both sides are plain video here, no overlay involved.
+
+    Inputs: 0 = clip A's video+audio (its last `duration`s), 1 = clip B's
+    video+audio (its first `duration`s).
+    """
+    def _bg(idx, tag):
+        # fps is forced here (not just at final encode) because xfade
+        # blends clip A's and clip B's video directly — if their source
+        # frame rates differ (common across YouTube clips), xfade sees
+        # mismatched frame pacing on its two inputs and blends unevenly.
+        return (
+            f"[{idx}:v]scale={cw}:{ch}:force_original_aspect_ratio=decrease,"
+            f"pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2:color=black,fps={fps}[{tag}]"
+        )
+
+    return (
+        f"{_bg(0, 'bgA')};"
+        f"{_bg(1, 'bgB')};"
+        f"[bgA][bgB]xfade=transition={video_transition}:duration={duration}:offset=0[vout];"
+        f"[0:a][1:a]acrossfade=d={duration}[aout]"
+    )
+
+
 if __name__ == "__main__":
     style = load_style()
     img = build_overlay_image(

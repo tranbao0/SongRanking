@@ -10,7 +10,10 @@ import os
 import re
 import threading
 
-from overlay import build_overlay_image, build_filter_complex
+from overlay import (
+    build_overlay_image, build_filter_complex, build_bare_filter_complex,
+    build_overlay_phase_filter_complex, build_transition_filter_complex,
+)
 
 CLIPS_DIR = "assets/clips"
 
@@ -59,28 +62,71 @@ def detect_hw_encoder():
     return None
 
 
-def _build_encode_cmd(codec, raw_clip, overlay_png, cw, ch, final_clip, fps=30):
+def _run_ffmpeg(build_cmd, codec, args, error_label):
+    """
+    Runs an ffmpeg command built by `build_cmd(codec, *args)`, retrying once
+    on software encoding if a GPU encode was requested and failed. Shared by
+    every encode_* function below so the GPU->CPU fallback logic lives in
+    one place.
+    """
+    result = subprocess.run(build_cmd(codec, *args), capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode != 0 and codec:
+        result = subprocess.run(build_cmd(None, *args), capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode != 0:
+        raise RuntimeError(f"{error_label} failed (ffmpeg exit {result.returncode}): {result.stderr[-500:]}")
+
+
+def _trim_input_args(raw_clip, trim_start=0.0, trim_duration=None):
+    # Trimming is an input seek (before -i), not a filter: it's frame-accurate
+    # by default in modern ffmpeg and lets the filter graphs below stay
+    # identical regardless of which window of the clip they're fed.
+    args = []
+    if trim_start:
+        args += ["-ss", str(trim_start)]
+    if trim_duration is not None:
+        args += ["-t", str(trim_duration)]
+    return [*args, "-i", raw_clip]
+
+
+def _build_encode_cmd(codec, raw_clip, overlay_png, cw, ch, final_clip, fps, trim_start, trim_duration):
     video_args = _HW_ENCODE_ARGS.get(codec, _CPU_ENCODE_ARGS)
     return [
-        "ffmpeg", "-i", raw_clip, "-i", overlay_png,
+        "ffmpeg", *_trim_input_args(raw_clip, trim_start, trim_duration), "-i", overlay_png,
         "-filter_complex", build_filter_complex(cw, ch),
         "-map", "[vout]", "-map", "0:a",
         *video_args,
-        # Force a constant, uniform frame rate on every clip. Source videos
-        # come in at different native rates (e.g. 23.976fps vs 30fps) — the
-        # concat demuxer's stream-copy path requires identical timebases
-        # across segments, and silently miscomputes frame durations when
-        # they differ, producing frozen/slow-motion segments and a wildly
-        # wrong total duration despite every frame still being present.
         "-r", str(fps), "-fps_mode", "cfr",
-        # Re-encoded (not "-c:a copy"): clips come from different source
-        # videos, each with its own original audio timestamp base. Stream
-        # copy carries that mismatch through and the concat demuxer can't
-        # rebase it cleanly, producing non-monotonic audio DTS at concat
-        # time. Re-encoding gives every clip fresh, consistent zero-based
-        # audio timestamps, matching the video track's behavior.
-        "-c:a", "aac", "-b:a", "128k",
+        "-c:a", "aac", "-ar", "48000", "-b:a", "128k",
         "-y", final_clip,
+    ]
+
+
+def _build_bare_cmd(codec, raw_clip, cw, ch, fps, trim_start, trim_duration, out_path):
+    video_args = _HW_ENCODE_ARGS.get(codec, _CPU_ENCODE_ARGS)
+    return [
+        "ffmpeg", *_trim_input_args(raw_clip, trim_start, trim_duration),
+        "-filter_complex", build_bare_filter_complex(cw, ch),
+        "-map", "[vout]", "-map", "0:a",
+        *video_args,
+        "-r", str(fps), "-fps_mode", "cfr",
+        "-c:a", "aac", "-ar", "48000", "-b:a", "128k",
+        "-y", out_path,
+    ]
+
+
+def _build_overlay_phase_cmd(codec, raw_clip, overlay_png, cw, ch, fps, trim_start, duration,
+                              transition, reverse, out_path):
+    video_args = _HW_ENCODE_ARGS.get(codec, _CPU_ENCODE_ARGS)
+    return [
+        "ffmpeg",
+        "-ss", str(trim_start), "-t", str(duration), "-i", raw_clip,
+        "-loop", "1", "-t", str(duration), "-i", overlay_png,
+        "-filter_complex", build_overlay_phase_filter_complex(cw, ch, transition, duration, fps, reverse),
+        "-map", "[vout]", "-map", "0:a",
+        *video_args,
+        "-r", str(fps), "-fps_mode", "cfr",
+        "-c:a", "aac", "-ar", "48000", "-b:a", "128k",
+        "-y", out_path,
     ]
 
 
@@ -124,15 +170,40 @@ def download_song(rank, title, url, start="00:01:00", end="00:01:15"):
     return raw_clip
 
 
+def _probe_duration(path):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    return float(result.stdout.strip())
+
+
 def encode_song(style, raw_clip, rank, title, artist, peak, entry_type,
-                views, release_date, months_on_chart, views_gained=None, rank_change="", codec=None):
+                views, release_date, months_on_chart, views_gained=None, rank_change="",
+                codec=None, head_trim=0.0, tail_trim=0.0):
     """
-    CPU/GPU-bound stage: burn in the overlay. Runs in the encode pool —
-    sized to match actual hardware/software encode capacity, independently
-    of how many downloads are in flight.
+    CPU/GPU-bound stage: builds this clip's own timeline —
+
+        [bare (edge clips only)] -> overlay wipes in -> static overlay
+        -> overlay wipes out -> [bare (edge clips only)]
+
+    — as separate small ffmpeg encodes, then stitches them into one file.
+    The wipe-in/out windows are `duration` seconds each (from style's
+    transition config) and live entirely inside this clip's own footage;
+    the bare bookend windows only exist for the first/last song in the
+    countdown (head_trim/tail_trim == 0), since every other clip instead
+    hands that space to build_transition_segment() to cross-fade into its
+    neighbor — see run_pipeline for how head_trim/tail_trim are chosen.
+
+    Runs in the encode pool — sized to match actual hardware/software encode
+    capacity, independently of how many downloads are in flight. Leaves
+    raw_clip on disk; the transition-building stage still needs the clip's
+    true (untrimmed) edges, and the caller cleans it up once every
+    transition touching this clip is done.
     """
     slug        = safe_filename(title)
-    final_clip  = f"{CLIPS_DIR}/final_{slug}_rank{rank}.mp4"
+    final_clip  = f"{CLIPS_DIR}/seg_{slug}_rank{rank}.mp4"
     overlay_png = f"{CLIPS_DIR}/overlay_{slug}_rank{rank}.png"
 
     _log(f"  [rank {rank}] Rendering overlay...")
@@ -149,33 +220,173 @@ def encode_song(style, raw_clip, rank, title, artist, peak, entry_type,
     cw  = style.get("canvas", {}).get("width", 1920)
     ch  = style.get("canvas", {}).get("height", 1080)
     fps = style.get("canvas", {}).get("fps", 30)
+    transition_cfg      = style.get("transition", {})
+    overlay_enter       = transition_cfg.get("overlay_type", "wiperight")
+    overlay_exit        = transition_cfg.get("overlay_exit_type", "wipeleft")
+    overlay_duration    = transition_cfg.get("overlay_duration", 0.5)
+    # The bare bookend phases (edge clips only) stand in for what an actual
+    # transition segment would otherwise supply, so they're sized to match
+    # that segment's duration, not the overlay wipe's own (usually shorter)
+    # duration — otherwise an edge clip's intro/outro would run a different
+    # length than the crossfade every interior clip gets instead.
+    boundary_duration   = transition_cfg.get("duration", 1.0)
 
-    result = subprocess.run(_build_encode_cmd(codec, raw_clip, overlay_png, cw, ch, final_clip, fps),
-                             capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if result.returncode != 0 and codec:
-        _log(f"  [rank {rank}] GPU encode ({codec}) failed, falling back to CPU...")
-        result = subprocess.run(_build_encode_cmd(None, raw_clip, overlay_png, cw, ch, final_clip, fps),
-                                 capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if result.returncode != 0:
-        raise RuntimeError(f"OVERLAY failed (ffmpeg exit {result.returncode}): {result.stderr[-500:]}")
+    full_dur     = _probe_duration(raw_clip)
+    window_start = head_trim
+    window_end   = full_dur - tail_trim
+    lead_bare    = boundary_duration if head_trim == 0 else 0.0
+    trail_bare   = boundary_duration if tail_trim == 0 else 0.0
+    static_start = window_start + lead_bare + overlay_duration
+    static_end   = window_end - trail_bare - overlay_duration
+    if static_end <= static_start:
+        raise RuntimeError(
+            f"OVERLAY failed: clip for rank {rank} ({full_dur:.2f}s) is too short "
+            f"to fit a {overlay_duration}s overlay transition on each side."
+        )
 
-    os.remove(raw_clip)
+    phases = []
+    try:
+        if lead_bare:
+            p = f"{CLIPS_DIR}/phase_{slug}_rank{rank}_lead.mp4"
+            _run_ffmpeg(_build_bare_cmd, codec, (raw_clip, cw, ch, fps, window_start, lead_bare, p),
+                        f"OVERLAY[rank {rank}]")
+            phases.append(p)
+
+        p = f"{CLIPS_DIR}/phase_{slug}_rank{rank}_in.mp4"
+        _run_ffmpeg(_build_overlay_phase_cmd, codec,
+                    (raw_clip, overlay_png, cw, ch, fps, window_start + lead_bare, overlay_duration,
+                     overlay_enter, False, p),
+                    f"OVERLAY[rank {rank}]")
+        phases.append(p)
+
+        p = f"{CLIPS_DIR}/phase_{slug}_rank{rank}_static.mp4"
+        _run_ffmpeg(_build_encode_cmd, codec,
+                    (raw_clip, overlay_png, cw, ch, p, fps, static_start, static_end - static_start),
+                    f"OVERLAY[rank {rank}]")
+        phases.append(p)
+
+        p = f"{CLIPS_DIR}/phase_{slug}_rank{rank}_out.mp4"
+        _run_ffmpeg(_build_overlay_phase_cmd, codec,
+                    (raw_clip, overlay_png, cw, ch, fps, static_end, overlay_duration, overlay_exit, True, p),
+                    f"OVERLAY[rank {rank}]")
+        phases.append(p)
+
+        if trail_bare:
+            p = f"{CLIPS_DIR}/phase_{slug}_rank{rank}_trail.mp4"
+            _run_ffmpeg(_build_bare_cmd, codec,
+                        (raw_clip, cw, ch, fps, window_end - trail_bare, trail_bare, p),
+                        f"OVERLAY[rank {rank}]")
+            phases.append(p)
+
+        # Full re-encode (not stream copy) here: these phases were each
+        # encoded by independent ffmpeg processes and, unlike the top-level
+        # assembly's much longer segments, are cheap enough that a clean
+        # re-encode costs nothing — worth it to avoid stream-copying
+        # together clips whose SPS/PPS may not agree seam-for-seam (e.g. if
+        # one phase silently fell back to CPU encoding and its neighbor
+        # didn't), which otherwise shows up as glitching right at the seam.
+        concatenate_clips(phases, output_path=final_clip, codec=codec, cw=cw, ch=ch, fps=fps)
+    finally:
+        for p in phases:
+            if os.path.exists(p):
+                os.remove(p)
     os.remove(overlay_png)
+
     _log(f"  [rank {rank}] Done -> {final_clip}")
     return final_clip
 
 
-def concatenate_clips(clip_paths, output_path="final_compilation.mp4"):
-    list_file = f"{CLIPS_DIR}/_concat_list.txt"
+def _build_transition_cmd(codec, clip_a, clip_b, cw, ch, fps, video_transition, duration, out_path):
+    video_args = _HW_ENCODE_ARGS.get(codec, _CPU_ENCODE_ARGS)
+    dur_a = _probe_duration(clip_a)
+    return [
+        "ffmpeg",
+        "-ss", str(max(dur_a - duration, 0)), "-i", clip_a,
+        "-t", str(duration), "-i", clip_b,
+        "-filter_complex", build_transition_filter_complex(cw, ch, video_transition, duration, fps),
+        "-map", "[vout]", "-map", "[aout]",
+        *video_args,
+        "-r", str(fps), "-fps_mode", "cfr",
+        "-c:a", "aac", "-ar", "48000", "-b:a", "128k",
+        "-y", out_path,
+    ]
+
+
+def encode_transition(clip_a, clip_b, cw, ch, fps, out_path, codec=None, video_transition="fade", duration=1.0):
+    """
+    Builds the short (~`duration`-second) boundary segment stitched between
+    two adjacent clips' bare footage instead of re-encoding the whole
+    compilation for a single crossfade — small enough to run once per
+    boundary, in parallel, alongside the rest of the encode work. Each
+    clip's own overlay wipe-in/fade-out already happened inside encode_song,
+    so there's no overlay involved here at all (see build_transition_
+    filter_complex).
+    """
+    _run_ffmpeg(_build_transition_cmd, codec, (clip_a, clip_b, cw, ch, fps, video_transition, duration, out_path),
+                f"TRANSITION[{os.path.basename(out_path)}]")
+    return out_path
+
+
+def _build_concat_reencode_cmd(codec, list_file, cw, ch, fps, output_path):
+    video_args = _HW_ENCODE_ARGS.get(codec, _CPU_ENCODE_ARGS)
+    return [
+        "ffmpeg", "-f", "concat", "-safe", "0", "-i", list_file,
+        "-vf", f"scale={cw}:{ch}:force_original_aspect_ratio=decrease,pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2:color=black",
+        *video_args,
+        "-r", str(fps), "-fps_mode", "cfr",
+        "-c:a", "aac", "-ar", "48000", "-b:a", "128k",
+        "-y", output_path,
+    ]
+
+
+def concatenate_clips(clip_paths, output_path="final_compilation.mp4", codec=None, cw=None, ch=None, fps=None):
+    """
+    Used both to assemble one song's own phases (encode_song) and to
+    assemble the whole compilation from every song's segment + the
+    transitions between them (run_pipeline), so it has to be safe to call
+    concurrently — the concat list file name is derived from output_path
+    rather than shared, and logging goes through the thread-safe _log().
+
+    By default the video track is a plain stream copy (no re-encode) and
+    only audio is re-encoded — see below. Pass cw/ch/fps to fully re-encode
+    the video too instead, which every current caller does: every clip_path
+    here came out of its own independent ffmpeg process, and each one
+    writes its own fresh SPS/PPS at the start of its bitstream even with
+    identical settings — stream-copying them together leaves those
+    parameter-set changes embedded mid-stream. Most software decoders
+    shrug that off, but it visibly breaks playback (freeze/black frames
+    right at the seam) in players leaning on hardware decode — confirmed in
+    VLC, Discord's embedded player, and mobile players. A stream copy is
+    only safe here when the caller can guarantee every input segment came
+    from the exact same encode session.
+
+    Audio is always re-encoded (not copied): each piece's AAC audio was
+    encoded independently and its duration is rarely an exact multiple of
+    AAC's 1024-sample frame size, so the concat demuxer's naive
+    cumulative-offset stitching drifts by a fraction of a frame at every
+    boundary, producing non-monotonic DTS. ffmpeg tolerates that when
+    decoding, but stricter players can drop the audio track outright.
+    Re-encoding audio here is cheap (audio decode/encode is trivial next to
+    video) and gives a continuous, monotonically increasing timeline.
+    """
+    list_file = f"{output_path}.concat.txt"
     with open(list_file, "w") as f:
         for path in clip_paths:
             abs_path = os.path.abspath(path).replace("\\", "/")
             f.write(f"file '{abs_path}'\n")
 
-    print("Concatenating all clips...")
-    subprocess.run([
-        "ffmpeg", "-f", "concat", "-safe", "0",
-        "-i", list_file, "-c", "copy", "-y", output_path,
-    ], check=True)
-    os.remove(list_file)
-    print(f"Compilation saved -> {output_path}")
+    _log(f"  Concatenating {len(clip_paths)} segment(s) -> {output_path}...")
+    try:
+        if cw is not None:
+            _run_ffmpeg(_build_concat_reencode_cmd, codec, (list_file, cw, ch, fps, output_path),
+                        f"CONCAT[{os.path.basename(output_path)}]")
+        else:
+            result = subprocess.run([
+                "ffmpeg", "-f", "concat", "-safe", "0", "-i", list_file,
+                "-c:v", "copy", "-c:a", "aac", "-ar", "48000", "-b:a", "128k",
+                "-y", output_path,
+            ], capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if result.returncode != 0:
+                raise RuntimeError(f"CONCAT failed (ffmpeg exit {result.returncode}): {result.stderr[-500:]}")
+    finally:
+        os.remove(list_file)
