@@ -254,27 +254,32 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
                 new_uploads = _list_new_uploads(youtube, playlist_id, existing_ids)
                 new_mvs = []
                 if new_uploads:
-                    # Titles the blocklist already rejects are dropped before
-                    # the duration lookup, not after: durations cost a quota
-                    # unit per 50 videos - the same rate as walking the
-                    # playlist itself - and a blocklisted title can't pass
-                    # is_valid_mv whatever its duration is. On a channel
-                    # heavy with teasers and mixes that is a real share of
-                    # the day's catalogue budget, and the survivors are
-                    # filtered identically below.
+                    # Every rejection that needs only the title runs before
+                    # any duration is fetched. Durations cost a quota unit
+                    # per 50 videos - the same rate as walking the playlist
+                    # itself - so anything already ruled out is quota spent
+                    # on an answer that gets discarded. The survivors are
+                    # duration-checked identically below, so the resulting
+                    # set is unchanged; only what it cost to reach it is.
+                    #
+                    # This matters most exactly where the bill is largest.
+                    # A broadcast archive can carry tens of thousands of
+                    # uploads of which only a small fraction name a
+                    # confirmed artist at all, and that check is pure text.
                     candidates = [v for v in new_uploads if not is_blocked_title(v["title"])]
+
+                    if shared_index:
+                        before = len(candidates)
+                        candidates = [v for v in candidates if shared_index.match(v["title"]) is not None]
+                        if len(candidates) != before:
+                            print(f"    filtered {before - len(candidates)} video(s) not matching a "
+                                  f"confirmed {row['genre']} artist (likely shared channel)")
+
                     durations = _fetch_durations(youtube, [v["video_id"] for v in candidates])
                     new_mvs = [
                         v for v in candidates
                         if is_valid_mv(v["title"], durations.get(v["video_id"], 0))
                     ]
-
-                    if shared_index:
-                        before = len(new_mvs)
-                        new_mvs = [v for v in new_mvs if shared_index.match(v["title"]) is not None]
-                        if len(new_mvs) != before:
-                            print(f"    filtered {before - len(new_mvs)} video(s) not matching a "
-                                  f"confirmed {row['genre']} artist (likely shared channel)")
 
                 new_video_dicts = [
                     {
