@@ -33,6 +33,7 @@ This catches artists Wikidata does not have yet, but it is not genre-aware, so i
 - **Manual yaml files** - `data/channels/<genre>_manual.yaml` and `data/channels/<genre>_exclude.yaml` patch whatever the two automated sources get wrong, in either direction.
 
 Once channels are known, `catalog.py` walks each channel's uploads via the YouTube Data API, filters out non-official-MV content (compilations, wrong duration, etc.), and clusters videos that are really the same song (an official MV plus its dance-practice or lyric-video counterpart, for example) so their view counts aggregate into one chart entry instead of splitting across rows.
+Grouping is incremental: once a video has been assigned to a song, it is never re-classified, so each sync only spends local/AI work on that channel's genuinely new uploads instead of its whole history - see `song_grouping.py`'s module docstring for the three-tier matching it uses (exact title match, local clustering, then a Gemini pass for whatever's left, which also disambiguates by artist on large multi-artist channels).
 `snapshot.py` then records each tracked video's current view count once per run, building up real day-by-day history rather than approximating it.
 
 Run this layer with `python run.py sync`. See [Commands](#commands) below for the full picture, including the cost-saving behavior that makes routine daily syncs cheap.
@@ -86,7 +87,7 @@ manual    ─┘                                    │
 git clone https://github.com/YOUR_USERNAME/SongRanking.git
 cd SongRanking
 cp .env.example .env   # add your GEMINI_API_KEY and YOUTUBE_API_KEY
-make update             # install all Python dependencies
+pip install -r requirements.txt   # install all Python dependencies
 ```
 
 `YOUTUBE_API_KEY` is required for `sync`/`chart` (and gives much better `csv`/`search` results too).
@@ -127,8 +128,8 @@ Shared flags: `--limit` (cap song count), `--download-workers` / `--encode-worke
 
 ## Guide: adding a new genre
 
-1. **Find the genre's Wikidata QID.** Search [wikidata.org](https://www.wikidata.org) for the genre (e.g. "K-pop" is `Q213665`) and add it to `GENRE_QIDS` in `src/providers/wikidata.py`.
-2. **Pick a representative kworb country chart.** Check [kworb.net/youtube/insights/](https://kworb.net/youtube/insights/) for a country whose chart is a reasonable popularity proxy for the genre, and add its two-letter code to `GENRE_COUNTRIES` in `src/providers/kworb.py`.
+1. **Find the genre's Wikidata QID.** Search [wikidata.org](https://www.wikidata.org) for the genre (e.g. "K-pop" is `Q213665`) and add it to `GENRE_QIDS` in `src/registry/providers/wikidata.py`.
+2. **Pick a representative kworb country chart.** Check [kworb.net/youtube/insights/](https://kworb.net/youtube/insights/) for a country whose chart is a reasonable popularity proxy for the genre, and add its two-letter code to `GENRE_COUNTRIES` in `src/registry/providers/kworb.py`.
 This is a seed, not a strict rule - it does not need to be a perfect match.
 3. **Create empty manual curation files:** `data/channels/<genre>_manual.yaml` and `data/channels/<genre>_exclude.yaml` (copy the structure/comments from the `kpop_*`/`jpop_*` versions already in that folder).
 4. **Run discovery for it:** `python run.py sync --genre <genre>`.
@@ -192,7 +193,7 @@ Manual entries always win over both automated sources; exclusions are applied la
 
 ## API spend safeguards
 
-`src/api_budget.py` tracks daily usage for both the YouTube Data API and the Gemini API in `data/.api_usage.json` (resets automatically at midnight, git-ignored).
+`src/shared/api_budget.py` tracks daily usage for both the YouTube Data API and the Gemini API in `data/.api_usage.json` (resets automatically at midnight, git-ignored).
 Both `sync` and any AI-assisted step (title cleanup, same-song grouping) stop cleanly before actually exceeding either budget, rather than failing with a raw API error mid-run.
 
 Defaults match YouTube's standard free-tier daily quota (10,000 units) and a conservative placeholder for Gemini.
@@ -219,7 +220,7 @@ If a `sync` run gets stopped by the budget guard partway through, nothing is los
 
 ## Tuning worker pools
 
-`src/pipeline.py` downloads and encodes clips through two independent thread pools: `--download-workers` (default 6) and `--encode-workers` (default 3).
+`src/render/pipeline.py` downloads and encodes clips through two independent thread pools: `--download-workers` (default 6) and `--encode-workers` (default 3).
 They are deliberately separate because they are bound by different resources:
 
 - **Download workers** are limited by network bandwidth *and* by YouTube's own per-IP rate limiting - past a certain concurrency, adding more workers does not increase throughput and starts triggering throttled/`403 Forbidden` responses instead.
@@ -250,4 +251,4 @@ For a 200 Mbps connection specifically, start with `python run.py csv --download
 > **Note:** Video clips and databases are excluded from version control via `.gitignore` to avoid hitting GitHub file size limits.
 >
 > `run.py` auto-checks PyPI for a newer `yt-dlp` release (at most once/day) before every `csv`/`search`/`chart` run and upgrades it automatically if one exists, since a stale `yt-dlp` is the most common cause of silent download failures.
-> The other dependencies are stable enough not to need this - rerun `make update` if you need to refresh them.
+> The other dependencies are stable enough not to need this - rerun `pip install -r requirements.txt --upgrade` if you need to refresh them.

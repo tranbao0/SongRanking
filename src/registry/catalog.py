@@ -106,36 +106,40 @@ def _fetch_durations(youtube, video_ids: list[str]) -> dict[str, int]:
     return durations
 
 
-def _confirmed_artists_by_genre(conn) -> dict[str, list[re.Pattern]]:
+def _confirmed_artists_by_genre(conn) -> dict[str, list[tuple[str, re.Pattern]]]:
     """
-    Word-boundary regex per Wikidata-confirmed artist, grouped by genre.
-    Used to filter large kworb-sourced channels down to videos that
-    actually belong to a genre-confirmed artist (see
-    _SHARED_CHANNEL_VIDEO_THRESHOLD above).
+    (artist_name, word-boundary regex) pairs per Wikidata-confirmed artist,
+    grouped by genre. Used both to filter large kworb-sourced channels down
+    to videos that actually belong to a genre-confirmed artist (see
+    _SHARED_CHANNEL_VIDEO_THRESHOLD above), and - passed through to
+    song_grouping as artist_patterns - to tag which artist a title belongs
+    to, so grouping can't merge two different artists' same-titled songs
+    together on a channel that hosts more than one.
     """
     rows = conn.execute("SELECT genre, display_name FROM channels WHERE source = 'wikidata'").fetchall()
-    patterns: dict[str, list[re.Pattern]] = {}
+    patterns: dict[str, list[tuple[str, re.Pattern]]] = {}
     for row in rows:
         name = row["display_name"].strip()
         if not name:
             continue
-        patterns.setdefault(row["genre"], []).append(re.compile(r"\b" + re.escape(name) + r"\b", re.IGNORECASE))
+        pattern = re.compile(r"\b" + re.escape(name) + r"\b", re.IGNORECASE)
+        patterns.setdefault(row["genre"], []).append((name, pattern))
     return patterns
 
 
-def _matches_confirmed_artist(title: str, patterns: list[re.Pattern]) -> bool:
-    return any(p.search(title) for p in patterns)
+def _matches_confirmed_artist(title: str, patterns: list[tuple[str, re.Pattern]]) -> bool:
+    return any(p.search(title) for _, p in patterns)
 
 
 def sync_videos(channel_ids: list[str] | None = None) -> int:
     """
     Discover new uploads for the given channels (all tracked channels,
     oldest-synced-first, if None), filter to official MVs, group same-song
-    duplicates (across each channel's full catalog, old + new - a new
-    upload might belong to an existing song group), and upsert into the
-    videos table. Stops early (without crashing) if the YouTube API budget
-    is exhausted - channels completed so far are already committed and
-    will be skipped on the next run via last_catalog_sync ordering.
+    duplicates (only new uploads are (re-)classified - see song_grouping's
+    module docstring), and upsert into the videos table. Stops early
+    (without crashing) if the YouTube API budget is exhausted - channels
+    completed so far are already committed and will be skipped on the
+    next run via last_catalog_sync ordering.
     Returns the number of new videos upserted.
     """
     conn = db.get_connection()
@@ -180,10 +184,22 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
                       f"({row['last_known_video_count']} -> {video_count}), walking new uploads...")
 
                 existing = conn.execute(
-                    "SELECT video_id, title, url, published_at, discovered_at FROM videos WHERE channel_id = ?",
+                    "SELECT video_id, title, url, published_at, discovered_at, song_id FROM videos WHERE channel_id = ?",
                     (channel_id,),
                 ).fetchall()
                 existing_ids = {r["video_id"] for r in existing}
+
+                # Non-empty only for large kworb-sourced channels (see
+                # _SHARED_CHANNEL_VIDEO_THRESHOLD) - those are the only ones
+                # where a title's artist isn't already implied by channel_id
+                # alone, so this is the only case where song_grouping needs
+                # per-title artist tagging to avoid merging two different
+                # artists' same-titled songs.
+                shared_patterns = (
+                    artist_patterns.get(row["genre"], [])
+                    if row["source"] == "kworb" and (video_count or 0) > _SHARED_CHANNEL_VIDEO_THRESHOLD
+                    else []
+                )
 
                 new_uploads = _list_new_uploads(youtube, playlist_id, existing_ids)
                 new_mvs = []
@@ -194,16 +210,14 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
                         if is_valid_mv(v["title"], durations.get(v["video_id"], 0))
                     ]
 
-                    if row["source"] == "kworb" and (video_count or 0) > _SHARED_CHANNEL_VIDEO_THRESHOLD:
-                        patterns = artist_patterns.get(row["genre"], [])
-                        if patterns:
-                            before = len(new_mvs)
-                            new_mvs = [v for v in new_mvs if _matches_confirmed_artist(v["title"], patterns)]
-                            if len(new_mvs) != before:
-                                print(f"    filtered {before - len(new_mvs)} video(s) not matching a "
-                                      f"confirmed {row['genre']} artist (likely shared channel)")
+                    if shared_patterns:
+                        before = len(new_mvs)
+                        new_mvs = [v for v in new_mvs if _matches_confirmed_artist(v["title"], shared_patterns)]
+                        if len(new_mvs) != before:
+                            print(f"    filtered {before - len(new_mvs)} video(s) not matching a "
+                                  f"confirmed {row['genre']} artist (likely shared channel)")
 
-                all_videos = [dict(r) for r in existing] + [
+                new_video_dicts = [
                     {
                         "video_id":      v["video_id"],
                         "title":         v["title"],
@@ -214,22 +228,29 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
                     for v in new_mvs
                 ]
 
-                print(f"    grouping {len(all_videos)} video(s) into songs "
-                      f"({len(new_mvs)} new)...")
-                song_map = song_grouping.group_channel_videos(conn, channel_id, all_videos)
+                # existing videos already have a settled song_id and are never
+                # re-grouped - only new_video_dicts goes through song_grouping,
+                # so AI usage scales with today's new uploads, not the channel's
+                # whole history.
+                if new_video_dicts:
+                    print(f"    grouping {len(new_video_dicts)} new video(s) into songs...")
+                song_map = song_grouping.group_channel_videos(
+                    conn, channel_id, existing, new_video_dicts, artist_patterns=shared_patterns,
+                )
 
                 rows_to_upsert = [
                     {**v, "channel_id": channel_id, "song_id": song_map.get(v["video_id"])}
-                    for v in all_videos
+                    for v in new_video_dicts
                 ]
-                conn.executemany(
-                    """
-                    INSERT INTO videos (video_id, channel_id, title, url, published_at, discovered_at, song_id)
-                    VALUES (:video_id, :channel_id, :title, :url, :published_at, :discovered_at, :song_id)
-                    ON CONFLICT(video_id) DO UPDATE SET title=excluded.title, song_id=excluded.song_id
-                    """,
-                    rows_to_upsert,
-                )
+                if rows_to_upsert:
+                    conn.executemany(
+                        """
+                        INSERT INTO videos (video_id, channel_id, title, url, published_at, discovered_at, song_id)
+                        VALUES (:video_id, :channel_id, :title, :url, :published_at, :discovered_at, :song_id)
+                        ON CONFLICT(video_id) DO UPDATE SET title=excluded.title, song_id=excluded.song_id
+                        """,
+                        rows_to_upsert,
+                    )
                 conn.execute(
                     "UPDATE channels SET last_catalog_sync = ?, last_known_video_count = ? WHERE channel_id = ?",
                     (datetime.now().isoformat(), video_count, channel_id),
