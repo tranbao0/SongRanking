@@ -12,6 +12,7 @@ doesn't lose the whole batch.
 
 import json
 
+from shared import gemini_client
 from shared.gemini_client import call_gemini, chunked
 
 _PROMPT_TEMPLATE = """\
@@ -66,6 +67,8 @@ def clean_titles(songs: list[dict]) -> list[dict]:
     Modifies the 'title' and 'artist' keys in-place on each song dict.
     Returns the same list (modified).
     """
+    if not gemini_client.is_available():
+        return songs
     for chunk in chunked(songs):
         _clean_chunk(chunk)
     print(f"  [title_cleaner] Cleaned {len(songs)} title(s) via Gemini.\n")

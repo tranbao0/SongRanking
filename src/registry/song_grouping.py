@@ -64,6 +64,7 @@ import json
 import re
 from datetime import datetime
 
+from shared import gemini_client
 from shared.gemini_client import call_gemini, chunked
 
 # Chunks are independent (see group_channel_videos), so these overlap
@@ -509,13 +510,20 @@ def group_channel_videos(
         if anchor is not None:
             song_anchors[song_id] = anchor
 
-    chunks = chunked(singles)
+    # Checked before any chunking work: with no key there is nothing for the
+    # AI tier to do, and building prompts only to discard them would cost a
+    # pass over every remaining title plus a log line per chunk.
+    chunks = chunked(singles) if gemini_client.is_available() else []
     if len(chunks) > 2:
         # A large channel can mean dozens of chunked Gemini calls - without
         # this, that stretch looks identical to a hang.
         print(f"    {len(singles)} title(s) need AI grouping ({len(chunks)} chunk(s))...")
 
     resolved: list[tuple[int | None, list[dict]]] = [(None, members) for members in confident]
+    if singles and not chunks:
+        # AI unavailable: every unresolved title becomes its own song,
+        # exactly as it would if each call had failed.
+        resolved.extend((None, [v]) for v in singles)
 
     # Chunks are independent by construction: every one is handed the same
     # existing_songs snapshot, built above and never updated between calls,

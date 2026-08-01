@@ -250,6 +250,13 @@ class GroupChannelVideosTest(unittest.TestCase):
     def setUp(self):
         self.conn = make_db()
         self.addCleanup(self.conn.close)
+        # These tests exercise the AI tier, which is skipped entirely when
+        # no key is configured - and the test environment has none. The
+        # call itself is still stubbed per-test; this only gets us past the
+        # availability check that guards the tier.
+        patcher = mock.patch.object(song_grouping.gemini_client, "is_available", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         add_channel(self.conn, "UC_a", display_name="Artist A")
         self.conn.commit()
 

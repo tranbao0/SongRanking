@@ -81,6 +81,37 @@ def chunked(items: list, size: int = CHUNK_SIZE) -> list[list]:
     return [items[i:i + size] for i in range(0, len(items), size)]
 
 
+# Reported once per process rather than once per call. Running deliberately
+# without a key is a supported mode - the free grouping tiers do the bulk of
+# the work - and a full sync makes thousands of calls, so repeating the
+# reason for each would bury everything else in the log.
+_UNAVAILABLE_REPORTED = False
+
+
+def is_available() -> bool:
+    """
+    Whether an AI call could be made at all: SDK importable and a key set.
+
+    Callers check this *before* preparing work, so a run without a key
+    skips the AI tier outright instead of building every prompt and
+    throwing the result away. call_gemini re-checks independently, so this
+    is an optimisation and a cleaner log, never the safety barrier.
+    """
+    global _UNAVAILABLE_REPORTED
+    if not _SDK_AVAILABLE:
+        reason = "'google-genai' package not installed"
+    elif not os.environ.get("GEMINI_API_KEY", "").strip():
+        reason = "GEMINI_API_KEY not set"
+    else:
+        return True
+
+    if not _UNAVAILABLE_REPORTED:
+        print(f"  [gemini_client] {reason} - AI steps are disabled for this run "
+              f"(grouping still runs its free tiers; unmatched uploads stay their own song).")
+        _UNAVAILABLE_REPORTED = True
+    return False
+
+
 def _is_retryable(exc: Exception) -> bool:
     """
     True for rate limits and transient server-side failures only. A bad key
