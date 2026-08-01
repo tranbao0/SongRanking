@@ -1,7 +1,7 @@
 # Song Ranking Video Automation Engine
 
-An automated pipeline for tracking music video popularity across genres and rendering countdown-style compilation videos from the results.
-The system has three components that build on each other: a discovery and data layer that tracks genre-tagged artists and their view-count history over time, a chart engine that turns that history into named rankings, and a render pipeline that turns a ranking into a finished video.
+Pipeline for tracking music video popularity across genres and rendering countdown-style compilation videos from the results.
+Three components: a discovery/data layer, a chart engine, and a render pipeline.
 
 ## Table of contents
 
@@ -20,28 +20,26 @@ The system has three components that build on each other: a discovery and data l
 
 ### 1. Discovery & data layer
 
-This is the part of the system that answers "who counts as an artist in this genre, and how popular are their songs over time."
-It is entirely local: everything it produces lives in `data/registry.db` (SQLite), and nothing downstream re-derives it from scratch on every run.
+Tracks genre-tagged artists and their view-count history. Everything it produces lives in `data/registry.db` (SQLite).
 
-Channel discovery cross-references two sources per genre, plus manual overrides:
+Channel discovery, per genre:
 
-- **Wikidata** - a SPARQL query finds every artist tagged with the target genre that has a linked YouTube channel.
-This is the authoritative source: an artist Wikidata confirms is kept regardless of whether kworb also finds them.
-It is not restricted to bands/groups, so solo artists are included too.
-- **kworb** - each genre's representative country chart on [kworb.net](https://kworb.net/youtube/insights/) is used as a popularity-based seed, resolved to channels via `yt-dlp` (no API quota cost).
-This catches artists Wikidata does not have yet, but it is not genre-aware, so it is unioned on top of Wikidata's results rather than trusted on its own.
-- **Manual yaml files** - `data/channels/<genre>_manual.yaml` and `data/channels/<genre>_exclude.yaml` patch whatever the two automated sources get wrong, in either direction.
+- **Wikidata** - SPARQL query for artists tagged with the genre and a linked YouTube channel (`P2397`). Includes solo artists, not just groups/bands. Source of truth on conflicts.
+- **kworb** - each genre's representative country chart on [kworb.net](https://kworb.net/youtube/insights/), resolved to channel IDs via `yt-dlp`. Unioned on top of Wikidata's results.
+- **Manual yaml** - `data/channels/<genre>_manual.yaml` (additions) and `data/channels/<genre>_exclude.yaml` (exclusions).
 
-Once channels are known, `catalog.py` walks each channel's uploads via the YouTube Data API, filters out non-official-MV content (compilations, wrong duration, etc.), and clusters videos that are really the same song (an official MV plus its dance-practice or lyric-video counterpart, for example) so their view counts aggregate into one chart entry instead of splitting across rows.
-Grouping is incremental: once a video has been assigned to a song, it is never re-classified, so each sync only spends local/AI work on that channel's genuinely new uploads instead of its whole history - see `song_grouping.py`'s module docstring for the three-tier matching it uses (exact title match, local clustering, then a Gemini pass for whatever's left, which also disambiguates by artist on large multi-artist channels).
-`snapshot.py` then records each tracked video's current view count once per run, building up real day-by-day history rather than approximating it.
+`catalog.py`:
+- Walks each channel's uploads via the YouTube Data API.
+- Filters to official MVs (`mv_filter.py`: duration window, blocklist for compilations/playlists/etc).
+- Groups uploads that are the same underlying song (`song_grouping.py`) so their views aggregate into one chart entry. Additive: a video's `song_id` is set once and never re-derived, so a sync only classifies that channel's new uploads, not its full history. Three tiers: exact normalized-title match against existing videos, local clustering among new uploads, then a Gemini pass for the remainder (also tags titles by Wikidata-confirmed artist on large multi-artist channels to keep different artists' same-titled songs from merging).
 
-Run this layer with `python run.py sync`. See [Commands](#commands) below for the full picture, including the cost-saving behavior that makes routine daily syncs cheap.
+`snapshot.py` records each tracked video's current view count once per run (`view_snapshots` table).
+
+Run with `python run.py sync`.
 
 ### 2. Chart engine
 
-A chart is just a declarative combination of genre, ranking metric, and time window, defined in `data/charts.yaml` and computed by `charts.py` purely from the local database - no network calls at all.
-Three metrics exist today:
+A chart = genre + metric + time window, defined in `data/charts.yaml`, computed by `charts.py` from the local database only (no network calls).
 
 | Metric | Meaning |
 |---|---|
@@ -49,13 +47,12 @@ Three metrics exist today:
 | `gained` | Views gained over the last `window_days` days, highest first. |
 | `newest` | Most recently published, regardless of views. |
 
-Adding a new chart is a config change, not a code change - see [the customization guide](#guide-adding-or-customizing-a-chart).
+A song group's `url`/`title` for rendering come from its highest-individual-views member. Adding a chart is a config change - see [the customization guide](#guide-adding-or-customizing-a-chart).
 
 ### 3. Render pipeline
 
-This is the original part of the system: given a ranked list of songs, download a clip of each, overlay the rank/title/artist/badge graphics, and concatenate everything into `final_compilation.mp4`.
-It does not care where the ranking came from - it consumes the same shaped data whether it was produced by the chart engine, a live YouTube search, or a hand-maintained CSV.
-Each ranking source keeps its own run-over-run history (so "new entry," "re-entry," and rank-change badges work correctly), stored as a CSV per source: `data/songs.csv` for the legacy manual/search workflow, and `data/charts/<chart_name>.csv` per named chart.
+Given a ranked list of songs: download a clip of each, overlay rank/title/artist/badge graphics, concatenate into `final_compilation.mp4`.
+Same renderer regardless of ranking source (chart engine, live search, or manual CSV). Each source keeps its own run-history CSV for rank-change/new-entry/re-entry badges: `data/songs.csv` (legacy manual/search workflow) or `data/charts/<chart_name>.csv` (per named chart).
 
 ```
 Wikidata ─┐
@@ -90,8 +87,8 @@ cp .env.example .env   # add your GEMINI_API_KEY and YOUTUBE_API_KEY
 pip install -r requirements.txt   # install all Python dependencies
 ```
 
-`YOUTUBE_API_KEY` is required for `sync`/`chart` (and gives much better `csv`/`search` results too).
-`GEMINI_API_KEY` is optional; it powers AI title cleanup and same-song grouping, and both features degrade gracefully (skipped, not crashed) if it is absent.
+`YOUTUBE_API_KEY`: required for `sync`/`chart`; also improves `csv`/`search` results.
+`GEMINI_API_KEY`: optional, used for AI title cleanup and song grouping; both fall back to non-AI behavior if unset.
 
 ## Commands
 
@@ -118,29 +115,26 @@ python run.py chart --name kpop_alltime      # compute + render a named chart fr
 python run.py chart --name kpop_alltime --limit 10
 ```
 
-`sync` never downloads or renders video - it only updates `data/registry.db`.
-`chart` never re-fetches view counts from YouTube for ranking purposes - it reads whatever `sync` last recorded, then renders.
-In other words: run `sync` on whatever cadence you want fresh data (daily is the intended cadence), and run `chart` whenever you actually want a video, independent of that.
-
-A first-time `sync` has to walk every channel's full upload history and is comparatively expensive; every `sync` after that is cheap; because it only re-checks channels for new uploads instead of re-walking everything (see [API spend safeguards](#api-spend-safeguards)).
+- `sync` only updates `data/registry.db` - no download/render.
+- `chart` only reads what `sync` last recorded - no fresh YouTube fetch.
+- A channel's first `sync` walks its full upload history; later syncs only check for new uploads (see [API spend safeguards](#api-spend-safeguards)).
 
 Shared flags: `--limit` (cap song count), `--download-workers` / `--encode-workers` (see [Tuning worker pools](#tuning-worker-pools)), `--no-filter` (search mode only, skips MV/duration filtering).
 
 ## Guide: adding a new genre
 
-1. **Find the genre's Wikidata QID.** Search [wikidata.org](https://www.wikidata.org) for the genre (e.g. "K-pop" is `Q213665`) and add it to `GENRE_QIDS` in `src/registry/providers/wikidata.py`.
-2. **Pick a representative kworb country chart.** Check [kworb.net/youtube/insights/](https://kworb.net/youtube/insights/) for a country whose chart is a reasonable popularity proxy for the genre, and add its two-letter code to `GENRE_COUNTRIES` in `src/registry/providers/kworb.py`.
-This is a seed, not a strict rule - it does not need to be a perfect match.
-3. **Create empty manual curation files:** `data/channels/<genre>_manual.yaml` and `data/channels/<genre>_exclude.yaml` (copy the structure/comments from the `kpop_*`/`jpop_*` versions already in that folder).
-4. **Run discovery for it:** `python run.py sync --genre <genre>`.
-5. **Review the results.** kworb-sourced channels are the ones most likely to need pruning (see [manual curation](#guide-manual-channel-curation)) - a country chart mixes in artists who do not belong to the new genre.
-6. **Add chart definitions for it** in `data/charts.yaml` - see the next section.
+1. **Find the genre's Wikidata QID.** [wikidata.org](https://www.wikidata.org) (e.g. "K-pop" is `Q213665`). Add it to `GENRE_QIDS` in `src/registry/providers/wikidata.py`.
+2. **Pick a representative kworb country chart.** [kworb.net/youtube/insights/](https://kworb.net/youtube/insights/). Add the two-letter code to `GENRE_COUNTRIES` in `src/registry/providers/kworb.py`.
+3. **Create manual curation files:** `data/channels/<genre>_manual.yaml` and `data/channels/<genre>_exclude.yaml` (copy structure from existing `kpop_*`/`jpop_*` files).
+4. **Run discovery:** `python run.py sync --genre <genre>`.
+5. **Review results** - kworb-sourced channels are most likely to need pruning (see [manual curation](#guide-manual-channel-curation)).
+6. **Add chart definitions** in `data/charts.yaml`.
 
-No other code changes are required. Everything downstream (catalog sync, view snapshots, chart computation, rendering) is already genre-generic.
+No other code changes required - catalog sync, view snapshots, chart computation, and rendering are genre-generic.
 
 ## Guide: adding or customizing a chart
 
-Charts are pure configuration in `data/charts.yaml`. Each entry:
+Charts are configuration in `data/charts.yaml`. Each entry:
 
 ```yaml
 - name: kpop_weekly_gainers   # used as: python run.py chart --name kpop_weekly_gainers
@@ -150,8 +144,7 @@ Charts are pure configuration in `data/charts.yaml`. Each entry:
   limit: 50                     # how many songs to include
 ```
 
-To add a chart, add an entry - no code changes needed for any combination of an existing genre with an existing metric.
-A few examples:
+Adding a chart = adding an entry, for any combination of an existing genre + metric.
 
 ```yaml
 - name: jpop_monthly_gainers
@@ -167,44 +160,41 @@ A few examples:
   limit: 100
 ```
 
-One real constraint: a `gained` chart's `window_days` is only as accurate as how long `sync` has actually been running daily - there is no approximation from publish date, only real recorded history.
-A brand-new 90-day chart will not produce meaningful results until `sync` has been run daily for 90 days.
+`gained`'s `window_days` accuracy is bounded by how long `sync` has been run daily - a new 90-day window needs 90 days of recorded history first.
 
-Adding a genuinely new **metric** (something that is not "sum of views," "delta of views," or "most recent") requires a small code change in `charts.py`'s `compute_chart()` - everything else (loading definitions, grouping by song, rendering) is shared and does not need to change.
+Adding a new **metric** (not "sum," "delta," or "most recent") requires a code change in `charts.py`'s `compute_chart()`.
 
 ## Guide: manual channel curation
 
-`data/channels/<genre>_manual.yaml` and `data/channels/<genre>_exclude.yaml` are hand-maintained and safe to edit directly; `sync` re-reads them every time.
+`data/channels/<genre>_manual.yaml` / `_exclude.yaml` are hand-edited directly; `sync` re-reads them every run.
 
-**Manual additions** (patches gaps neither Wikidata nor kworb caught):
+**Manual additions:**
 
 ```yaml
 - channel_id: UCxxxxxxxxxxxxxxxxxxxxxx
   display_name: Artist Name
 ```
 
-**Exclusions** (drops a channel regardless of which source found it - most useful for kworb noise, since a country's chart can include artists who do not actually belong to the genre):
+**Exclusions** (drops a channel regardless of source):
 
 ```yaml
 - channel_id: UCxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-Manual entries always win over both automated sources; exclusions are applied last, after everything else is merged.
+Precedence: manual additions > automated sources; exclusions applied last.
 
 ## API spend safeguards
 
-`src/shared/api_budget.py` tracks daily usage for both the YouTube Data API and the Gemini API in `data/.api_usage.json` (resets automatically at midnight, git-ignored).
-Both `sync` and any AI-assisted step (title cleanup, same-song grouping) stop cleanly before actually exceeding either budget, rather than failing with a raw API error mid-run.
+`src/shared/api_budget.py` tracks daily usage for the YouTube Data API and Gemini API in `data/.api_usage.json` (resets at midnight, git-ignored). `sync` and AI-assisted steps (title cleanup, song grouping) stop before exceeding budget instead of erroring mid-run.
 
-Defaults match YouTube's standard free-tier daily quota (10,000 units) and a conservative placeholder for Gemini.
-Override either in `.env` if your actual tier differs:
+Defaults: YouTube 10,000 units/day, Gemini 1,500 requests/day. Override in `.env`:
 
 ```bash
 YOUTUBE_DAILY_QUOTA=10000
 GEMINI_DAILY_LIMIT=1500
 ```
 
-If a `sync` run gets stopped by the budget guard partway through, nothing is lost - already-completed channels are committed immediately, and the next `sync` run picks up with the least-recently-synced channels first instead of redoing finished work.
+A budget-stopped `sync` resumes from the least-recently-synced channel on the next run - no completed work is redone.
 
 ## Data files
 
@@ -220,35 +210,31 @@ If a `sync` run gets stopped by the budget guard partway through, nothing is los
 
 ## Tuning worker pools
 
-`src/render/pipeline.py` downloads and encodes clips through two independent thread pools: `--download-workers` (default 6) and `--encode-workers` (default 3).
-They are deliberately separate because they are bound by different resources:
+`src/render/pipeline.py` downloads and encodes clips through two independent thread pools: `--download-workers` (default 6), `--encode-workers` (default 3).
 
-- **Download workers** are limited by network bandwidth *and* by YouTube's own per-IP rate limiting - past a certain concurrency, adding more workers does not increase throughput and starts triggering throttled/`403 Forbidden` responses instead.
-- **Encode workers** are limited by hardware: GPU encode session capacity (NVENC/QSV/AMF) or CPU core count for the `libx264` fallback.
-
-If downloads cannot keep up, extra encode workers just sit idle waiting for clips - there is nothing for them to do.
-This is the common case on slow connections, and it is why the two pools are sized independently rather than sharing one worker count.
+- **Download workers**: bounded by network bandwidth and YouTube's per-IP rate limiting.
+- **Encode workers**: bounded by hardware - GPU encode session capacity (NVENC/QSV/AMF) or CPU core count (`libx264` fallback).
 
 ### Rule of thumb by connection speed
 
 Assuming ~15s clips at 1080p, default frame rate (roughly 5-10 MB per clip):
 
-| Connection speed | `--download-workers` | `--encode-workers` (GPU) | `--encode-workers` (CPU only) | Why |
+| Connection speed | `--download-workers` | `--encode-workers` (GPU) | `--encode-workers` (CPU only) | Bottleneck |
 |---|:---:|:---:|:---:|---|
-| < 25 Mbps | 2-3 | 2 | 1-2 | Network-bound - extra encode workers would mostly idle. |
-| 25-100 Mbps | 4-6 (default) | 3 (default) | 2-3 | Balanced; the defaults are a reasonable starting point. |
-| 100-300 Mbps | 6-8 | 3-4 | 3-4 | Bandwidth stops being the limit; YouTube-side rate limiting becomes the real ceiling, so pushing much past 8 rarely helps. |
-| 300+ Mbps / very fast link | 8-10 | 4-6 | ~physical cores / 2 | Encode hardware is now the bottleneck - a bigger download pool will not speed things up further. |
+| < 25 Mbps | 2-3 | 2 | 1-2 | Network |
+| 25-100 Mbps | 4-6 (default) | 3 (default) | 2-3 | Balanced |
+| 100-300 Mbps | 6-8 | 3-4 | 3-4 | YouTube-side rate limiting |
+| 300+ Mbps / very fast link | 8-10 | 4-6 | ~physical cores / 2 | Encode hardware |
 
-For a 200 Mbps connection specifically, start with `python run.py csv --download-workers 6 --encode-workers 4` (GPU) - bandwidth has stopped being the constraint by that point, so there is little upside to a larger download pool, while the encode pool can be sized to hardware capacity since downloads will comfortably keep it fed.
+For a 200 Mbps connection: `python run.py csv --download-workers 6 --encode-workers 4` (GPU).
 
 ### Estimating manually
 
-- Per-clip download time ≈ `clip_size_MB × 8 / per_connection_mbps` + ~3-5s fixed overhead (connection setup, format negotiation) - on fast connections this fixed cost matters more than raw bandwidth.
+- Per-clip download time ≈ `clip_size_MB × 8 / per_connection_mbps` + ~3-5s fixed overhead (connection setup, format negotiation).
 - Per-clip encode time ≈ 2-5s on GPU, 10-30s on CPU (`libx264 -preset fast`).
-- Encode workers beyond `download_workers × (download_time_per_clip / encode_time_per_clip)` will not have enough incoming clips to stay busy - that is the point past which more `--encode-workers` stops helping.
+- Encode workers beyond `download_workers × (download_time_per_clip / encode_time_per_clip)` sit idle.
 
-> **Note:** Video clips and databases are excluded from version control via `.gitignore` to avoid hitting GitHub file size limits.
+> **Note:** Video clips and databases are excluded from version control via `.gitignore` (GitHub file size limits).
 >
-> `run.py` auto-checks PyPI for a newer `yt-dlp` release (at most once/day) before every `csv`/`search`/`chart` run and upgrades it automatically if one exists, since a stale `yt-dlp` is the most common cause of silent download failures.
-> The other dependencies are stable enough not to need this - rerun `pip install -r requirements.txt --upgrade` if you need to refresh them.
+> `run.py` checks PyPI for a newer `yt-dlp` release (at most once/day) before every `csv`/`search`/`chart` run and upgrades automatically if found.
+> Other dependencies: `pip install -r requirements.txt --upgrade`.
