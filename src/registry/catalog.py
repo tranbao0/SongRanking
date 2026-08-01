@@ -25,7 +25,7 @@ from datetime import date, datetime
 from registry import db, song_grouping
 from shared import api_budget
 from shared.mv_filter import is_blocked_title, is_valid_mv
-from shared.youtube_api import _get_client, _parse_iso_duration
+from shared.youtube_api import chunked_ids, get_client, parse_iso_duration
 
 # Channels above this video count are treated as likely shared/label
 # channels (e.g. "HYBE LABELS" or "1theK" hosting many different acts)
@@ -109,12 +109,11 @@ def _list_new_uploads(youtube, playlist_id: str, known_video_ids: set[str]) -> l
 
 def _fetch_durations(youtube, video_ids: list[str]) -> dict[str, int]:
     durations = {}
-    for i in range(0, len(video_ids), 50):
-        chunk = video_ids[i:i + 50]
+    for chunk in chunked_ids(video_ids):
         response = youtube.videos().list(part="contentDetails", id=",".join(chunk)).execute()
         api_budget.record_youtube_units(1)
         for item in response.get("items", []):
-            durations[item["id"]] = _parse_iso_duration(item["contentDetails"].get("duration", ""))
+            durations[item["id"]] = parse_iso_duration(item["contentDetails"].get("duration", ""))
     return durations
 
 
@@ -264,7 +263,7 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
             for genre, patterns in artist_patterns.items()
         }
         no_artist_index = song_grouping.build_artist_index([])
-        youtube = _get_client()
+        youtube = get_client()
         upserted = 0
         processed = 0
 

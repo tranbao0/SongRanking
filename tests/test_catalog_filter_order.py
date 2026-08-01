@@ -45,7 +45,7 @@ class FilterOrderTest(unittest.TestCase):
             fetched.extend(video_ids)
             return {vid: 200 for vid in video_ids}  # all inside the MV window
 
-        with mock.patch.object(catalog, "_get_client", return_value=mock.Mock()), \
+        with mock.patch.object(catalog, "get_client", return_value=mock.Mock()), \
              mock.patch.object(catalog, "_channel_status", return_value=("PL_x", 9999)), \
              mock.patch.object(catalog, "_list_new_uploads", return_value=uploads), \
              mock.patch.object(catalog, "_fetch_durations", side_effect=_fake_durations), \
@@ -82,7 +82,7 @@ class FilterOrderTest(unittest.TestCase):
     def test_surviving_videos_are_still_duration_checked(self):
         """Pre-filtering must not let a too-short clip through."""
         uploads = [self._upload("short", "BTS - Dynamite Official MV")]
-        with mock.patch.object(catalog, "_get_client", return_value=mock.Mock()), \
+        with mock.patch.object(catalog, "get_client", return_value=mock.Mock()), \
              mock.patch.object(catalog, "_channel_status", return_value=("PL_x", 9999)), \
              mock.patch.object(catalog, "_list_new_uploads", return_value=uploads), \
              mock.patch.object(catalog, "_fetch_durations", return_value={"short": 5}), \

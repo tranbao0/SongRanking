@@ -47,7 +47,7 @@ class SyncResilienceTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def _sync(self, status_side_effect, uploads_side_effect=None):
-        with mock.patch.object(catalog, "_get_client", return_value=mock.Mock()), \
+        with mock.patch.object(catalog, "get_client", return_value=mock.Mock()), \
              mock.patch.object(catalog, "_channel_status", side_effect=status_side_effect), \
              mock.patch.object(catalog, "_list_new_uploads",
                                side_effect=uploads_side_effect or (lambda *a: [])), \
