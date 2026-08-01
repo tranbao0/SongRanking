@@ -214,7 +214,9 @@ Titles the blocklist already rejects are dropped before their durations are fetc
 
 **Gemini** is billed per token, and a request's instruction preamble, candidate-song list and thinking cost are all paid per call regardless of how many titles it carries.
 Grouping therefore sends large chunks (`CHUNK_SIZE` in `src/shared/gemini_client.py`) rather than many small ones - see the measured table in that file.
-Rate limits and transient server errors are retried with jittered backoff, because song grouping is additive: a call that fails is not retried later, so its videos would stay permanently ungrouped.
+Failures are retried at two levels, because song grouping is additive: a chunk that fails is never revisited, so its videos would stay permanently ungrouped.
+Rate limits and transient server errors are retried with jittered backoff inside `gemini_client`, and a response that arrives but can't be parsed is re-asked once by `song_grouping` (sampling is stochastic, so a re-ask usually succeeds).
+Errors that cannot succeed - a bad key, a malformed request - are not retried at all, since every attempt is a billed request.
 
 ## Data files
 

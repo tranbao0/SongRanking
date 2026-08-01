@@ -287,6 +287,50 @@ def _local_cluster(videos: list[dict], artist_index: _ArtistIndex) -> dict:
     return groups
 
 
+_MALFORMED_RESPONSE_ERRORS = (
+    json.JSONDecodeError, ValueError, TypeError, IndexError, AttributeError,
+)
+
+# How many times a chunk is asked to classify before giving up and leaving
+# it ungrouped. Applies only to a response that arrives but can't be read -
+# call_gemini already retries the transport itself, so a None from it is
+# a failure that has exhausted its own retries and won't improve here.
+#
+# Worth one extra request because the cost is asymmetric: sampling is
+# stochastic so a re-ask usually parses, whereas giving up strands a whole
+# chunk of videos as singletons permanently - grouping is additive and
+# never revisits them.
+_MAX_PARSE_ATTEMPTS = 2
+
+
+def _parse_group_response(
+    text: str, videos: list[dict], existing_songs: dict[int, str],
+) -> list[tuple[int | None, list[dict]]]:
+    """
+    Turn one raw model response into (existing_song_id_or_None, members)
+    tuples. Tolerant about content - unusable entries are skipped and any
+    video the model didn't mention becomes its own group - but raises on
+    a response that isn't readable at all, which the caller retries.
+    """
+    raw_groups = json.loads(text)
+    seen = set()
+    groups = []
+    for raw in raw_groups:
+        member_nums = raw.get("members", [])
+        members = [videos[i - 1] for i in member_nums if isinstance(i, int) and 1 <= i <= len(videos)]
+        seen.update(i for i in member_nums if isinstance(i, int))
+        if not members:
+            continue
+        existing_id = raw.get("existing_id")
+        if existing_id not in existing_songs:
+            existing_id = None  # hallucinated/omitted ID - treat as a new song instead of crashing
+        groups.append((existing_id, members))
+    for i, v in enumerate(videos, start=1):
+        if i not in seen:
+            groups.append((None, [v]))
+    return groups
+
+
 def _ai_group_chunk(
     videos: list[dict], existing_songs: dict[int, str], artist_index: _ArtistIndex,
 ) -> list[tuple[int | None, list[dict]]]:
@@ -299,7 +343,7 @@ def _ai_group_chunk(
     artist so the model won't merge two different artists' identically
     titled songs. Returns (existing_song_id_or_None, members) tuples -
     None means a new song not seen before. Falls back to all-new-
-    singletons on any failure.
+    singletons once retries are spent, so a video is never dropped.
     """
     def _label(title):
         artist = artist_index.match(title)
@@ -307,31 +351,23 @@ def _ai_group_chunk(
 
     existing_list = "\n".join(f"{sid}: {_label(title)}" for sid, title in existing_songs.items()) or "(none tracked yet)"
     entries = "\n".join(f"{i + 1}. {_label(v['title'])}" for i, v in enumerate(videos))
-    text = call_gemini(_GROUP_PROMPT.format(existing=existing_list, entries=entries, n=len(videos)))
-    if text is None:
-        return [(None, [v]) for v in videos]
+    prompt = _GROUP_PROMPT.format(existing=existing_list, entries=entries, n=len(videos))
 
-    try:
-        raw_groups = json.loads(text)
-        seen = set()
-        groups = []
-        for raw in raw_groups:
-            member_nums = raw.get("members", [])
-            members = [videos[i - 1] for i in member_nums if isinstance(i, int) and 1 <= i <= len(videos)]
-            seen.update(i for i in member_nums if isinstance(i, int))
-            if not members:
-                continue
-            existing_id = raw.get("existing_id")
-            if existing_id not in existing_songs:
-                existing_id = None  # hallucinated/omitted ID - treat as a new song instead of crashing
-            groups.append((existing_id, members))
-        for i, v in enumerate(videos, start=1):
-            if i not in seen:
-                groups.append((None, [v]))
-        return groups
-    except (json.JSONDecodeError, ValueError, TypeError, IndexError, AttributeError) as e:
-        print(f"  [song_grouping] AI grouping failed ({e}) - leaving this chunk ungrouped.")
-        return [(None, [v]) for v in videos]
+    for attempt in range(_MAX_PARSE_ATTEMPTS):
+        text = call_gemini(prompt)
+        if text is None:
+            break  # transport failure, already retried inside call_gemini
+        try:
+            return _parse_group_response(text, videos, existing_songs)
+        except _MALFORMED_RESPONSE_ERRORS as e:
+            remaining = _MAX_PARSE_ATTEMPTS - attempt - 1
+            if remaining:
+                print(f"  [song_grouping] Unreadable AI response ({e}) - re-asking "
+                      f"({remaining} attempt(s) left).")
+            else:
+                print(f"  [song_grouping] AI grouping failed ({e}) - leaving this chunk ungrouped.")
+
+    return [(None, [v]) for v in videos]
 
 
 def group_channel_videos(

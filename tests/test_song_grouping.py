@@ -351,6 +351,69 @@ class GroupChannelVideosTest(unittest.TestCase):
         self.assertEqual(len(seen), 2)
         self.assertEqual(seen[0], seen[1])
 
+    def _group_with_responses(self, new, responses):
+        """Runs grouping with call_gemini returning `responses` in order."""
+        calls = []
+
+        def _fake_call_gemini(prompt, model=None):
+            calls.append(prompt)
+            return responses[min(len(calls) - 1, len(responses) - 1)]
+
+        with mock.patch.object(song_grouping, "call_gemini", _fake_call_gemini):
+            result = song_grouping.group_channel_videos(self.conn, "UC_a", [], new)
+        return result, len(calls)
+
+    def test_unreadable_response_is_re_asked(self):
+        """
+        A malformed response is worth another request: sampling is
+        stochastic so a re-ask usually parses, and giving up strands the
+        whole chunk as singletons permanently.
+        """
+        new = [{"video_id": "a", "title": "Song One"}, {"video_id": "b", "title": "Song One Alt"}]
+        good = '[{"existing_id": null, "members": [1, 2]}]'
+
+        result, calls = self._group_with_responses(new, ["not json at all", good])
+        self.assertEqual(calls, 2)
+        self.assertEqual(result["a"], result["b"])  # the retry's grouping was used
+
+    def test_repeatedly_unreadable_response_falls_back_to_singletons(self):
+        new = [{"video_id": "a", "title": "Song One"}, {"video_id": "b", "title": "Song One Alt"}]
+
+        result, calls = self._group_with_responses(new, ["still not json"])
+        self.assertEqual(calls, song_grouping._MAX_PARSE_ATTEMPTS)
+        self.assertEqual(set(result), {"a", "b"})
+        self.assertNotEqual(result["a"], result["b"])  # nothing dropped, just ungrouped
+
+    def test_transport_failure_is_not_re_asked(self):
+        """
+        call_gemini returns None only after exhausting its own retries, so
+        asking again here just bills the same failure a second time.
+        """
+        new = [{"video_id": "a", "title": "Song One"}]
+        _, calls = self._group_with_responses(new, [None])
+        self.assertEqual(calls, 1)
+
+    def test_valid_response_costs_exactly_one_request(self):
+        new = [{"video_id": "a", "title": "Song One"}, {"video_id": "b", "title": "Song Two"}]
+        good = '[{"existing_id": null, "members": [1]}, {"existing_id": null, "members": [2]}]'
+
+        result, calls = self._group_with_responses(new, [good])
+        self.assertEqual(calls, 1)
+        self.assertNotEqual(result["a"], result["b"])
+
+    def test_json_that_parses_but_is_odd_is_not_re_asked(self):
+        """
+        Content-level weirdness is already handled tolerantly - skipped
+        entries, hallucinated ids, unmentioned videos - so it must not
+        trigger a retry and spend another request.
+        """
+        new = [{"video_id": "a", "title": "Song One"}, {"video_id": "b", "title": "Song Two"}]
+        odd = '[{"existing_id": 999, "members": [1, 47]}]'  # bad id, out-of-range member, b unmentioned
+
+        result, calls = self._group_with_responses(new, [odd])
+        self.assertEqual(calls, 1)
+        self.assertEqual(set(result), {"a", "b"})
+
     def test_failed_gemini_call_leaves_videos_as_singletons(self):
         """A failure must never drop a video, per the module docstring."""
         new = [{"video_id": f"v{i}", "title": f"Distinct Song {i}"} for i in range(3)]
