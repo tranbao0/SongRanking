@@ -13,6 +13,9 @@ Usage:
   python run.py sync --genre kpop         # refresh a single genre (repeatable)
 
   python run.py chart --name kpop_alltime # render a named chart from data/charts.yaml
+
+  python run.py decouple                  # clear song groupings so they can be redone
+  python run.py decouple --genre kpop     # one genre only
 """
 
 import json
@@ -67,9 +70,11 @@ def main():
     )
     parser.add_argument(
         "command",
-        choices=["csv", "search", "clean", "sync", "chart"],
+        choices=["csv", "search", "clean", "sync", "chart", "decouple"],
         help="Command to run",
     )
+    parser.add_argument("--yes", action="store_true",
+                        help="Skip the confirmation prompt (decouple mode only)")
     parser.add_argument("--q", metavar="QUERY", default="kpop songs",
                         help='Search query (search mode only, default: "kpop songs")')
     parser.add_argument("--genre", action="append", metavar="GENRE",
@@ -102,6 +107,15 @@ def main():
         print("Taking view snapshot...")
         snapshot_count = snapshot.take_snapshot()
         print(f"  {snapshot_count} snapshot row(s) inserted")
+        return
+
+    if args.command == "decouple":
+        from registry import decouple as decouple_mod
+
+        genres = args.genre or [None]
+        if len(genres) > 1:
+            parser.error("decouple takes at most one --genre")
+        decouple_mod.decouple(genre=genres[0], assume_yes=args.yes)
         return
 
     ensure_yt_dlp_up_to_date()

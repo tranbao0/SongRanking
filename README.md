@@ -125,6 +125,28 @@ python run.py chart --name kpop_alltime      # compute + render a named chart fr
 python run.py chart --name kpop_alltime --limit 10
 ```
 
+### Redoing grouping
+
+```bash
+python run.py decouple                  # clear song assignments for every genre
+python run.py decouple --genre kpop     # one genre only
+python run.py decouple --yes            # skip the confirmation (scripts)
+```
+
+Grouping is additive: a video's `song_id` is set once and never re-derived, which is what keeps a daily `sync` cheap.
+The consequence is that a registry grouped under settings you have since changed - or grouped without the AI tier because a budget ran out mid-run - cannot be improved by syncing again, because a sync only looks at videos it has never seen.
+`decouple` is the escape hatch: it clears the assignments so grouping can be made afresh.
+
+It never deletes videos. Only the grouping goes.
+
+**Read the confirmation before answering.** The cost is asymmetric:
+
+- A song holding one video loses nothing - re-deriving it is a local normalisation pass.
+- A song holding several videos is a real decision, and any made by the AI tier cost API calls to make again.
+
+The prompt reports both counts, and requires you to type `decouple` rather than accept a `y`.
+A timestamped backup is written before anything changes, so an accidental run costs no quota to undo - restore the `.pre-decouple.db` file.
+
 - `sync` only updates `data/registry.db` - no download/render.
 - `chart` only reads what `sync` last recorded - no fresh YouTube fetch.
 - A channel's first `sync` walks its full upload history; later syncs only check for new uploads (see [API spend safeguards](#api-spend-safeguards)).
