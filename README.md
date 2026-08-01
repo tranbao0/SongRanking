@@ -203,15 +203,28 @@ Fan lyric-video channels and re-uploaders carry the right genre but the wrong up
 `src/shared/api_budget.py` tracks daily usage for the YouTube Data API and Gemini API in `data/.api_usage.json` (resets at midnight, git-ignored).
 `sync` and AI-assisted steps (title cleanup, song grouping) stop before exceeding budget instead of erroring mid-run.
 
-Defaults: YouTube 10,000 units/day, Gemini 1,500 requests/day. Override in `.env`:
+Defaults: YouTube 10,000 units/day, Gemini 500 requests/day. Override in `.env`:
 
 ```bash
 YOUTUBE_DAILY_QUOTA=10000
-GEMINI_DAILY_LIMIT=1500
+GEMINI_DAILY_LIMIT=500
 ```
 
-The Gemini default is a conservative placeholder rather than a published limit.
-Paid tiers are far higher, and on a first full `sync` this value - not wall-clock speed - is what caps how many channels complete per day, so it is worth setting to your actual tier.
+`YOUTUBE_DAILY_QUOTA` matches YouTube's standard free-tier allocation.
+That allocation is fixed - raising it goes through a quota extension request rather than billing - so cloud credit does not lift it and there is rarely a reason to change this value.
+
+`GEMINI_DAILY_LIMIT` is a spend guard, not an estimate of any tier's rate limit.
+Gemini bills per token, so the request count isn't the cost directly, but capping requests bounds a runaway loop - which is the failure worth insuring against on a small prepaid balance.
+The default is deliberately low because the AI tier is optional: the free grouping tiers do the bulk of the work, so a sync that stops early loses little.
+On a first full `sync` this value, not wall-clock speed, is what caps how many channels complete per day - raise it if the bootstrap keeps stopping before you want it to.
+
+### Running without Gemini at all
+
+Leave `GEMINI_API_KEY` unset and the AI steps are skipped entirely, reporting once rather than per call.
+Grouping still runs its two free tiers; anything they can't match stays its own song, and nothing is dropped.
+
+On the current registry that costs less than it sounds.
+The free tiers already merge the predictable cases, and the residue the AI tier would judge is dominated by pairs that should stay separate anyway - remixes, and different songs by one artist whose titles overlap because the artist's name dominates them.
 
 A budget-stopped `sync` resumes from the least-recently-synced channel on the next run - no completed work is redone.
 

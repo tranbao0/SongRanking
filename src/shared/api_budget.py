@@ -23,9 +23,15 @@ _LOCK = threading.Lock()
 # Matches the YouTube Data API's standard free-tier daily quota.
 YOUTUBE_DAILY_QUOTA = int(os.environ.get("YOUTUBE_DAILY_QUOTA", 10000))
 
-# Conservative placeholder, not a published guarantee - Gemini free-tier
-# limits vary by model/tier and change over time. Set GEMINI_DAILY_LIMIT
-# in .env to your actual tier's limit if you know it.
+# A spend guard, not an estimate of any tier's rate limit. Gemini bills
+# per token, so requests aren't what costs money directly - but a request
+# cap is a blunt circuit-breaker that bounds a runaway loop, and on a
+# small prepaid balance that is the failure worth insuring against.
+#
+# Deliberately low. The free grouping tiers do the bulk of the work, and
+# the residue the AI tier judges on this data is dominated by pairs that
+# should stay separate anyway, so a sync that stops early loses very
+# little. Raise it if a bootstrap is stopping before you want it to.
 GEMINI_DAILY_LIMIT = int(os.environ.get("GEMINI_DAILY_LIMIT", 500))
 
 WARN_THRESHOLD = 0.8
