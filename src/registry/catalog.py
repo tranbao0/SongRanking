@@ -106,6 +106,36 @@ def _fetch_durations(youtube, video_ids: list[str]) -> dict[str, int]:
     return durations
 
 
+# A song is recorded against its artist's own channel when one is known,
+# even though the video that created it may sit on an aggregator or
+# broadcast channel that happened to upload it first (see song_grouping's
+# artist_home_channels). Matching only on videos.channel_id would never
+# find those, so the artist's own upload of the same song would start a
+# second song rather than joining the existing one - and on a bootstrap
+# the aggregators are exactly the channels that get catalogued first,
+# since kworb entries are inserted ahead of Wikidata's.
+_EXISTING_VIDEOS_SQL = """
+    SELECT video_id, title, url, published_at, discovered_at, song_id
+    FROM videos
+    WHERE channel_id = :channel_id
+    UNION
+    SELECT v.video_id, v.title, v.url, v.published_at, v.discovered_at, v.song_id
+    FROM videos v
+    JOIN songs s ON s.song_id = v.song_id
+    WHERE s.channel_id = :channel_id
+"""
+
+
+def _existing_videos(conn, channel_id: str) -> list:
+    """
+    Everything a new upload on `channel_id` should be matched against:
+    that channel's own videos, plus any video belonging to a song already
+    anchored to it. UNION rather than UNION ALL, so a video that satisfies
+    both halves is offered once.
+    """
+    return conn.execute(_EXISTING_VIDEOS_SQL, {"channel_id": channel_id}).fetchall()
+
+
 def _confirmed_artists(conn) -> tuple[dict[str, list[tuple[str, re.Pattern]]], dict[str, str]]:
     """
     One pass over the Wikidata-confirmed channels, returning both things
@@ -206,10 +236,7 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
                 print(f"  {progress} {channel_id}: video count changed "
                       f"({row['last_known_video_count']} -> {video_count}), walking new uploads...")
 
-                existing = conn.execute(
-                    "SELECT video_id, title, url, published_at, discovered_at, song_id FROM videos WHERE channel_id = ?",
-                    (channel_id,),
-                ).fetchall()
+                existing = _existing_videos(conn, channel_id)
                 existing_ids = {r["video_id"] for r in existing}
 
                 # Non-empty only for large kworb-sourced channels (see
@@ -275,10 +302,7 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
 
                 cross_existing = []
                 for cid in cross_channel_ids:
-                    cross_existing.extend(conn.execute(
-                        "SELECT video_id, title, url, published_at, discovered_at, song_id FROM videos WHERE channel_id = ?",
-                        (cid,),
-                    ).fetchall())
+                    cross_existing.extend(_existing_videos(conn, cid))
 
                 # existing videos already have a settled song_id and are never
                 # re-grouped - only new_video_dicts goes through song_grouping,

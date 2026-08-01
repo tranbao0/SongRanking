@@ -65,6 +65,7 @@ _POST_MIGRATION_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_videos_song ON videos(song_id);
 CREATE INDEX IF NOT EXISTS idx_snapshots_date ON view_snapshots(snapshot_date);
 CREATE INDEX IF NOT EXISTS idx_channels_genre ON channels(genre);
+CREATE INDEX IF NOT EXISTS idx_songs_channel ON songs(channel_id);
 DROP INDEX IF EXISTS idx_snapshots_video;
 """
 

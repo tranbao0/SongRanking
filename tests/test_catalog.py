@@ -9,7 +9,7 @@ share a display_name. Both original queries are kept below as oracles.
 
 import unittest
 
-from .context import make_db, add_channel
+from .context import make_db, add_channel, add_video
 
 from registry import catalog, song_grouping
 
@@ -42,6 +42,73 @@ def _reference_home_channels(conn):
 
 def _names(patterns_by_genre):
     return {genre: [name for name, _ in pairs] for genre, pairs in patterns_by_genre.items()}
+
+
+class ExistingVideosTest(unittest.TestCase):
+    """
+    A song first catalogued from an aggregator or broadcast channel is
+    anchored to the artist's own channel, but its video row stays on the
+    aggregator. Matching only by videos.channel_id would never surface it,
+    so the artist's own upload of that song would start a second song -
+    and on a bootstrap the aggregators are catalogued first, so this is
+    the common order rather than an edge case.
+    """
+
+    def setUp(self):
+        self.conn = make_db()
+        self.addCleanup(self.conn.close)
+        add_channel(self.conn, "UC_aggregator", display_name="1theK", source="kworb")
+        add_channel(self.conn, "UC_artist", display_name="BTS")
+        # Song discovered via the aggregator, anchored to the artist.
+        self.conn.execute(
+            "INSERT INTO songs (song_id, channel_id, canonical_title, grouped_at) "
+            "VALUES (1, 'UC_artist', 'Dynamite', '2026-01-01')"
+        )
+        add_video(self.conn, "agg_vid", "UC_aggregator", title="[MV] BTS - Dynamite", song_id=1)
+        self.conn.commit()
+
+    def _ids(self, channel_id):
+        return {r["video_id"] for r in catalog._existing_videos(self.conn, channel_id)}
+
+    def test_artist_channel_sees_songs_anchored_to_it(self):
+        """The regression: without this the artist's own MV duplicates the song."""
+        self.assertEqual(self._ids("UC_artist"), {"agg_vid"})
+
+    def test_channel_still_sees_its_own_videos(self):
+        add_video(self.conn, "own_vid", "UC_artist", title="BTS - Butter")
+        self.conn.commit()
+        self.assertEqual(self._ids("UC_artist"), {"agg_vid", "own_vid"})
+
+    def test_aggregator_still_sees_the_video_it_hosts(self):
+        self.assertEqual(self._ids("UC_aggregator"), {"agg_vid"})
+
+    def test_a_video_matching_both_halves_is_returned_once(self):
+        """UNION, not UNION ALL - a duplicate row would skew canonical-title choice."""
+        add_video(self.conn, "both", "UC_artist", title="BTS - Dynamite (Dance Practice)", song_id=1)
+        self.conn.commit()
+        rows = catalog._existing_videos(self.conn, "UC_artist")
+        self.assertEqual(len(rows), len({r["video_id"] for r in rows}))
+
+    def test_unrelated_channels_are_not_pulled_in(self):
+        add_channel(self.conn, "UC_other", display_name="Other")
+        add_video(self.conn, "other_vid", "UC_other")
+        self.conn.commit()
+        self.assertNotIn("other_vid", self._ids("UC_artist"))
+
+    def test_ungrouped_videos_do_not_leak_across_channels(self):
+        """song_id NULL must not join every other ungrouped video."""
+        add_video(self.conn, "loose_agg", "UC_aggregator", title="Loose One")
+        add_video(self.conn, "loose_art", "UC_artist", title="Loose Two")
+        self.conn.commit()
+        self.assertEqual(self._ids("UC_artist"), {"agg_vid", "loose_art"})
+
+    def test_lookup_uses_an_index_rather_than_scanning_videos(self):
+        plan = " ".join(
+            row["detail"] for row in self.conn.execute(
+                "EXPLAIN QUERY PLAN " + catalog._EXISTING_VIDEOS_SQL, {"channel_id": "UC_artist"}
+            )
+        )
+        self.assertNotIn("SCAN videos", plan)
 
 
 class ConfirmedArtistsTest(unittest.TestCase):
