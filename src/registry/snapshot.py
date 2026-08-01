@@ -7,14 +7,14 @@ from publish date.
 
 from datetime import date
 
-import db
-from youtube_api import batch_fetch_metadata
+from registry import db
+from shared.youtube_api import batch_fetch_metadata
 
 
 def take_snapshot() -> int:
     """
     Fetch current view counts for every tracked video and insert today's
-    row into view_snapshots. Idempotent — videos that already have a row
+    row into view_snapshots. Idempotent - videos that already have a row
     for today are skipped, so re-running the same day is a no-op.
     Returns the number of snapshot rows inserted.
     """
@@ -30,8 +30,10 @@ def take_snapshot() -> int:
         videos = conn.execute("SELECT video_id, url FROM videos").fetchall()
         pending = [v for v in videos if v["video_id"] not in already_done]
         if not pending:
+            print("  [snapshot] Nothing pending, all tracked videos already have today's snapshot")
             return 0
 
+        print(f"  [snapshot] Fetching current views for {len(pending)} video(s)...")
         metadata = batch_fetch_metadata([v["url"] for v in pending])
 
         rows = [
@@ -45,6 +47,7 @@ def take_snapshot() -> int:
             rows,
         )
         conn.commit()
+        print(f"  [snapshot] Inserted {len(rows)} snapshot row(s)")
         return len(rows)
     finally:
         conn.close()

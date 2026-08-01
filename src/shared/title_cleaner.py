@@ -6,13 +6,13 @@ short, display-ready song titles and artist names for the overlay.
 
 Requires GEMINI_API_KEY in .env (or environment).
 If the key is missing or a call fails, original titles are kept unchanged
-for whichever chunk failed — chunks are independent, so one bad response
+for whichever chunk failed - chunks are independent, so one bad response
 doesn't lose the whole batch.
 """
 
 import json
 
-from gemini_client import call_gemini, chunked
+from shared.gemini_client import call_gemini, chunked
 
 _PROMPT_TEMPLATE = """\
 You clean up YouTube video metadata for a K-pop song ranking overlay.
@@ -26,7 +26,7 @@ like "HYBE LABELS", "HYBE LABELS and", "JYP Entertainment", "SM Entertainment", 
 - Keep Korean characters exactly as-is.
 - If you cannot determine a clean title, return the original unchanged.
 - Be particularly careful with upload channel name versus artist name; if the artist is fictional, KEEP THE ARTIST NAME
-Return ONLY a JSON array — no markdown, no explanation. Each element: {{"title": "...", "artist": "..."}}.
+Return ONLY a JSON array - no markdown, no explanation. Each element: {{"title": "...", "artist": "..."}}.
 
 {entries}"""
 
@@ -47,7 +47,7 @@ def _clean_chunk(songs: list[dict]) -> None:
         if not isinstance(cleaned, list) or len(cleaned) != len(songs):
             raise ValueError("Response length mismatch")
     except (json.JSONDecodeError, ValueError) as e:
-        print(f"  [title_cleaner] Chunk cleanup failed ({e}) — using original titles.")
+        print(f"  [title_cleaner] Chunk cleanup failed ({e}) - using original titles.")
         return
 
     for song, item in zip(songs, cleaned):

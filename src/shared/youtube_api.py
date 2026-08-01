@@ -13,17 +13,9 @@ import os
 import re
 from datetime import date, datetime
 
-import api_budget
-from mv_filter import is_valid_mv
-
-
-def _months_since(release_date: date) -> int:
-    """Whole months elapsed since `release_date` (minimum 1)."""
-    today = date.today()
-    months = (today.year - release_date.year) * 12 + (today.month - release_date.month)
-    if today.day < release_date.day:
-        months -= 1
-    return max(1, months)
+from shared import api_budget
+from shared.dates import months_since
+from shared.mv_filter import is_valid_mv
 
 try:
     from dotenv import load_dotenv
@@ -91,7 +83,7 @@ def _video_to_meta(item: dict) -> dict:
         "release_year":    release_year,
         "release_date":    release_date.strftime("%Y.%m.%d"),
         "years_on_chart":  max(1, date.today().year - release_year + 1),
-        "months_on_chart": _months_since(release_date),
+        "months_on_chart": months_since(release_date),
     }
 
 
@@ -155,8 +147,8 @@ def search_kpop(query: str, limit: int = 50, filter_mv: bool = True) -> list[dic
     Drop-in replacement for search.search_kpop().
 
     Uses a two-step API call:
-      1. search.list  — finds video IDs matching the query
-      2. videos.list  — fetches stats + duration for those IDs
+      1. search.list  - finds video IDs matching the query
+      2. videos.list  - fetches stats + duration for those IDs
 
     Results are sorted by view count descending.
     YouTube API caps search results at 50 per request.
@@ -191,7 +183,7 @@ def search_kpop(query: str, limit: int = 50, filter_mv: bool = True) -> list[dic
         release_date = datetime.strptime(published[:10], "%Y-%m-%d").date() if len(published) >= 10 else date.today()
         release_year = release_date.year
         years_on_chart = max(1, date.today().year - release_year + 1)
-        months_on_chart = _months_since(release_date)
+        months_on_chart = months_since(release_date)
         duration     = _parse_iso_duration(item["contentDetails"].get("duration", ""))
 
         songs.append({

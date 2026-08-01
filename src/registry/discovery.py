@@ -13,10 +13,10 @@ from pathlib import Path
 
 import yaml
 
-import db
-from providers import kworb, wikidata
+from registry import db
+from registry.providers import kworb, wikidata
 
-CHANNELS_DIR = Path(__file__).parent.parent / "data" / "channels"
+CHANNELS_DIR = Path(__file__).parent.parent.parent / "data" / "channels"
 
 KNOWN_GENRES = sorted(set(wikidata.GENRE_QIDS) | set(kworb.GENRE_COUNTRIES))
 

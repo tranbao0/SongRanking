@@ -19,7 +19,9 @@ BLOCKLIST = re.compile(
     r"|mash.?up"
     r"|collection"
     r"|ranking"
-    r"|mix"           # "kpop mix 2024" — distinct from "remix" (no word boundary match)
+    r"|mix"           # "kpop mix 2024" - distinct from "remix" (no word boundary match)
+    r"|teaser"        # pre-release promo clip, not the song itself - excluded even when
+                       # it clears MIN_DURATION (some run well past a typical teaser length)
     r")\b",
     re.IGNORECASE,
 )

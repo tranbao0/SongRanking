@@ -2,14 +2,14 @@
 Search for K-pop songs via yt-dlp and print ranked results.
 
 Usage:
-  python src/search.py "kpop songs" --limit 20
-  python src/search.py "kpop hits" --csv          # emit CSV rows ready for songs.csv
-  python src/search.py "kpop hits" --no-filter    # skip duration/title filtering
+  python src/shared/search.py "kpop songs" --limit 20
+  python src/shared/search.py "kpop hits" --csv          # emit CSV rows ready for songs.csv
+  python src/shared/search.py "kpop hits" --no-filter    # skip duration/title filtering
 
 yt-dlp does the heavy lifting: ytsearch<N> + --flat-playlist + --print
 fetches metadata without downloading any video.
 
-Swap in youtube_api.py (see src/youtube_api.py) once an API key is available.
+Swap in youtube_api.py (see src/shared/youtube_api.py) once an API key is available.
 """
 
 import subprocess
@@ -17,22 +17,14 @@ import sys
 import argparse
 from datetime import date
 
-from mv_filter import is_valid_mv
+from shared.dates import months_since
+from shared.mv_filter import is_valid_mv
 
 
 PRINT_TEMPLATE = (
     "%(id)s|||%(title)s|||%(uploader)s"
     "|||%(view_count)s|||%(upload_date)s|||%(duration)s"
 )
-
-
-def _months_since(release_date: date) -> int:
-    """Whole months elapsed since `release_date` (minimum 1)."""
-    today = date.today()
-    months = (today.year - release_date.year) * 12 + (today.month - release_date.month)
-    if today.day < release_date.day:
-        months -= 1
-    return max(1, months)
 
 
 def search_kpop(query: str, limit: int = 50, filter_mv: bool = True) -> list[dict]:
@@ -84,7 +76,7 @@ def search_kpop(query: str, limit: int = 50, filter_mv: bool = True) -> list[dic
         release_year = release_date.year
 
         years_on_chart = max(1, date.today().year - release_year + 1)
-        months_on_chart = _months_since(release_date)
+        months_on_chart = months_since(release_date)
 
         songs.append({
             "id":              vid_id.strip(),

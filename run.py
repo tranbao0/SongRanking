@@ -1,5 +1,5 @@
 """
-Command runner — cross-platform replacement for the Makefile.
+Command runner for the SongRanking pipeline.
 
 Usage:
   python run.py csv
@@ -23,7 +23,7 @@ import argparse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
-from pipeline import run_pipeline
+from render.pipeline import run_pipeline
 
 _YT_DLP_CHECK_CACHE = Path("data/.yt_dlp_update_check.json")
 _YT_DLP_CHECK_INTERVAL = 24 * 60 * 60  # re-check at most once/day
@@ -31,11 +31,11 @@ _YT_DLP_CHECK_INTERVAL = 24 * 60 * 60  # re-check at most once/day
 
 def ensure_yt_dlp_up_to_date():
     """
-    yt-dlp goes stale fast — YouTube extraction changes break older
+    yt-dlp goes stale fast - YouTube extraction changes break older
     releases silently (e.g. PO Token requirements shifting between
     clients). Runs yt-dlp's own self-update ("yt-dlp -U"), which targets
-    whichever install actually backs the "yt-dlp" command on PATH — the
-    same one the pipeline's subprocess calls use — rather than assuming
+    whichever install actually backs the "yt-dlp" command on PATH - the
+    same one the pipeline's subprocess calls use - rather than assuming
     it's pip-managed. Checked at most once/day; skipped silently if
     yt-dlp isn't found or the update check times out.
     """
@@ -50,7 +50,7 @@ def ensure_yt_dlp_up_to_date():
     try:
         result = subprocess.run(["yt-dlp", "-U"], capture_output=True, text=True, timeout=30)
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        return  # yt-dlp missing or unresponsive — don't block the run over this
+        return  # yt-dlp missing or unresponsive - don't block the run over this
 
     _YT_DLP_CHECK_CACHE.parent.mkdir(parents=True, exist_ok=True)
     _YT_DLP_CHECK_CACHE.write_text(json.dumps({"checked_at": time.time()}))
@@ -87,7 +87,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == "sync":
-        import discovery, catalog, snapshot
+        from registry import discovery, catalog, snapshot
 
         genres = args.genre or discovery.KNOWN_GENRES
         print(f"Syncing channels for: {', '.join(genres)}")

@@ -5,7 +5,7 @@ helper so callers send small, focused prompts instead of one large list
 (better matching quality, less hallucination risk on big inputs).
 
 Used by title_cleaner.py (title/artist cleanup) and song_grouping.py
-(same-song clustering) — both need identical boilerplate around an
+(same-song clustering) - both need identical boilerplate around an
 otherwise different prompt/response shape.
 """
 
@@ -23,7 +23,7 @@ try:
 except ImportError:
     pass
 
-import api_budget
+from shared import api_budget
 
 MODEL = "models/gemini-3.5-flash"
 CHUNK_SIZE = 15
@@ -52,15 +52,15 @@ def call_gemini(prompt: str, model: str = MODEL) -> str | None:
     Send `prompt` to Gemini and return the raw response text (markdown
     code fences stripped), or None if the call can't be made or fails for
     any reason (SDK not installed, no API key, budget exhausted, API
-    error) — callers should fall back to their pre-AI behavior on None.
+    error) - callers should fall back to their pre-AI behavior on None.
     """
     if not _SDK_AVAILABLE:
-        print("  [gemini_client] 'google-genai' package not installed — skipping AI call.")
+        print("  [gemini_client] 'google-genai' package not installed - skipping AI call.")
         return None
 
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
-        print("  [gemini_client] GEMINI_API_KEY not set — skipping AI call.")
+        print("  [gemini_client] GEMINI_API_KEY not set - skipping AI call.")
         return None
 
     try:

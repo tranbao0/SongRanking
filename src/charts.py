@@ -6,9 +6,9 @@ a chart is a new yaml entry; only a genuinely new metric needs a new
 branch here.
 
 Ranks by song, not by individual video: a song can have multiple YouTube
-uploads (official MV, teaser/performance video, dance practice, etc.)
-that song_grouping.py has already clustered via videos.song_id. Views
-are summed across a group's members; one representative member (the
+uploads (official MV, performance video, dance practice, etc.) that
+song_grouping.py has already clustered via videos.song_id. Views are
+summed across a group's members; one representative member (the
 highest-individual-views one) supplies the url/title used for rendering.
 Ungrouped videos (song_id NULL) are treated as their own singleton group,
 so behavior for those is unchanged from before grouping existed.
@@ -19,18 +19,10 @@ from pathlib import Path
 
 import yaml
 
-import db
+from registry import db
+from shared.dates import months_since
 
 CHARTS_FILE = Path(__file__).parent.parent / "data" / "charts.yaml"
-
-
-def _months_since(release_date: date) -> int:
-    """Whole months elapsed since `release_date` (minimum 1)."""
-    today = date.today()
-    months = (today.year - release_date.year) * 12 + (today.month - release_date.month)
-    if today.day < release_date.day:
-        months -= 1
-    return max(1, months)
 
 
 def _load_definition(name: str) -> dict:
@@ -98,10 +90,10 @@ def _build_group_entry(members: list, views_by_id: dict) -> dict | None:
     """
     Compute everything a chart might need from one song group: summed
     cumulative views, summed gained views (only from members that have
-    both a latest and baseline snapshot — a too-new member is excluded
+    both a latest and baseline snapshot - a too-new member is excluded
     from the sum rather than invalidating the whole group), the most
     recently published member (for "newest" ranking), and a
-    representative member (highest individual views — supplies the
+    representative member (highest individual views - supplies the
     url/title actually used for rendering). Returns None if no member has
     any view data yet.
     """
@@ -178,7 +170,7 @@ def compute_chart(name: str) -> list[dict]:
                 "release_year":    release_date.year,
                 "release_date":    release_date.strftime("%Y.%m.%d"),
                 "years_on_chart":  max(1, date.today().year - release_date.year + 1),
-                "months_on_chart": _months_since(release_date),
+                "months_on_chart": months_since(release_date),
                 "url":             rep["url"],
             })
         return results

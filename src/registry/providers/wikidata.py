@@ -4,7 +4,7 @@ Wikidata tags with the target genre and links to a YouTube channel (P2397)
 is included, regardless of whether other providers (e.g. kworb) also find
 them.
 
-Deliberately does not filter on "instance of" (P31) — restricting to
+Deliberately does not filter on "instance of" (P31) - restricting to
 "musical group" would exclude solo artists (e.g. PSY), so the only
 requirement is the genre tag itself.
 """

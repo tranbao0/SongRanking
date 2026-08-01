@@ -3,14 +3,7 @@ import subprocess
 import json
 from datetime import date
 
-
-def _months_since(release_date: date) -> int:
-    """Whole months elapsed since `release_date` (minimum 1)."""
-    today = date.today()
-    months = (today.year - release_date.year) * 12 + (today.month - release_date.month)
-    if today.day < release_date.day:
-        months -= 1
-    return max(1, months)
+from shared.dates import months_since
 
 
 def fetch_metadata(url):
@@ -32,7 +25,7 @@ def fetch_metadata(url):
 
     # Count the release year itself as year 1 on chart
     years_on_chart = max(1, date.today().year - release_year + 1)
-    months_on_chart = _months_since(release_date)
+    months_on_chart = months_since(release_date)
 
     return {
         "views": views,

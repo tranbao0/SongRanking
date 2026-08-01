@@ -1,16 +1,20 @@
 """
 Groups a channel's videos into songs, so multiple uploads of the same
-underlying song (official MV + teaser/performance video + dance practice
-+ lyric video, etc.) aggregate into one chart entry instead of splitting
+underlying song (official MV + performance video + dance practice +
+lyric video, etc.) aggregate into one chart entry instead of splitting
 view counts across separate rows.
+
+Teasers are not part of this - mv_filter's blocklist excludes them before
+a video ever reaches catalog sync, since a teaser isn't the song itself
+and shouldn't contribute views to it (or exist as its own chart entry).
 
 Two stages, to keep AI usage small and focused rather than sending one
 big list per channel:
-  1. Local normalization (free, no AI) — strips predictable video-type
+  1. Local normalization (free, no AI) - strips predictable video-type
      suffixes ("Official MV", "Dance Practice", ...) and groups videos
      whose normalized titles match exactly. Covers the common case.
   2. Chunked AI pass (Gemini, via gemini_client) for whatever didn't get
-     an exact match — stylized titles, alternate romanizations, etc.
+     an exact match - stylized titles, alternate romanizations, etc.
      Falls back to leaving videos ungrouped (singletons) on any failure,
      so a video is never silently dropped.
 """
@@ -19,11 +23,11 @@ import json
 import re
 from datetime import datetime
 
-from gemini_client import call_gemini, chunked
+from shared.gemini_client import call_gemini, chunked
 
 _VIDEO_TYPE_KEYWORDS = (
     "official", "mv", "m/v", "lyric", "performance", "practice",
-    "choreography", "teaser", "video", "audio", "visualizer",
+    "choreography", "video", "audio", "visualizer",
 )
 
 _BRACKET_RE = re.compile(r"[\(\[\{][^\)\]\}]*[\)\]\}]")
@@ -33,13 +37,13 @@ _WHITESPACE_RE = re.compile(r"\s+")
 
 _GROUP_PROMPT = """\
 You are grouping YouTube video titles that are different uploads of the SAME underlying \
-song (e.g. an official MV, a teaser, a dance practice video, or a lyric/cover upload of the \
-same song all count as the same song). Do NOT group different songs together, even by the \
-same artist. Do NOT group promotional/behind-the-scenes content with the song itself, even \
-from the same release — album trailers, "making of" videos, photo session / behind-the-scenes \
-footage, and similar are NOT the song and must stay in their own singleton group. Only group \
-videos where the song itself is the actual content (MV, lyric video, dance practice, \
-performance video, acoustic/cover version, audio upload).
+song (e.g. an official MV, a dance practice video, or a lyric/cover upload of the same song \
+all count as the same song). Do NOT group different songs together, even by the same artist. \
+Do NOT group promotional/behind-the-scenes content with the song itself, even from the same \
+release - album trailers, "making of" videos, photo session / behind-the-scenes footage, and \
+similar are NOT the song and must stay in their own singleton group. Only group videos where \
+the song itself is the actual content (MV, lyric video, dance practice, performance video, \
+acoustic/cover version, audio upload).
 
 Titles (numbered):
 {entries}
@@ -98,7 +102,7 @@ def _ai_group_chunk(videos: list[dict]) -> list[list[dict]]:
                 groups.append([v])
         return groups
     except (json.JSONDecodeError, ValueError, TypeError, IndexError) as e:
-        print(f"  [song_grouping] AI grouping failed ({e}) — leaving this chunk ungrouped.")
+        print(f"  [song_grouping] AI grouping failed ({e}) - leaving this chunk ungrouped.")
         return [[v] for v in videos]
 
 
@@ -107,7 +111,7 @@ def group_channel_videos(conn, channel_id: str, videos: list[dict]) -> dict[str,
     Cluster `videos` (each a dict with at least video_id/title) into
     songs for `channel_id`, overwriting that channel's songs rows, and
     return {video_id: song_id}. Full recompute each call rather than
-    incremental merging — simpler and self-correcting as new uploads
+    incremental merging - simpler and self-correcting as new uploads
     appear than trying to reconcile against a prior grouping.
     """
     if not videos:
@@ -117,8 +121,16 @@ def group_channel_videos(conn, channel_id: str, videos: list[dict]) -> dict[str,
     confident = [members for members in local_groups.values() if len(members) > 1]
     singles    = [members[0] for members in local_groups.values() if len(members) == 1]
 
+    chunks = chunked(singles)
+    if len(chunks) > 2:
+        # A large channel can mean dozens of chunked Gemini calls in a
+        # row - without this, that stretch looks identical to a hang.
+        print(f"    {len(singles)} title(s) need AI grouping ({len(chunks)} chunk(s))...")
+
     final_groups = list(confident)
-    for chunk in chunked(singles):
+    for i, chunk in enumerate(chunks, start=1):
+        if len(chunks) > 2 and i % 5 == 0:
+            print(f"      ...chunk {i}/{len(chunks)}")
         final_groups.extend(_ai_group_chunk(chunk))
 
     conn.execute("DELETE FROM songs WHERE channel_id = ?", (channel_id,))

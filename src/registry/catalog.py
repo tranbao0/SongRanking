@@ -7,10 +7,10 @@ same-song duplicates via song_grouping, and upserts survivors into the
 Steady-state runs are budget-aware and resumable:
   - A channel's uploads-playlist ID and current video count are fetched
     in one combined call (1 unit total). If the count hasn't changed
-    since last sync, that's the entire cost for this channel — no
+    since last sync, that's the entire cost for this channel - no
     pagination at all.
   - When something *has* changed, pagination stops as soon as it reaches
-    a video already in the `videos` table — the uploads playlist is
+    a video already in the `videos` table - the uploads playlist is
     newest-first, so anything after that point was already seen on a
     prior sync and doesn't need re-fetching.
   - Channels are processed oldest-synced-first and committed one at a
@@ -22,28 +22,32 @@ Steady-state runs are budget-aware and resumable:
 import re
 from datetime import date, datetime
 
-import api_budget
-import db
-import song_grouping
-from mv_filter import is_valid_mv
-from youtube_api import _get_client, _parse_iso_duration
+from registry import db, song_grouping
+from shared import api_budget
+from shared.mv_filter import is_valid_mv
+from shared.youtube_api import _get_client, _parse_iso_duration
 
 # Channels above this video count are treated as likely shared/label
 # channels (e.g. "HYBE LABELS" hosting many different acts) rather than
 # one artist's own channel. Only kworb-sourced channels get this
-# treatment — kworb has no genre awareness and can resolve an artist
+# treatment - kworb has no genre awareness and can resolve an artist
 # search to a shared channel that also hosts artists outside the target
 # genre. Wikidata-sourced channels skip this: cross-checked separately,
 # real multi-artist overlap there is rare and already same-genre related
 # acts (e.g. a member's channel doubling as their group's channel).
 _SHARED_CHANNEL_VIDEO_THRESHOLD = 400
 
+# How often (in pages) to print pagination progress for a large channel -
+# without this, a channel with thousands of uploads walks silently for
+# several minutes, which looks identical to a hang.
+_PAGE_LOG_INTERVAL = 10
+
 
 def _channel_status(youtube, channel_id: str) -> tuple[str | None, int | None]:
     """
     One call returning both the uploads playlist ID and the channel's
     current public video count (1 unit total, instead of two separate
-    1-unit calls) — used for the cheap unchanged-channel skip and, when
+    1-unit calls) - used for the cheap unchanged-channel skip and, when
     something did change, to seed the paginated walk below.
     """
     response = youtube.channels().list(part="contentDetails,statistics", id=channel_id).execute()
@@ -62,12 +66,15 @@ def _list_new_uploads(youtube, playlist_id: str, known_video_ids: set[str]) -> l
     for videos not already in `known_video_ids`. Stops as soon as a known
     video is reached rather than walking the channel's full history.
     """
-    videos, page_token = [], None
+    videos, page_token, page_num = [], None, 0
     while True:
         response = youtube.playlistItems().list(
             part="snippet", playlistId=playlist_id, maxResults=50, pageToken=page_token,
         ).execute()
         api_budget.record_youtube_units(1)
+        page_num += 1
+        if page_num % _PAGE_LOG_INTERVAL == 0:
+            print(f"    ...page {page_num} ({len(videos)} new video(s) so far, still paginating)")
 
         hit_known = False
         for item in response.get("items", []):
@@ -103,7 +110,8 @@ def _confirmed_artists_by_genre(conn) -> dict[str, list[re.Pattern]]:
     """
     Word-boundary regex per Wikidata-confirmed artist, grouped by genre.
     Used to filter large kworb-sourced channels down to videos that
-    actually belong to a genre-confirmed artist (see module docstring).
+    actually belong to a genre-confirmed artist (see
+    _SHARED_CHANNEL_VIDEO_THRESHOLD above).
     """
     rows = conn.execute("SELECT genre, display_name FROM channels WHERE source = 'wikidata'").fetchall()
     patterns: dict[str, list[re.Pattern]] = {}
@@ -123,10 +131,10 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
     """
     Discover new uploads for the given channels (all tracked channels,
     oldest-synced-first, if None), filter to official MVs, group same-song
-    duplicates (across each channel's full catalog, old + new — a new
+    duplicates (across each channel's full catalog, old + new - a new
     upload might belong to an existing song group), and upsert into the
     videos table. Stops early (without crashing) if the YouTube API budget
-    is exhausted — channels completed so far are already committed and
+    is exhausted - channels completed so far are already committed and
     will be skipped on the next run via last_catalog_sync ordering.
     Returns the number of new videos upserted.
     """
@@ -141,19 +149,25 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
         query += " ORDER BY last_catalog_sync ASC NULLS FIRST"
         rows = conn.execute(query, params).fetchall()
 
+        total = len(rows)
+        print(f"  [catalog] {total} channel(s) to check")
+
         artist_patterns = _confirmed_artists_by_genre(conn)
         youtube = _get_client()
         upserted = 0
         processed = 0
 
-        for row in rows:
+        for i, row in enumerate(rows, start=1):
             channel_id = row["channel_id"]
+            progress = f"[catalog {i}/{total}]"
             try:
                 playlist_id, video_count = _channel_status(youtube, channel_id)
                 if playlist_id is None:
+                    print(f"  {progress} {channel_id}: no uploads playlist (channel deleted/private?), skipping")
                     continue
 
                 if video_count is not None and video_count == row["last_known_video_count"]:
+                    print(f"  {progress} {channel_id}: unchanged ({video_count} videos), skipped")
                     conn.execute(
                         "UPDATE channels SET last_catalog_sync = ? WHERE channel_id = ?",
                         (datetime.now().isoformat(), channel_id),
@@ -161,6 +175,9 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
                     conn.commit()
                     processed += 1
                     continue
+
+                print(f"  {progress} {channel_id}: video count changed "
+                      f"({row['last_known_video_count']} -> {video_count}), walking new uploads...")
 
                 existing = conn.execute(
                     "SELECT video_id, title, url, published_at, discovered_at FROM videos WHERE channel_id = ?",
@@ -183,8 +200,8 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
                             before = len(new_mvs)
                             new_mvs = [v for v in new_mvs if _matches_confirmed_artist(v["title"], patterns)]
                             if len(new_mvs) != before:
-                                print(f"  [catalog] {channel_id}: filtered {before - len(new_mvs)} video(s) "
-                                      f"not matching a confirmed {row['genre']} artist (likely shared channel)")
+                                print(f"    filtered {before - len(new_mvs)} video(s) not matching a "
+                                      f"confirmed {row['genre']} artist (likely shared channel)")
 
                 all_videos = [dict(r) for r in existing] + [
                     {
@@ -197,6 +214,8 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
                     for v in new_mvs
                 ]
 
+                print(f"    grouping {len(all_videos)} video(s) into songs "
+                      f"({len(new_mvs)} new)...")
                 song_map = song_grouping.group_channel_videos(conn, channel_id, all_videos)
 
                 rows_to_upsert = [
@@ -218,10 +237,11 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
                 conn.commit()
                 upserted += len(new_mvs)
                 processed += 1
+                print(f"    done - {len(new_mvs)} new video(s) upserted")
 
             except api_budget.QuotaExceededError as e:
                 print(f"  [catalog] {e}")
-                print(f"  [catalog] Stopped after {processed}/{len(rows)} channel(s) — "
+                print(f"  [catalog] Stopped after {processed}/{total} channel(s) - "
                       f"already-synced channels will be skipped on the next `sync` run.")
                 break
 

@@ -124,11 +124,11 @@ def determine_badges(songs):
     Assign _entry_type and finalise peak for each song.
 
     Badge priority (highest wins):
-      highest_jump     — biggest positive rank improvement (needs last_rank)
-      highest_increase — biggest views_gained (needs last_views); excludes best_jump
-      re_entry         — has last_views but no last_rank (dropped off, now back)
-      new_entry        — no last_views (never charted before)
-      ""               — continuously charted, no special distinction
+      highest_jump     - biggest positive rank improvement (needs last_rank)
+      highest_increase - biggest views_gained (needs last_views); excludes best_jump
+      re_entry         - has last_views but no last_rank (dropped off, now back)
+      new_entry        - no last_views (never charted before)
+      ""               - continuously charted, no special distinction
     """
     # Finalise peak: best (lowest-numbered) rank seen across all runs
     for song in songs:
@@ -251,10 +251,10 @@ def clean_csv_titles(csv_path):
     as-is), so this is the way to retroactively clean everything already
     on the chart without deleting and re-searching.
     """
-    from title_cleaner import clean_titles
+    from shared.title_cleaner import clean_titles
 
     if not os.path.exists(csv_path):
-        print(f"{csv_path} does not exist — nothing to clean.")
+        print(f"{csv_path} does not exist - nothing to clean.")
         return
 
     with open(csv_path, newline="", encoding="utf-8") as f:

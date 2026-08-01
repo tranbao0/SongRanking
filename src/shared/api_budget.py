@@ -12,10 +12,10 @@ import threading
 from datetime import date
 from pathlib import Path
 
-USAGE_FILE = Path(__file__).parent.parent / "data" / ".api_usage.json"
+USAGE_FILE = Path(__file__).parent.parent.parent / "data" / ".api_usage.json"
 
 # batch_fetch_metadata (youtube_api.py) records usage from multiple
-# worker threads concurrently — without this, two threads could both
+# worker threads concurrently - without this, two threads could both
 # read the same count, increment it, and write back, silently losing one
 # thread's usage from the budget.
 _LOCK = threading.Lock()
@@ -23,7 +23,7 @@ _LOCK = threading.Lock()
 # Matches the YouTube Data API's standard free-tier daily quota.
 YOUTUBE_DAILY_QUOTA = int(os.environ.get("YOUTUBE_DAILY_QUOTA", 10000))
 
-# Conservative placeholder, not a published guarantee — Gemini free-tier
+# Conservative placeholder, not a published guarantee - Gemini free-tier
 # limits vary by model/tier and change over time. Set GEMINI_DAILY_LIMIT
 # in .env to your actual tier's limit if you know it.
 GEMINI_DAILY_LIMIT = int(os.environ.get("GEMINI_DAILY_LIMIT", 1500))
@@ -62,7 +62,7 @@ def _record(key: str, amount: int, limit: int, api_name: str) -> None:
 
         if ratio >= STOP_THRESHOLD:
             raise QuotaExceededError(
-                f"{api_name} usage would reach {projected}/{limit} ({ratio:.0%}) — "
+                f"{api_name} usage would reach {projected}/{limit} ({ratio:.0%}) - "
                 f"stopping before the free-tier budget is exceeded."
             )
 

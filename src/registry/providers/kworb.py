@@ -1,6 +1,6 @@
 """
 kworb-based channel discovery. kworb publishes per-country weekly YouTube
-video charts (no channel links/IDs — just "Artist - Track" text), so this
+video charts (no channel links/IDs - just "Artist - Track" text), so this
 is a popularity-based seed, not an authoritative genre roster: a country's
 chart mixes in artists who don't belong to the target genre (e.g. a K-pop
 act charting on Japan's page). Callers should treat this as additive on
@@ -27,7 +27,7 @@ from bs4 import BeautifulSoup
 CHART_URL = "https://kworb.net/youtube/insights/{country}.html"
 
 # One representative country chart per genre, used purely as a popularity
-# seed — not a claim that the genre is exclusive to that market.
+# seed - not a claim that the genre is exclusive to that market.
 GENRE_COUNTRIES = {
     "kpop": "kr",
     "jpop": "jp",
@@ -62,7 +62,7 @@ def _resolve_channel(artist: str, track: str) -> tuple[str, str] | None:
     Resolve an (artist, track) pair to (channel_id, channel_name) via a
     yt-dlp search for that exact charting video. Deliberately not
     --flat-playlist: flat search results don't reliably populate
-    channel_id (confirmed empirically — it comes back "NA" often enough
+    channel_id (confirmed empirically - it comes back "NA" often enough
     to matter), so this pays for a full single-video extraction per
     candidate instead. Returns None if yt-dlp finds nothing or the
     result has no channel_id (e.g. a non-YouTube upload got matched).

@@ -10,7 +10,7 @@ import os
 import re
 import threading
 
-from overlay import (
+from render.overlay import (
     build_overlay_image, build_filter_complex, build_bare_filter_complex,
     build_overlay_phase_filter_complex, build_transition_filter_complex,
 )
@@ -21,7 +21,7 @@ _print_lock = threading.Lock()
 
 
 def _log(msg):
-    """Thread-safe print — avoids interleaved/garbled lines when songs process concurrently."""
+    """Thread-safe print - avoids interleaved/garbled lines when songs process concurrently."""
     with _print_lock:
         print(msg)
 
@@ -46,7 +46,7 @@ def detect_hw_encoder():
     Probe the local ffmpeg build for a usable hardware H.264 encoder
     (NVENC > QSV > AMF). Returns the codec name, or None if only software
     encoding is available. Availability in the ffmpeg build doesn't
-    guarantee the hardware actually works at runtime — encode_song()
+    guarantee the hardware actually works at runtime - encode_song()
     falls back to libx264 per-clip if the hardware encode fails.
     """
     try:
@@ -134,7 +134,7 @@ def _build_overlay_phase_cmd(codec, raw_clip, overlay_png, cw, ch, fps, trim_sta
 # video/session bucketed into YouTube's SABR-only experiment, which blocks
 # adaptive-format URLs for most clients). android/mweb still reliably expose
 # the legacy progressive format 18 even under that experiment, just capped
-# at 360p — build_vf()'s canvas scale/pad step handles the resolution
+# at 360p - build_vf()'s canvas scale/pad step handles the resolution
 # mismatch so the clip still concatenates cleanly with 1080p neighbors.
 _DOWNLOAD_FALLBACK_CLIENT = "android"
 
@@ -154,7 +154,7 @@ def _probe_duration(path):
 def download_song(rank, title, url, start="00:01:00", end="00:01:15"):
     """
     I/O-bound stage: pull the clip down with yt-dlp. Runs in the download
-    pool — sized larger than the encode pool since it's network-bound, not
+    pool - sized larger than the encode pool since it's network-bound, not
     CPU/GPU-bound.
     """
     slug     = safe_filename(title)
@@ -171,15 +171,15 @@ def download_song(rank, title, url, start="00:01:00", end="00:01:15"):
             url,
         ], capture_output=True, text=True, encoding="utf-8", errors="replace")
         # yt-dlp can exit 0 even when the section download itself produced
-        # nothing usable — e.g. a video bucketed into a player-client
+        # nothing usable - e.g. a video bucketed into a player-client
         # experiment whose adaptive-format URLs reject the byte-range
         # requests --download-sections relies on. ffmpeg then writes an
         # empty file while yt-dlp still reports success, so exit code
-        # alone isn't a reliable success signal — the output has to
+        # alone isn't a reliable success signal - the output has to
         # actually probe as a real clip too.
         if result.returncode == 0 and _probe_duration(raw_clip) is None:
             result.returncode = 1
-            result.stderr += "\n(postcheck) downloaded file has no readable duration — treating as a failed attempt"
+            result.stderr += "\n(postcheck) downloaded file has no readable duration - treating as a failed attempt"
         return result
 
     _log(f"  [rank {rank}] Downloading clip...")
@@ -202,15 +202,15 @@ def encode_song(style, raw_clip, rank, title, artist, peak, entry_type,
         [bare (edge clips only)] -> overlay wipes in -> static overlay
         -> overlay wipes out -> [bare (edge clips only)]
 
-    — as separate small ffmpeg encodes, then stitches them into one file.
+    - as separate small ffmpeg encodes, then stitches them into one file.
     The wipe-in/out windows are `duration` seconds each (from style's
     transition config) and live entirely inside this clip's own footage;
     the bare bookend windows only exist for the first/last song in the
     countdown (head_trim/tail_trim == 0), since every other clip instead
     hands that space to build_transition_segment() to cross-fade into its
-    neighbor — see run_pipeline for how head_trim/tail_trim are chosen.
+    neighbor - see run_pipeline for how head_trim/tail_trim are chosen.
 
-    Runs in the encode pool — sized to match actual hardware/software encode
+    Runs in the encode pool - sized to match actual hardware/software encode
     capacity, independently of how many downloads are in flight. Leaves
     raw_clip on disk; the transition-building stage still needs the clip's
     true (untrimmed) edges, and the caller cleans it up once every
@@ -241,7 +241,7 @@ def encode_song(style, raw_clip, rank, title, artist, peak, entry_type,
     # The bare bookend phases (edge clips only) stand in for what an actual
     # transition segment would otherwise supply, so they're sized to match
     # that segment's duration, not the overlay wipe's own (usually shorter)
-    # duration — otherwise an edge clip's intro/outro would run a different
+    # duration - otherwise an edge clip's intro/outro would run a different
     # length than the crossfade every interior clip gets instead.
     boundary_duration   = transition_cfg.get("duration", 1.0)
 
@@ -297,7 +297,7 @@ def encode_song(style, raw_clip, rank, title, artist, peak, entry_type,
         # Full re-encode (not stream copy) here: these phases were each
         # encoded by independent ffmpeg processes and, unlike the top-level
         # assembly's much longer segments, are cheap enough that a clean
-        # re-encode costs nothing — worth it to avoid stream-copying
+        # re-encode costs nothing - worth it to avoid stream-copying
         # together clips whose SPS/PPS may not agree seam-for-seam (e.g. if
         # one phase silently fell back to CPU encoding and its neighbor
         # didn't), which otherwise shows up as glitching right at the seam.
@@ -332,7 +332,7 @@ def encode_transition(clip_a, clip_b, cw, ch, fps, out_path, codec=None, video_t
     """
     Builds the short (~`duration`-second) boundary segment stitched between
     two adjacent clips' bare footage instead of re-encoding the whole
-    compilation for a single crossfade — small enough to run once per
+    compilation for a single crossfade - small enough to run once per
     boundary, in parallel, alongside the rest of the encode work. Each
     clip's own overlay wipe-in/fade-out already happened inside encode_song,
     so there's no overlay involved here at all (see build_transition_
@@ -360,18 +360,18 @@ def concatenate_clips(clip_paths, output_path="final_compilation.mp4", codec=Non
     Used both to assemble one song's own phases (encode_song) and to
     assemble the whole compilation from every song's segment + the
     transitions between them (run_pipeline), so it has to be safe to call
-    concurrently — the concat list file name is derived from output_path
+    concurrently - the concat list file name is derived from output_path
     rather than shared, and logging goes through the thread-safe _log().
 
     By default the video track is a plain stream copy (no re-encode) and
-    only audio is re-encoded — see below. Pass cw/ch/fps to fully re-encode
+    only audio is re-encoded - see below. Pass cw/ch/fps to fully re-encode
     the video too instead, which every current caller does: every clip_path
     here came out of its own independent ffmpeg process, and each one
     writes its own fresh SPS/PPS at the start of its bitstream even with
-    identical settings — stream-copying them together leaves those
+    identical settings - stream-copying them together leaves those
     parameter-set changes embedded mid-stream. Most software decoders
     shrug that off, but it visibly breaks playback (freeze/black frames
-    right at the seam) in players leaning on hardware decode — confirmed in
+    right at the seam) in players leaning on hardware decode - confirmed in
     VLC, Discord's embedded player, and mobile players. A stream copy is
     only safe here when the caller can guarantee every input segment came
     from the exact same encode session.

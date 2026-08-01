@@ -2,14 +2,14 @@
 Build or append to data/songs.csv from a list of YouTube URLs.
 
 Usage:
-  # Interactive — prompts for rank/peak/new-entry per song:
-  python src/build_csv.py https://youtu.be/xxx https://youtu.be/yyy
+  # Interactive - prompts for rank/peak/new-entry per song:
+  python src/shared/build_csv.py https://youtu.be/xxx https://youtu.be/yyy
 
   # Pipe URLs from a text file:
-  python src/build_csv.py < data/urls.txt
+  python src/shared/build_csv.py < data/urls.txt
 
   # Append to existing CSV instead of overwriting:
-  python src/build_csv.py --append https://youtu.be/xxx
+  python src/shared/build_csv.py --append https://youtu.be/xxx
 """
 
 import subprocess
@@ -18,12 +18,11 @@ import csv
 import sys
 import os
 
-OUTPUT_FILE = "data/songs.csv"
-FIELDNAMES  = ["rank", "title", "artist", "url", "peak", "is_new_entry", "start", "end", "years_on_chart", "last_views", "last_rank"]
+from render.chart_state import DATA_FILE as OUTPUT_FILE, FIELDNAMES
 
 
 def clean_url(url):
-    """Strip YouTube playlist/radio parameters — keep only the video ID."""
+    """Strip YouTube playlist/radio parameters - keep only the video ID."""
     if "watch?v=" in url:
         video_id = url.split("watch?v=")[1].split("&")[0]
         return f"https://www.youtube.com/watch?v={video_id}"
@@ -54,7 +53,7 @@ def fetch_title_artist(url):
         if title.upper().endswith(suffix.upper()):
             title = title[: -len(suffix)].strip()
 
-    # Extract text inside parentheses if present, e.g. "🔞GO🔞" → "GO"
+    # Extract text inside parentheses if present, e.g. "🔞GO🔞" -> "GO"
     import re
     paren = re.search(r"\(([^)]+)\)", title)
     if paren:

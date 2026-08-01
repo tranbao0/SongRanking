@@ -65,7 +65,7 @@ def build_overlay_image(style, *, rank, title, artist, peak, release_date, month
     """
     Render the full bottom-bar overlay as an RGBA PNG-ready image, sized to the
     style's canvas. ffmpeg composites this over the video with a plain `overlay`
-    filter — Pillow does the actual drawing (font supports Hangul via Malgun
+    filter - Pillow does the actual drawing (font supports Hangul via Malgun
     Gothic) since drawtext/drawbox can't do soft-edged gradients cleanly.
 
     The bar sits `bottom_margin` px above the frame's bottom edge so it isn't
@@ -91,7 +91,7 @@ def build_overlay_image(style, *, rank, title, artist, peak, release_date, month
     draw = ImageDraw.Draw(img)
 
     # ── Gradient fade above the solid bar, then the solid bar itself ───────
-    # This is the only gradient in the whole design — everything else below
+    # This is the only gradient in the whole design - everything else below
     # (rank, stats, badge) is drawn with flat fills per the style constraints.
     fade_img = _vgrad_rgb(cw, fade_h, bar_color, bar_color).convert("RGBA")
     fade_alpha = Image.new("L", (cw, fade_h))
@@ -150,7 +150,7 @@ def build_overlay_image(style, *, rank, title, artist, peak, release_date, month
 
     # ── Vertical layout: title row, then stats row, then rank spans both ───
     # Row height comes from the font's fixed ascent+descent, not the specific
-    # string's ink bbox — titles with descenders (e.g. "Soda Pop") would
+    # string's ink bbox - titles with descenders (e.g. "Soda Pop") would
     # otherwise measure taller than ones without, throwing off row spacing
     # inconsistently from clip to clip.
     title_h = sum(title_font.getmetrics())
@@ -277,7 +277,7 @@ def build_bare_filter_complex(cw, ch):
     """
     Plain scale/pad with no overlay composited. Used for the brief bare
     windows at the very start of the first song and the very end of the
-    last song — every other clip's bare edges are instead produced by
+    last song - every other clip's bare edges are instead produced by
     build_transition_filter_complex (interior boundary) or build_overlay_
     phase_filter_complex (that clip's own wipe-in/fade-out window).
     """
@@ -290,14 +290,14 @@ def build_bare_filter_complex(cw, ch):
 def build_overlay_phase_filter_complex(cw, ch, transition, duration, fps, reverse=False):
     """
     Wipes a clip's own overlay on (reverse=False) or off (reverse=True)
-    entirely within that clip's own footage — no neighboring clip involved.
+    entirely within that clip's own footage - no neighboring clip involved.
     Splits the scaled/padded video into a bare copy and an overlaid copy,
     then xfades bare->overlaid (entry) or overlaid->bare (exit) across the
     whole `duration`-second window (offset=0).
 
     Inputs: 0 = clip video+audio (already trimmed to this window), 1 = the
     clip's overlay PNG (looped for `duration`s). Audio is passed straight
-    through unfiltered — the overlay's visibility never affects the audio,
+    through unfiltered - the overlay's visibility never affects the audio,
     so there's nothing to blend there.
     """
     bg = (
@@ -308,7 +308,7 @@ def build_overlay_phase_filter_complex(cw, ch, transition, duration, fps, revers
     return (
         f"{bg};"
         # -loop'd image inputs default to 25fps regardless of the clip's
-        # native rate — forced to match here so xfade blends two streams
+        # native rate - forced to match here so xfade blends two streams
         # with identical frame pacing instead of resampling one on the fly.
         f"[1:v]fps={fps}[ovsrc];"
         f"[bg1][ovsrc]overlay=0:0:format=auto[ov];"
@@ -322,14 +322,14 @@ def build_transition_filter_complex(cw, ch, video_transition, duration, fps=30):
     By the time footage reaches this boundary, each clip has already wiped
     its own overlay off (see build_overlay_phase_filter_complex) during its
     own encode, using up the `duration` seconds this transition sits
-    between — so both sides are plain video here, no overlay involved.
+    between - so both sides are plain video here, no overlay involved.
 
     Inputs: 0 = clip A's video+audio (its last `duration`s), 1 = clip B's
     video+audio (its first `duration`s).
     """
     def _bg(idx, tag):
         # fps is forced here (not just at final encode) because xfade
-        # blends clip A's and clip B's video directly — if their source
+        # blends clip A's and clip B's video directly - if their source
         # frame rates differ (common across YouTube clips), xfade sees
         # mismatched frame pacing on its two inputs and blends unevenly.
         return (

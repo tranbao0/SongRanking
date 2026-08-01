@@ -2,14 +2,14 @@
 SQLite-backed registry: genre-tagged channels, their catalogued videos,
 song groupings across duplicate uploads, and daily view-count snapshots.
 This is the historical data store that chart computation (charts.py) reads
-from — separate from data/songs.csv, which remains the render pipeline's
+from - separate from data/songs.csv, which remains the render pipeline's
 own per-chart working file.
 """
 
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent / "data" / "registry.db"
+DB_PATH = Path(__file__).parent.parent.parent / "data" / "registry.db"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS channels (
@@ -54,7 +54,7 @@ _POST_MIGRATION_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_videos_song ON videos(song_id);
 """
 
-# Columns added after the initial release — ALTER TABLE ADD COLUMN doesn't
+# Columns added after the initial release - ALTER TABLE ADD COLUMN doesn't
 # have an IF NOT EXISTS form, so each is applied individually and the
 # "duplicate column" error (already-migrated databases) is swallowed.
 _MIGRATIONS = [

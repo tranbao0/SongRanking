@@ -4,7 +4,7 @@ import time
 import concurrent.futures
 
 # Windows consoles/pipes default Python's stdout to the legacy locale codepage
-# (e.g. cp1252), which can't represent Hangul — printing a Korean song title
+# (e.g. cp1252), which can't represent Hangul - printing a Korean song title
 # would otherwise crash the whole run with UnicodeEncodeError.
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
@@ -15,10 +15,10 @@ try:
 except ImportError:
     pass
 
-from overlay import load_style
-from encoding import detect_hw_encoder, download_song, encode_song, encode_transition, concatenate_clips, _log
-from heatmap import pick_clip
-from chart_state import (
+from render.overlay import load_style
+from render.encoding import detect_hw_encoder, download_song, encode_song, encode_transition, concatenate_clips, _log
+from render.heatmap import pick_clip
+from render.chart_state import (
     DATA_FILE, load_history, songs_from_search, pre_fetch_all,
     determine_badges, save_run_state, load_songs, clean_csv_titles,
 )
@@ -29,11 +29,11 @@ _DEFAULT_END   = "00:01:15"
 # Use YouTube Data API if key is present, otherwise fall back to yt-dlp.
 _YT_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
 if _YT_API_KEY:
-    from youtube_api import batch_fetch_metadata, search_kpop as _search_fn
+    from shared.youtube_api import batch_fetch_metadata, search_kpop as _search_fn
     print("[backend] YouTube Data API v3")
 else:
-    from metadata import batch_fetch_metadata
-    from search import search_kpop as _search_fn
+    from shared.metadata import batch_fetch_metadata
+    from shared.search import search_kpop as _search_fn
     print("[backend] yt-dlp (no YOUTUBE_API_KEY set)")
 
 CLIPS_DIR  = "assets/clips"
@@ -61,7 +61,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
                   download_workers=6, encode_workers=3, clean_titles=False,
                   chart_name=None):
     """
-    K-pop song ranking video generator. Programmatic entry point — the CLI
+    K-pop song ranking video generator. Programmatic entry point - the CLI
     (run.py) parses args and calls this directly.
     """
     if clean_titles:
@@ -78,13 +78,13 @@ def run_pipeline(search=None, limit=None, no_filter=False,
         print(f'Computing chart "{chart_name}"...\n')
         results = compute_chart(chart_name)
         if not results:
-            print("Chart produced no results (registry empty for this genre — run `sync` first?). Exiting.")
+            print("Chart produced no results (registry empty for this genre - run `sync` first?). Exiting.")
             return
         history = load_history(csv_path)
         songs   = songs_from_search(results, history)
     elif search:
         csv_path = DATA_FILE
-        from title_cleaner import clean_titles as clean_titles_fn
+        from shared.title_cleaner import clean_titles as clean_titles_fn
         search_limit = limit or 20
         print(f'Searching YouTube: "{search}" (fetching top {search_limit})...\n')
         results = _search_fn(search, limit=search_limit, filter_mv=not no_filter)
@@ -123,7 +123,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
         gained_str = f"  (+{gained:,} gained)" if gained is not None else ""
         change_str = f" {change}" if change else " (new)"
         badge_str  = f"  [{badge}]" if badge else ""
-        print(f"  Rank {s['rank']}{change_str}: {s['title']} — {s['_meta']['views']:,} views{gained_str}{badge_str}")
+        print(f"  Rank {s['rank']}{change_str}: {s['title']} - {s['_meta']['views']:,} views{gained_str}{badge_str}")
     print()
 
     countdown = list(reversed(ranked))
@@ -135,7 +135,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
     if codec:
         print(f"[encoder] Hardware acceleration: {codec} (falls back to CPU per-clip on failure)\n")
     else:
-        print("[encoder] No GPU encoder detected in this ffmpeg build — using CPU (libx264)\n")
+        print("[encoder] No GPU encoder detected in this ffmpeg build - using CPU (libx264)\n")
 
     transition_cfg      = style.get("transition", {})
     video_transition     = transition_cfg.get("video_type", "fade")
@@ -206,7 +206,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
             try:
                 raw_clip = future.result()
             except RuntimeError as e:
-                _log(f"  ERROR: Rank {song['rank']} ({song['title']}) — {e}\n")
+                _log(f"  ERROR: Rank {song['rank']} ({song['title']}) - {e}\n")
                 failed.append((song["rank"], song["title"]))
                 continue
             dl_done += 1
@@ -226,7 +226,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
             try:
                 completed_by_rank[song["rank"]] = future.result()  # seg_clip path
             except RuntimeError as e:
-                _log(f"  ERROR: Rank {song['rank']} ({song['title']}) — {e}\n")
+                _log(f"  ERROR: Rank {song['rank']} ({song['title']}) - {e}\n")
                 failed.append((song["rank"], song["title"]))
                 continue
             enc_done += 1
@@ -234,7 +234,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
     enc_stage_end = time.monotonic()
 
     # Build the small boundary segment between every pair of adjacent songs
-    # that both survived download/encode — skipped where a neighbor failed,
+    # that both survived download/encode - skipped where a neighbor failed,
     # which just leaves a slightly earlier hard cut at that one boundary
     # instead of a crossfade. These are cheap (~1s of output each) and run
     # in their own parallel batch rather than one costly full-length re-encode.
@@ -266,12 +266,12 @@ def run_pipeline(search=None, limit=None, no_filter=False,
                 try:
                     transition_by_pair[pair] = future.result()
                 except RuntimeError as e:
-                    _log(f"  ERROR: Transition rank {pair[0]}->{pair[1]} — {e}\n")
+                    _log(f"  ERROR: Transition rank {pair[0]}->{pair[1]} - {e}\n")
         trans_stage_end = time.monotonic()
 
     # raw clips are only needed by the per-clip encode (its own overlay PNG
     # is cleaned up inside encode_song already) and by the transitions
-    # touching them — both are done now, safe to clean up.
+    # touching them - both are done now, safe to clean up.
     for raw_clip in raw_by_rank.values():
         if os.path.exists(raw_clip):
             os.remove(raw_clip)
@@ -298,7 +298,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
         # mid-stream, which most software decoders shrug off but which
         # visibly breaks playback in players that lean on hardware decode
         # (confirmed reproducing in VLC, Discord's embedded player, and
-        # mobile players — video freezes/blacks out right at each seam).
+        # mobile players - video freezes/blacks out right at each seam).
         concatenate_clips(segments, codec=codec, cw=cw, ch=ch, fps=fps)
         concat_time = time.monotonic() - t0
         print("Compilation saved -> final_compilation.mp4\n")
@@ -323,7 +323,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
         print(f"Transition stage: {_fmt_secs(trans_span)}  ({trans_span / total_time:.0%} of total)"
               f"  [{len(trans_times)}/{len(transition_jobs)} built, avg {_avg(trans_times.values()):.1f}s each]")
     print(f"Final concat:     {_fmt_secs(concat_time)}  ({concat_time / total_time:.0%} of total)")
-    print("(Download/encode stages overlap by design — percentages won't sum to 100%.)")
+    print("(Download/encode stages overlap by design - percentages won't sum to 100%.)")
     print("=" * 55)
 
     if failed:
