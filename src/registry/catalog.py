@@ -114,12 +114,19 @@ def _fetch_durations(youtube, video_ids: list[str]) -> dict[str, int]:
 # second song rather than joining the existing one - and on a bootstrap
 # the aggregators are exactly the channels that get catalogued first,
 # since kworb entries are inserted ahead of Wikidata's.
+# song_channel_id (the anchor) rides along so song_grouping can tell which
+# artist each candidate song belongs to without re-parsing its title -
+# an artist's own upload is often just the song name, with the artist
+# nowhere in the text.
 _EXISTING_VIDEOS_SQL = """
-    SELECT video_id, title, url, published_at, discovered_at, song_id
-    FROM videos
-    WHERE channel_id = :channel_id
+    SELECT v.video_id, v.title, v.url, v.published_at, v.discovered_at, v.song_id,
+           s.channel_id AS song_channel_id
+    FROM videos v
+    LEFT JOIN songs s ON s.song_id = v.song_id
+    WHERE v.channel_id = :channel_id
     UNION
-    SELECT v.video_id, v.title, v.url, v.published_at, v.discovered_at, v.song_id
+    SELECT v.video_id, v.title, v.url, v.published_at, v.discovered_at, v.song_id,
+           s.channel_id
     FROM videos v
     JOIN songs s ON s.song_id = v.song_id
     WHERE s.channel_id = :channel_id

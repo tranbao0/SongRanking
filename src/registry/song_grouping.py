@@ -303,6 +303,62 @@ _MALFORMED_RESPONSE_ERRORS = (
 _MAX_PARSE_ATTEMPTS = 2
 
 
+def _row_get(row, key, default=None):
+    """Read an optional column from a sqlite3.Row or a plain dict."""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
+
+
+def _scoped_candidates(chunk, existing_songs, song_anchors, artist_index, artist_home_channels, channel_id):
+    """
+    Narrow the candidate list sent with one chunk to songs a title in that
+    chunk could actually be.
+
+    The full list is every song on every channel the caller merged in. On
+    a shared channel that means one entry per song of every confirmed
+    artist appearing anywhere on it - hundreds of artists, thousands of
+    songs - repeated in full in each chunk's prompt, even though a title
+    by one artist can never be another artist's song. That is the single
+    largest input-token cost in a catalogue sync, and it grows as the
+    registry fills.
+
+    Scoping is by artist rather than by text similarity on purpose. A
+    title and its match may share no words at all - an alternate
+    romanization or native-script rendering is exactly the case tier 3
+    exists to catch - so dropping candidates that merely look unrelated
+    would defeat the tier. Which artist a song belongs to is instead read
+    from its anchor channel, which is exact.
+
+    Returns `existing_songs` unchanged whenever scoping can't be done
+    safely: no artist patterns (a single-artist channel's list is already
+    small), no anchor information, or a chunk whose titles resolve to no
+    confirmed artist at all.
+    """
+    if not artist_index or not song_anchors:
+        return existing_songs
+
+    homes = set()
+    for v in chunk:
+        artist = artist_index.match(v["title"])
+        home = artist_home_channels.get(artist) if artist else None
+        if home:
+            homes.add(home)
+    if not homes:
+        return existing_songs
+
+    # Songs anchored here too: this channel's own back catalogue is
+    # relevant to anything uploaded to it, whatever the title says.
+    homes.add(channel_id)
+    scoped = {
+        song_id: title
+        for song_id, title in existing_songs.items()
+        if song_anchors.get(song_id) in homes
+    }
+    return scoped
+
+
 def _parse_group_response(
     text: str, videos: list[dict], existing_songs: dict[int, str],
 ) -> list[tuple[int | None, list[dict]]]:
@@ -437,6 +493,7 @@ def group_channel_videos(
     # (see module docstring) with no extra query - same shortest-title
     # convention used below when a group becomes a new song.
     existing_songs: dict[int, str] = {}
+    song_anchors: dict[int, str] = {}
     for v in existing_videos:
         song_id = v["song_id"]
         if song_id is None:
@@ -444,6 +501,13 @@ def group_channel_videos(
         title = v["title"]
         if song_id not in existing_songs or len(title) < len(existing_songs[song_id]):
             existing_songs[song_id] = title
+        # Which artist's channel the song belongs to, used to scope each
+        # chunk's candidate list (see _scoped_candidates). Absent when a
+        # caller supplies rows without it, in which case scoping is
+        # skipped rather than guessed at.
+        anchor = _row_get(v, "song_channel_id")
+        if anchor is not None:
+            song_anchors[song_id] = anchor
 
     chunks = chunked(singles)
     if len(chunks) > 2:
@@ -461,17 +525,21 @@ def group_channel_videos(
     # last. Results are consumed in submission order (map, not
     # as_completed) so the song_id each new group is assigned below stays
     # identical to what the sequential version produced.
+    def _classify(chunk):
+        candidates = _scoped_candidates(
+            chunk, existing_songs, song_anchors, artist_index, artist_home_channels, channel_id,
+        )
+        return _ai_group_chunk(chunk, candidates, artist_index)
+
     if len(chunks) <= 1:
         for chunk in chunks:
-            resolved.extend(_ai_group_chunk(chunk, existing_songs, artist_index))
+            resolved.extend(_classify(chunk))
     else:
         done = 0
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(_AI_CHUNK_WORKERS, len(chunks))
         ) as pool:
-            for chunk_groups in pool.map(
-                lambda c: _ai_group_chunk(c, existing_songs, artist_index), chunks
-            ):
+            for chunk_groups in pool.map(_classify, chunks):
                 resolved.extend(chunk_groups)
                 done += 1
                 if len(chunks) > 2 and done % 5 == 0:
