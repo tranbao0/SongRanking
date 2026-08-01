@@ -65,8 +65,16 @@ CHUNK_SIZE = 60
 # as "leave these ungrouped" and grouping is additive - an ungrouped video
 # is never revisited, so a transient 429 would permanently split a song
 # instead of merely delaying it.
-_MAX_ATTEMPTS = 3
-_BACKOFF_BASE = 2.0
+#
+# Patience is sized for the failure seen in practice, which is not a brief
+# blip: a 500 "currently experiencing high demand" on a Flash model can
+# persist for minutes. Four attempts backing off 4s/8s/16s wait roughly
+# half a minute, where 3 attempts at 2s/4s gave up after six seconds and
+# stranded the chunk. Bounded rather than generous because every attempt
+# is counted against the day's budget, so a sustained outage must not
+# spend the whole allowance on retries.
+_MAX_ATTEMPTS = 4
+_BACKOFF_BASE = 4.0
 
 
 def chunked(items: list, size: int = CHUNK_SIZE) -> list[list]:
