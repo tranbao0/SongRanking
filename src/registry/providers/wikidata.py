@@ -1,8 +1,9 @@
 """
 Wikidata SPARQL-based channel discovery. Authoritative source: any artist
 Wikidata tags with the target genre and links to a YouTube channel (P2397)
-is included, regardless of whether other providers (e.g. kworb) also find
-them.
+is included. This is the only automated discovery source; label and
+distributor channels, which have no artist entry here, are curated in
+data/channels/<genre>_manual.yaml instead.
 
 Deliberately does not filter on "instance of" (P31) - restricting to
 "musical group" would exclude solo artists (e.g. PSY), so the only

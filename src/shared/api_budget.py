@@ -26,7 +26,7 @@ YOUTUBE_DAILY_QUOTA = int(os.environ.get("YOUTUBE_DAILY_QUOTA", 10000))
 # Conservative placeholder, not a published guarantee - Gemini free-tier
 # limits vary by model/tier and change over time. Set GEMINI_DAILY_LIMIT
 # in .env to your actual tier's limit if you know it.
-GEMINI_DAILY_LIMIT = int(os.environ.get("GEMINI_DAILY_LIMIT", 1500))
+GEMINI_DAILY_LIMIT = int(os.environ.get("GEMINI_DAILY_LIMIT", 500))
 
 WARN_THRESHOLD = 0.8
 STOP_THRESHOLD = 0.95

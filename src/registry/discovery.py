@@ -1,11 +1,18 @@
 """
 Merges channel discovery across providers into the `channels` table.
 
-Wikidata is authoritative: its entries are always kept. kworb is a
-popularity-based seed and is unioned in on top, so it only adds channels
-Wikidata missed rather than gating what Wikidata already found. A manual
-per-genre yaml patches remaining gaps and an exclude yaml prunes false
-positives (mainly from kworb's regional charts).
+Wikidata is the only automated source, and is authoritative: an artist it
+tags with the genre and links to a YouTube channel is included. A manual
+per-genre yaml adds what it cannot - label, distributor and broadcaster
+channels have no Wikidata artist entry however much of the genre they
+carry - and an exclude yaml prunes anything that shouldn't be tracked.
+
+A popularity-seeded provider (kworb's per-country YouTube charts) was
+tried and removed. Country charts rank what charts *in* a market rather
+than what belongs to a genre, so it kept introducing acts from other
+genres entirely, and their uploads are labelled impeccably enough by
+their own labels that no title-level filter could tell them apart. The
+channels it found that were worth keeping are curated in the manual yaml.
 """
 
 from datetime import date
@@ -14,11 +21,11 @@ from pathlib import Path
 import yaml
 
 from registry import db
-from registry.providers import kworb, wikidata
+from registry.providers import wikidata
 
 CHANNELS_DIR = Path(__file__).parent.parent.parent / "data" / "channels"
 
-KNOWN_GENRES = sorted(set(wikidata.GENRE_QIDS) | set(kworb.GENRE_COUNTRIES))
+KNOWN_GENRES = sorted(wikidata.GENRE_QIDS)
 
 
 def _load_yaml_list(path: Path) -> list:
@@ -55,10 +62,8 @@ def discover_genre(genre: str) -> list[dict]:
     """
     merged: dict[str, dict] = {}
 
-    for entry in kworb.discover_channels(genre):
-        merged[entry["channel_id"]] = entry
     for entry in wikidata.discover_channels(genre):
-        merged[entry["channel_id"]] = entry  # wikidata wins on overlap
+        merged[entry["channel_id"]] = entry
     for entry in _manual_channels(genre):
         merged[entry["channel_id"]] = entry  # manual overrides everything
 

@@ -28,13 +28,16 @@ from shared.mv_filter import is_blocked_title, is_valid_mv
 from shared.youtube_api import _get_client, _parse_iso_duration
 
 # Channels above this video count are treated as likely shared/label
-# channels (e.g. "HYBE LABELS" hosting many different acts) rather than
-# one artist's own channel. Only kworb-sourced channels get this
-# treatment - kworb has no genre awareness and can resolve an artist
-# search to a shared channel that also hosts artists outside the target
-# genre. Wikidata-sourced channels skip this: cross-checked separately,
-# real multi-artist overlap there is rare and already same-genre related
-# acts (e.g. a member's channel doubling as their group's channel).
+# channels (e.g. "HYBE LABELS" or "1theK" hosting many different acts)
+# rather than one artist's own channel.
+#
+# Wikidata-sourced channels are exempt: Wikidata links an artist to their
+# own channel, so real multi-artist overlap there is rare and is already
+# same-genre related acts (e.g. a member's channel doubling as their
+# group's channel). Every other source is a curated addition - labels,
+# distributors and broadcasters, which is exactly what a manual entry
+# exists to add - so those do need per-title artist tagging to keep two
+# different artists' same-titled songs from merging.
 _SHARED_CHANNEL_VIDEO_THRESHOLD = 400
 
 # How often (in pages) to print pagination progress for a large channel -
@@ -122,7 +125,7 @@ def _fetch_durations(youtube, video_ids: list[str]) -> dict[str, int]:
 # find those, so the artist's own upload of the same song would start a
 # second song rather than joining the existing one - and on a bootstrap
 # the aggregators are exactly the channels that get catalogued first,
-# since kworb entries are inserted ahead of Wikidata's.
+# since a distributor's back catalogue dwarfs any single artist's.
 # song_channel_id (the anchor) rides along so song_grouping can tell which
 # artist each candidate song belongs to without re-parsing its title -
 # an artist's own upload is often just the song name, with the artist
@@ -160,7 +163,7 @@ def _confirmed_artists(conn) -> tuple[dict[str, list[tuple[str, re.Pattern]]], d
       - {genre: [(artist_name, title-matching regex), ...]}, compiled by
         song_grouping.artist_pattern so the regexes here and the combined
         prefilter built from them anchor identically. Used both to filter
-        large kworb-sourced channels down to videos that actually
+        large multi-artist channels down to videos that actually
         belong to a genre-confirmed artist (see
         _SHARED_CHANNEL_VIDEO_THRESHOLD above), and - passed through to
         song_grouping as artist_patterns - to tag which artist a title
@@ -255,7 +258,7 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
                 existing = _existing_videos(conn, channel_id)
                 existing_ids = {r["video_id"] for r in existing}
 
-                # Non-empty only for large kworb-sourced channels (see
+                # Non-empty only for large multi-artist channels (see
                 # _SHARED_CHANNEL_VIDEO_THRESHOLD) - those are the only ones
                 # where a title's artist isn't already implied by channel_id
                 # alone, so this is the only case where song_grouping needs
@@ -263,7 +266,7 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
                 # artists' same-titled songs.
                 shared_index = (
                     artist_index_by_genre.get(row["genre"], no_artist_index)
-                    if row["source"] == "kworb" and (video_count or 0) > _SHARED_CHANNEL_VIDEO_THRESHOLD
+                    if row["source"] != "wikidata" and (video_count or 0) > _SHARED_CHANNEL_VIDEO_THRESHOLD
                     else no_artist_index
                 )
 

@@ -13,7 +13,7 @@ re-classified, so a sync only ever spends work (local or AI) on videos
 that don't have one yet.
 
 On most channels a title alone is enough - the channel already implies a
-single artist. On large kworb-sourced channels flagged as likely shared
+single artist. On large curated channels flagged as likely shared
 (see catalog.py's _SHARED_CHANNEL_VIDEO_THRESHOLD), that's not true, so
 callers pass artist_patterns (Wikidata-confirmed artist name -> regex)
 and every tier below folds the title's matched artist into its matching

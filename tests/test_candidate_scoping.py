@@ -104,7 +104,7 @@ class GroupingStillWorksTest(unittest.TestCase):
         self.conn = make_db()
         self.addCleanup(self.conn.close)
         add_channel(self.conn, "UC_bts", "kpop", "BTS", "wikidata")
-        add_channel(self.conn, "UC_shared", "kpop", "Broadcast", "kworb")
+        add_channel(self.conn, "UC_shared", "kpop", "Broadcast", "manual")
         self.conn.execute(
             "INSERT INTO songs (song_id, channel_id, canonical_title, grouped_at) "
             "VALUES (1, 'UC_bts', 'Dynamite', '2026-01-01')"

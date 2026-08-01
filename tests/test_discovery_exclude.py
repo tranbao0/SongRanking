@@ -1,9 +1,8 @@
 """
 Guards channel exclusion, the mechanism for pruning genre false positives.
 
-kworb seeds a genre from a country's chart, which ranks what charts *in*
-that country rather than what belongs to the genre - so international acts
-arrive tagged as kpop, labelled impeccably by their own labels. No
+A popularity-seeded provider once tagged international acts as kpop,
+labelled impeccably by their own labels. No
 title-level filter can reject those: an Oasis "Official Lyric Video" looks
 exactly like the K-pop uploads we want. The channel has to be pruned, and
 the pruning has to reach content already catalogued from it.
@@ -21,8 +20,8 @@ class PurgeExcludedTest(unittest.TestCase):
     def setUp(self):
         self.conn = make_db()
         self.addCleanup(self.conn.close)
-        add_channel(self.conn, "UC_keep", "kpop", "Real Kpop Act", "kworb")
-        add_channel(self.conn, "UC_drop", "kpop", "Oasis", "kworb")
+        add_channel(self.conn, "UC_keep", "kpop", "Real Kpop Act", "manual")
+        add_channel(self.conn, "UC_drop", "kpop", "Oasis", "manual")
         self.conn.execute(
             "INSERT INTO songs (song_id, channel_id, canonical_title, grouped_at) "
             "VALUES (1, 'UC_keep', 'Real Song', '2026-01-01'), "

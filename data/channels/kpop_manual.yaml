@@ -1,3 +1,28 @@
-# Manually-added kpop channels, for artists Wikidata/kworb miss.
+# Manually-added kpop channels, for artists and labels Wikidata misses.
 # - channel_id: UCxxxxxxxxxxxxxxxxxxxxxx
 #   display_name: Artist Name
+#
+# Wikidata only links an artist to their *own* channel, so label and
+# distributor channels have no entry there however much of the genre they
+# carry. They are curated here instead.
+#
+# Only official artist, label, distributor or broadcaster channels belong
+# in this file. Fan lyric-video channels and re-uploaders carry the right
+# genre but the wrong uploads: their view counts are separate from the
+# official release, so counting them splits a song's audience across
+# copies rather than measuring it.
+
+- channel_id: UCweOkPb1wVVH0Q0Tlj4a5Pw
+  display_name: 1theK
+- channel_id: UC3IZKseVpdzPSBaWxBxundA
+  display_name: HYBE LABELS
+- channel_id: UCQdq-lqPEq_yZ_wP_kuVB9Q
+  display_name: KQ ENTERTAINMENT
+- channel_id: UC5BMQOsAB8hKUyHu9KI6yig
+  display_name: KBS WORLD TV
+- channel_id: UCy3LUnp2XlCR4DSZm7gA75w
+  display_name: BBGIRLS
+- channel_id: UCowiwt93gqGlNG4k5VDxO-w
+  display_name: MEOVV
+- channel_id: UCFpb1KZtdQgjdbJJL4bvc7Q
+  display_name: cosmosy

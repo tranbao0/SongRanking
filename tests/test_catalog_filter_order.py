@@ -24,10 +24,10 @@ class FilterOrderTest(unittest.TestCase):
         self.conn = make_db(keep_open=True)
         self.addCleanup(self.conn.really_close)
 
-        # One confirmed artist, and a kworb channel far over the
+        # One confirmed artist, and a curated channel far over the
         # shared-channel threshold - i.e. a broadcast/aggregator archive.
         add_channel(self.conn, "UC_bts", "kpop", "BTS", "wikidata")
-        add_channel(self.conn, "UC_broadcast", "kpop", "KBS WORLD TV", "kworb")
+        add_channel(self.conn, "UC_broadcast", "kpop", "KBS WORLD TV", "manual")
         self.conn.execute(
             "UPDATE channels SET last_known_video_count = 0 WHERE channel_id = 'UC_broadcast'"
         )

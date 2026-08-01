@@ -25,9 +25,13 @@ Tracks genre-tagged artists and their view-count history. Everything it produces
 
 Channel discovery, per genre:
 
-- **Wikidata** - SPARQL query for artists tagged with the genre and a linked YouTube channel (`P2397`). Includes solo artists, not just groups/bands. Source of truth on conflicts.
-- **kworb** - each genre's representative country chart on [kworb.net](https://kworb.net/youtube/insights/), resolved to channel IDs via `yt-dlp`. Unioned on top of Wikidata's results.
+- **Wikidata** - SPARQL query for artists tagged with the genre and a linked YouTube channel (`P2397`). Includes solo artists, not just groups/bands. The only automated source, and authoritative.
 - **Manual yaml** - `data/channels/<genre>_manual.yaml` (additions) and `data/channels/<genre>_exclude.yaml` (exclusions).
+  Wikidata links an artist to their *own* channel, so label, distributor and broadcaster channels have no entry there however much of the genre they carry. Those are curated by hand.
+
+> A popularity-seeded provider (per-country YouTube charts) was tried and removed.
+> A country chart ranks what charts *in* a market, not what belongs to a genre, so it kept introducing acts from other genres entirely - and because their uploads are labelled impeccably by their own labels, no title-level filter could tell them apart from the real thing.
+> Genre membership has to be decided per channel, which is what the two yaml files are for.
 
 `catalog.py`:
 - Walks each channel's uploads via the YouTube Data API.
@@ -62,8 +66,8 @@ Same renderer regardless of ranking source (chart engine, live search, or manual
 
 ```
 Wikidata ─┐
-kworb     ─┼─> discovery.py ─> channels table ─┐
-manual    ─┘                                    │
+manual    ─┼─> discovery.py ─> channels table ─┐
+exclude   ─┘                                    │
                                                  v
                                           catalog.py ─> videos + songs tables
                                                  │
@@ -130,11 +134,10 @@ Shared flags: `--limit` (cap song count), `--download-workers` / `--encode-worke
 ## Guide: adding a new genre
 
 1. **Find the genre's Wikidata QID.** [wikidata.org](https://www.wikidata.org) (e.g. "K-pop" is `Q213665`). Add it to `GENRE_QIDS` in `src/registry/providers/wikidata.py`.
-2. **Pick a representative kworb country chart.** [kworb.net/youtube/insights/](https://kworb.net/youtube/insights/). Add the two-letter code to `GENRE_COUNTRIES` in `src/registry/providers/kworb.py`.
-3. **Create manual curation files:** `data/channels/<genre>_manual.yaml` and `data/channels/<genre>_exclude.yaml` (copy structure from existing `kpop_*`/`jpop_*` files).
-4. **Run discovery:** `python run.py sync --genre <genre>`.
-5. **Review results** - kworb-sourced channels are most likely to need pruning (see [manual curation](#guide-manual-channel-curation)).
-6. **Add chart definitions** in `data/charts.yaml`.
+2. **Create manual curation files:** `data/channels/<genre>_manual.yaml` and `data/channels/<genre>_exclude.yaml` (copy structure from existing `kpop_*`/`jpop_*` files).
+3. **Run discovery:** `python run.py sync --genre <genre>`.
+4. **Review results**, then curate. Wikidata gives you artists; add the genre's label/distributor channels to the manual file yourself, since those carry a large share of the catalogue and Wikidata has no entry for them.
+5. **Add chart definitions** in `data/charts.yaml`.
 
 No other code changes required - catalog sync, view snapshots, chart computation, and rendering are genre-generic.
 
@@ -187,7 +190,13 @@ Adding a new **metric** (not "sum," "delta," or "most recent") requires a code c
 - channel_id: UCxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-Precedence: manual additions > automated sources; exclusions applied last.
+Precedence: manual additions override Wikidata; exclusions are applied last and win over everything.
+
+Excluding a channel also deletes it and everything catalogued from it - its videos, and any song left with no videos.
+That matters because charts read videos joined to channels, so an excluded channel's uploads would otherwise keep charting under the genre they were wrongly tagged with.
+
+Only official artist, label, distributor or broadcaster channels belong in the manual file.
+Fan lyric-video channels and re-uploaders carry the right genre but the wrong uploads: their views are separate from the official release, so counting them splits a song's audience across copies instead of measuring it.
 
 ## API spend safeguards
 

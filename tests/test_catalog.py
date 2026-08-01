@@ -57,7 +57,7 @@ class ExistingVideosTest(unittest.TestCase):
     def setUp(self):
         self.conn = make_db()
         self.addCleanup(self.conn.close)
-        add_channel(self.conn, "UC_aggregator", display_name="1theK", source="kworb")
+        add_channel(self.conn, "UC_aggregator", display_name="1theK", source="manual")
         add_channel(self.conn, "UC_artist", display_name="BTS")
         # Song discovered via the aggregator, anchored to the artist.
         self.conn.execute(
@@ -120,7 +120,7 @@ class ConfirmedArtistsTest(unittest.TestCase):
         add_channel(self.conn, "UC_bts", "kpop", "BTS", "wikidata")
         add_channel(self.conn, "UC_twice", "kpop", "TWICE", "wikidata")
         add_channel(self.conn, "UC_perfume", "jpop", "Perfume", "wikidata")
-        add_channel(self.conn, "UC_kworb", "kpop", "Some Label", "kworb")
+        add_channel(self.conn, "UC_label", "kpop", "Some Label", "manual")
         add_channel(self.conn, "UC_manual", "kpop", "Manual Pick", "manual")
         add_channel(self.conn, "UC_blank", "kpop", "   ", "wikidata")
         self.conn.commit()
@@ -143,8 +143,8 @@ class ConfirmedArtistsTest(unittest.TestCase):
         self.assertEqual(home_channels["Shared Name"], "UC_second")  # last row wins, as before
 
     def test_only_wikidata_channels_are_confirmed(self):
-        """kworb is a popularity seed, not a genre roster - it must not confirm."""
-        add_channel(self.conn, "UC_kworb", "kpop", "Label Channel", "kworb")
+        """only wikidata confirms an artist; curated entries must not."""
+        add_channel(self.conn, "UC_label", "kpop", "Label Channel", "manual")
         add_channel(self.conn, "UC_manual", "kpop", "Manual Pick", "manual")
         self.conn.commit()
 
