@@ -15,6 +15,7 @@ Three components: a discovery/data layer, a chart engine, and a render pipeline.
 - [API spend safeguards](#api-spend-safeguards)
 - [Data files](#data-files)
 - [Tuning worker pools](#tuning-worker-pools)
+- [Tests](#tests)
 
 ## Architecture
 
@@ -31,7 +32,12 @@ Channel discovery, per genre:
 `catalog.py`:
 - Walks each channel's uploads via the YouTube Data API.
 - Filters to official MVs (`mv_filter.py`: duration window, blocklist for compilations/playlists/etc).
-- Groups uploads that are the same underlying song (`song_grouping.py`) so their views aggregate into one chart entry. Additive: a video's `song_id` is set once and never re-derived, so a sync only classifies that channel's new uploads, not its full history. Three tiers: exact normalized-title match against existing videos, local clustering among new uploads, then a Gemini pass for the remainder (also tags titles by Wikidata-confirmed artist on large multi-artist channels to keep different artists' same-titled songs from merging).
+- Groups uploads that are the same underlying song (`song_grouping.py`) so their views aggregate into one chart entry.
+  Additive: a video's `song_id` is set once and never re-derived, so a sync only classifies that channel's new uploads, not its full history.
+  Three tiers, cheapest first: exact normalized-title match against existing videos, local clustering among new uploads, then a Gemini pass for whatever is left.
+  The first two tiers are free and deterministic, and normalization strips upload-type markers whether or not they are bracketed (`'Dynamite' Official MV` and `'Dynamite' Dance Practice` resolve to the same key), so most same-song pairs never reach the AI at all.
+  On large multi-artist channels the AI tier also tags each title with its Wikidata-confirmed artist, to keep different artists' same-titled songs from merging.
+  A re-arranged version counts as a different song: remixes, acoustic, instrumental and sped-up versions each chart separately from the original.
 
 `snapshot.py` records each tracked video's current view count once per run (`view_snapshots` table).
 
@@ -185,7 +191,8 @@ Precedence: manual additions > automated sources; exclusions applied last.
 
 ## API spend safeguards
 
-`src/shared/api_budget.py` tracks daily usage for the YouTube Data API and Gemini API in `data/.api_usage.json` (resets at midnight, git-ignored). `sync` and AI-assisted steps (title cleanup, song grouping) stop before exceeding budget instead of erroring mid-run.
+`src/shared/api_budget.py` tracks daily usage for the YouTube Data API and Gemini API in `data/.api_usage.json` (resets at midnight, git-ignored).
+`sync` and AI-assisted steps (title cleanup, song grouping) stop before exceeding budget instead of erroring mid-run.
 
 Defaults: YouTube 10,000 units/day, Gemini 1,500 requests/day. Override in `.env`:
 
@@ -194,7 +201,20 @@ YOUTUBE_DAILY_QUOTA=10000
 GEMINI_DAILY_LIMIT=1500
 ```
 
+The Gemini default is a conservative placeholder rather than a published limit.
+Paid tiers are far higher, and on a first full `sync` this value - not wall-clock speed - is what caps how many channels complete per day, so it is worth setting to your actual tier.
+
 A budget-stopped `sync` resumes from the least-recently-synced channel on the next run - no completed work is redone.
+
+### What a run actually spends
+
+**YouTube** costs 1 unit per 50 videos walked, and again 1 unit per 50 durations checked.
+A channel's first sync walks its entire upload history, so a 4,000-upload channel costs ~160 units on its own; later syncs cost 1 unit when the video count hasn't changed.
+Titles the blocklist already rejects are dropped before their durations are fetched, so no quota is spent resolving videos that cannot qualify.
+
+**Gemini** is billed per token, and a request's instruction preamble, candidate-song list and thinking cost are all paid per call regardless of how many titles it carries.
+Grouping therefore sends large chunks (`CHUNK_SIZE` in `src/shared/gemini_client.py`) rather than many small ones - see the measured table in that file.
+Rate limits and transient server errors are retried with jittered backoff, because song grouping is additive: a call that fails is not retried later, so its videos would stay permanently ungrouped.
 
 ## Data files
 
@@ -209,6 +229,25 @@ A budget-stopped `sync` resumes from the least-recently-synced channel on the ne
 | `data/.api_usage.json` | Today's API spend counters. Git-ignored, resets daily. |
 
 ## Tuning worker pools
+
+There are three pools in total: two in the render pipeline, exposed as CLI flags, and one in song grouping, set in code.
+
+### Song grouping (Gemini)
+
+`_AI_CHUNK_WORKERS` in `src/registry/song_grouping.py` (default 4) controls how many grouping requests are in flight at once.
+A grouping call is ~10s of mostly waiting, and a channel can need several, so overlapping them is the difference between a sync that looks responsive and one that looks hung.
+
+This pool is safe to widen or narrow because **the chunks are independent by construction**.
+Every chunk is handed the same snapshot of already-known songs, that snapshot is never updated mid-pass, and no song row is written until all chunks have returned.
+Concurrency therefore cannot change which videos end up grouped together - results are also consumed in submission order, so even the assigned `song_id` values match what a sequential run produces.
+
+Raise it if you are on a paid tier with generous rate limits and want a first sync to finish sooner.
+Lower it to 1 if you are hitting 429s more often than the retry/backoff absorbs.
+Note that widening this does not reduce spend at all - it only hides latency - and on a first sync your daily Gemini budget, not this number, is what limits progress.
+
+Chunk *size* is the setting that affects cost and accuracy; see `CHUNK_SIZE` in `src/shared/gemini_client.py`, which carries the benchmark it was chosen from.
+
+### Download and encode
 
 `src/render/pipeline.py` downloads and encodes clips through two independent thread pools: `--download-workers` (default 6), `--encode-workers` (default 3).
 
@@ -233,6 +272,20 @@ For a 200 Mbps connection: `python run.py csv --download-workers 6 --encode-work
 - Per-clip download time ≈ `clip_size_MB × 8 / per_connection_mbps` + ~3-5s fixed overhead (connection setup, format negotiation).
 - Per-clip encode time ≈ 2-5s on GPU, 10-30s on CPU (`libx264 -preset fast`).
 - Encode workers beyond `download_workers × (download_time_per_clip / encode_time_per_clip)` sit idle.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -t .
+```
+
+Standard library `unittest`, no extra dependencies and no test runner to install.
+
+No test reaches the network, spends API quota, or touches `data/registry.db` - every one builds its own in-memory database, and the YouTube and Gemini calls are stubbed.
+The suite is therefore safe to run while a `sync` is in progress.
+
+Several tests are differential: they keep a previous implementation as an oracle and assert the current one matches it across randomized inputs.
+That is how the SQL rewrite of the view lookup and the artist-matching index are pinned, and any test whose docstring says *"Do not optimise"* is one of those oracles.
 
 > **Note:** Video clips and databases are excluded from version control via `.gitignore` (GitHub file size limits).
 >

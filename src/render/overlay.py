@@ -39,14 +39,17 @@ def _text_w(draw, font, text):
     return _measure(draw, font, text)[2]
 
 
-def _vgrad_rgb(width, height, top_rgb, bottom_rgb):
-    """A width x height opaque image whose color lerps top_rgb -> bottom_rgb top to bottom."""
-    col = Image.new("RGB", (1, max(height, 1)))
-    px = col.load()
-    for y in range(height):
-        t = y / max(height - 1, 1)
-        px[0, y] = tuple(int(top_rgb[i] + (bottom_rgb[i] - top_rgb[i]) * t) for i in range(3))
-    return col.resize((max(width, 1), max(height, 1)))
+def _valpha_ramp(width, height, max_alpha):
+    """
+    A width x height 8-bit mask ramping 0 -> max_alpha top to bottom, each
+    row a single flat value. Built one pixel wide and stretched with NEAREST
+    (exact replication, no resampling, since only the width changes), rather
+    than materialising a width*height Python list to putdata() - at 1920px
+    wide that list alone costs ~45ms per overlay for an identical result.
+    """
+    column = Image.new("L", (1, max(height, 1)))
+    column.putdata([int(max_alpha * (y / max(height - 1, 1))) for y in range(height)])
+    return column.resize((max(width, 1), max(height, 1)), Image.NEAREST)
 
 
 def _fit_fontsize(draw, font_path, text, max_width, start_size, min_size):
@@ -93,10 +96,10 @@ def build_overlay_image(style, *, rank, title, artist, peak, release_date, month
     # ── Gradient fade above the solid bar, then the solid bar itself ───────
     # This is the only gradient in the whole design - everything else below
     # (rank, stats, badge) is drawn with flat fills per the style constraints.
-    fade_img = _vgrad_rgb(cw, fade_h, bar_color, bar_color).convert("RGBA")
-    fade_alpha = Image.new("L", (cw, fade_h))
-    fade_alpha.putdata([int(bar_alpha * (y / max(fade_h - 1, 1))) for y in range(fade_h) for _ in range(cw)])
-    fade_img.putalpha(fade_alpha)
+    # Flat bar_color throughout - the fade is purely an alpha ramp, so only
+    # the mask varies down the strip.
+    fade_img = Image.new("RGBA", (cw, fade_h), (*bar_color, 0))
+    fade_img.putalpha(_valpha_ramp(cw, fade_h, bar_alpha))
     img.paste(fade_img, (0, fade_top), fade_img)
     draw.rectangle([0, bar_top, cw, bar_bottom], fill=(*bar_color, int(bar_alpha)))
 
@@ -131,15 +134,16 @@ def build_overlay_image(style, *, rank, title, artist, peak, release_date, month
     sep_font    = _font(fr, t["artist_fontsize"])
     artist_font = _font(fr, t["artist_fontsize"])
 
+    # The separator and artist are fixed for the whole loop, so they're
+    # measured once instead of re-measured on every character dropped.
+    artist_text = artist.upper()
+    fixed_w = _text_w(draw, sep_font, t["separator"]) + _text_w(draw, artist_font, artist_text)
+
     display_title = title
-    full_w = (_text_w(draw, title_font, display_title)
-              + _text_w(draw, sep_font, t["separator"])
-              + _text_w(draw, artist_font, artist.upper()))
+    full_w = _text_w(draw, title_font, display_title) + fixed_w
     while full_w > max_title_w and len(display_title) > 3:
         display_title = display_title[:-1]
-        full_w = (_text_w(draw, title_font, display_title + "…")
-                  + _text_w(draw, sep_font, t["separator"])
-                  + _text_w(draw, artist_font, artist.upper()))
+        full_w = _text_w(draw, title_font, display_title + "…") + fixed_w
     if display_title != title:
         display_title += "…"
 
@@ -192,7 +196,6 @@ def build_overlay_image(style, *, rank, title, artist, peak, release_date, month
     sw, _ = _draw_text(draw, sep_x, row1_center_y - sep_h / 2, t["separator"], sep_font,
                         _rgba(t["separator_color"]))
 
-    artist_text = artist.upper()
     artist_h = _measure(draw, artist_font, artist_text)[3]
     _draw_text(draw, sep_x + sw, row1_center_y - artist_h / 2, artist_text, artist_font,
                _rgba(t["artist_color"]))

@@ -24,7 +24,7 @@ from datetime import date, datetime
 
 from registry import db, song_grouping
 from shared import api_budget
-from shared.mv_filter import is_valid_mv
+from shared.mv_filter import is_blocked_title, is_valid_mv
 from shared.youtube_api import _get_client, _parse_iso_duration
 
 # Channels above this video count are treated as likely shared/label
@@ -106,29 +106,43 @@ def _fetch_durations(youtube, video_ids: list[str]) -> dict[str, int]:
     return durations
 
 
-def _confirmed_artists_by_genre(conn) -> dict[str, list[tuple[str, re.Pattern]]]:
+def _confirmed_artists(conn) -> tuple[dict[str, list[tuple[str, re.Pattern]]], dict[str, str]]:
     """
-    (artist_name, word-boundary regex) pairs per Wikidata-confirmed artist,
-    grouped by genre. Used both to filter large kworb-sourced channels down
-    to videos that actually belong to a genre-confirmed artist (see
-    _SHARED_CHANNEL_VIDEO_THRESHOLD above), and - passed through to
-    song_grouping as artist_patterns - to tag which artist a title belongs
-    to, so grouping can't merge two different artists' same-titled songs
-    together on a channel that hosts more than one.
+    One pass over the Wikidata-confirmed channels, returning both things
+    sync_videos needs from them:
+
+      - {genre: [(artist_name, title-matching regex), ...]}, compiled by
+        song_grouping.artist_pattern so the regexes here and the combined
+        prefilter built from them anchor identically. Used both to filter
+        large kworb-sourced channels down to videos that actually
+        belong to a genre-confirmed artist (see
+        _SHARED_CHANNEL_VIDEO_THRESHOLD above), and - passed through to
+        song_grouping as artist_patterns - to tag which artist a title
+        belongs to, so grouping can't merge two different artists'
+        same-titled songs together on a channel that hosts more than one.
+      - {artist_name: that artist's own channel_id}. Passed to
+        song_grouping as artist_home_channels so a video matched to a
+        confirmed artist on a *different* channel (e.g. a broadcast/stage
+        channel re-uploading them) can be recognized as the same artist's
+        song instead of becoming a separate, un-merged entry - see
+        song_grouping's module docstring.
+
+    Previously two separate queries over the same rows. Row order (and so
+    which channel_id wins when two confirmed channels share a display_name)
+    is unchanged, since both queries had the same table and WHERE clause.
     """
-    rows = conn.execute("SELECT genre, display_name FROM channels WHERE source = 'wikidata'").fetchall()
+    rows = conn.execute(
+        "SELECT genre, display_name, channel_id FROM channels WHERE source = 'wikidata'"
+    ).fetchall()
     patterns: dict[str, list[tuple[str, re.Pattern]]] = {}
+    home_channels: dict[str, str] = {}
     for row in rows:
         name = row["display_name"].strip()
         if not name:
             continue
-        pattern = re.compile(r"\b" + re.escape(name) + r"\b", re.IGNORECASE)
-        patterns.setdefault(row["genre"], []).append((name, pattern))
-    return patterns
-
-
-def _matches_confirmed_artist(title: str, patterns: list[tuple[str, re.Pattern]]) -> bool:
-    return any(p.search(title) for _, p in patterns)
+        patterns.setdefault(row["genre"], []).append((name, song_grouping.artist_pattern(name)))
+        home_channels[name] = row["channel_id"]
+    return patterns, home_channels
 
 
 def sync_videos(channel_ids: list[str] | None = None) -> int:
@@ -156,7 +170,16 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
         total = len(rows)
         print(f"  [catalog] {total} channel(s) to check")
 
-        artist_patterns = _confirmed_artists_by_genre(conn)
+        artist_patterns, official_channels = _confirmed_artists(conn)
+        # Built once per genre rather than per channel: every shared channel
+        # in a genre matches against the same confirmed-artist list, and a
+        # shared index also shares its compiled prefilter and per-title memo
+        # (see song_grouping._ArtistIndex).
+        artist_index_by_genre = {
+            genre: song_grouping.build_artist_index(patterns)
+            for genre, patterns in artist_patterns.items()
+        }
+        no_artist_index = song_grouping.build_artist_index([])
         youtube = _get_client()
         upserted = 0
         processed = 0
@@ -195,24 +218,33 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
                 # alone, so this is the only case where song_grouping needs
                 # per-title artist tagging to avoid merging two different
                 # artists' same-titled songs.
-                shared_patterns = (
-                    artist_patterns.get(row["genre"], [])
+                shared_index = (
+                    artist_index_by_genre.get(row["genre"], no_artist_index)
                     if row["source"] == "kworb" and (video_count or 0) > _SHARED_CHANNEL_VIDEO_THRESHOLD
-                    else []
+                    else no_artist_index
                 )
 
                 new_uploads = _list_new_uploads(youtube, playlist_id, existing_ids)
                 new_mvs = []
                 if new_uploads:
-                    durations = _fetch_durations(youtube, [v["video_id"] for v in new_uploads])
+                    # Titles the blocklist already rejects are dropped before
+                    # the duration lookup, not after: durations cost a quota
+                    # unit per 50 videos - the same rate as walking the
+                    # playlist itself - and a blocklisted title can't pass
+                    # is_valid_mv whatever its duration is. On a channel
+                    # heavy with teasers and mixes that is a real share of
+                    # the day's catalogue budget, and the survivors are
+                    # filtered identically below.
+                    candidates = [v for v in new_uploads if not is_blocked_title(v["title"])]
+                    durations = _fetch_durations(youtube, [v["video_id"] for v in candidates])
                     new_mvs = [
-                        v for v in new_uploads
+                        v for v in candidates
                         if is_valid_mv(v["title"], durations.get(v["video_id"], 0))
                     ]
 
-                    if shared_patterns:
+                    if shared_index:
                         before = len(new_mvs)
-                        new_mvs = [v for v in new_mvs if _matches_confirmed_artist(v["title"], shared_patterns)]
+                        new_mvs = [v for v in new_mvs if shared_index.match(v["title"]) is not None]
                         if len(new_mvs) != before:
                             print(f"    filtered {before - len(new_mvs)} video(s) not matching a "
                                   f"confirmed {row['genre']} artist (likely shared channel)")
@@ -228,14 +260,36 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
                     for v in new_mvs
                 ]
 
+                # On a shared channel, a new video's matched artist might
+                # already have their own tracked channel elsewhere - pull
+                # that channel's existing videos in too so this upload can
+                # link to that artist's existing song instead of becoming
+                # a separate entry (see song_grouping's module docstring).
+                cross_channel_ids = set()
+                if shared_index:
+                    for v in new_video_dicts:
+                        artist = shared_index.match(v["title"])
+                        home_channel_id = official_channels.get(artist) if artist else None
+                        if home_channel_id and home_channel_id != channel_id:
+                            cross_channel_ids.add(home_channel_id)
+
+                cross_existing = []
+                for cid in cross_channel_ids:
+                    cross_existing.extend(conn.execute(
+                        "SELECT video_id, title, url, published_at, discovered_at, song_id FROM videos WHERE channel_id = ?",
+                        (cid,),
+                    ).fetchall())
+
                 # existing videos already have a settled song_id and are never
                 # re-grouped - only new_video_dicts goes through song_grouping,
                 # so AI usage scales with today's new uploads, not the channel's
                 # whole history.
                 if new_video_dicts:
-                    print(f"    grouping {len(new_video_dicts)} new video(s) into songs...")
+                    extra = f" (cross-checking {len(cross_channel_ids)} artist channel(s))" if cross_channel_ids else ""
+                    print(f"    grouping {len(new_video_dicts)} new video(s) into songs...{extra}")
                 song_map = song_grouping.group_channel_videos(
-                    conn, channel_id, existing, new_video_dicts, artist_patterns=shared_patterns,
+                    conn, channel_id, existing + cross_existing, new_video_dicts,
+                    artist_patterns=shared_index, artist_home_channels=official_channels,
                 )
 
                 rows_to_upsert = [

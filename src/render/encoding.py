@@ -140,6 +140,7 @@ _DOWNLOAD_FALLBACK_CLIENT = "android"
 
 
 def _probe_duration(path):
+    """Always spawns ffprobe. Use _cached_duration for files known to be final."""
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", path],
@@ -149,6 +150,33 @@ def _probe_duration(path):
         return float(result.stdout.strip())
     except ValueError:
         return None
+
+
+# A raw clip's duration gets asked for repeatedly once it's on disk: by
+# encode_song, then again by each transition segment built against it, and
+# again whenever _run_ffmpeg rebuilds a command for its CPU-fallback retry.
+# Every one of those is a process spawn (~370ms on the dev machine) for a
+# number that can't change, since nothing rewrites a clip after download.
+#
+# Deliberately not used by download_song: it probes to decide whether an
+# attempt produced a usable file at all, and a retry rewrites that same
+# path - so it probes uncached and seeds this only once a file is final.
+_duration_cache: dict[str, float] = {}
+_duration_cache_lock = threading.Lock()
+
+
+def _cached_duration(path):
+    """Duration of a file that won't be rewritten, probed at most once."""
+    with _duration_cache_lock:
+        cached = _duration_cache.get(path)
+    if cached is not None:
+        return cached
+
+    duration = _probe_duration(path)
+    if duration is not None:
+        with _duration_cache_lock:
+            _duration_cache[path] = duration
+    return duration
 
 
 def download_song(rank, title, url, start="00:01:00", end="00:01:15"):
@@ -177,9 +205,17 @@ def download_song(rank, title, url, start="00:01:00", end="00:01:15"):
         # empty file while yt-dlp still reports success, so exit code
         # alone isn't a reliable success signal - the output has to
         # actually probe as a real clip too.
-        if result.returncode == 0 and _probe_duration(raw_clip) is None:
-            result.returncode = 1
-            result.stderr += "\n(postcheck) downloaded file has no readable duration - treating as a failed attempt"
+        if result.returncode == 0:
+            duration = _probe_duration(raw_clip)
+            if duration is None:
+                result.returncode = 1
+                result.stderr += "\n(postcheck) downloaded file has no readable duration - treating as a failed attempt"
+            else:
+                # The clip is final from here on, so hand this probe's
+                # result to everything downstream that would re-spawn
+                # ffprobe for the same answer.
+                with _duration_cache_lock:
+                    _duration_cache[raw_clip] = duration
         return result
 
     _log(f"  [rank {rank}] Downloading clip...")
@@ -197,7 +233,7 @@ def encode_song(style, raw_clip, rank, title, artist, peak, entry_type,
                 views, release_date, months_on_chart, views_gained=None, rank_change="",
                 codec=None, head_trim=0.0, tail_trim=0.0):
     """
-    CPU/GPU-bound stage: builds this clip's own timeline —
+    CPU/GPU-bound stage: builds this clip's own timeline -
 
         [bare (edge clips only)] -> overlay wipes in -> static overlay
         -> overlay wipes out -> [bare (edge clips only)]
@@ -245,7 +281,7 @@ def encode_song(style, raw_clip, rank, title, artist, peak, entry_type,
     # length than the crossfade every interior clip gets instead.
     boundary_duration   = transition_cfg.get("duration", 1.0)
 
-    full_dur = _probe_duration(raw_clip)
+    full_dur = _cached_duration(raw_clip)
     if full_dur is None:
         raise RuntimeError(f"OVERLAY failed: rank {rank} raw clip has no readable duration (corrupt/empty download).")
     window_start = head_trim
@@ -314,7 +350,7 @@ def encode_song(style, raw_clip, rank, title, artist, peak, entry_type,
 
 def _build_transition_cmd(codec, clip_a, clip_b, cw, ch, fps, video_transition, duration, out_path):
     video_args = _HW_ENCODE_ARGS.get(codec, _CPU_ENCODE_ARGS)
-    dur_a = _probe_duration(clip_a)
+    dur_a = _cached_duration(clip_a)
     return [
         "ffmpeg",
         "-ss", str(max(dur_a - duration, 0)), "-i", clip_a,

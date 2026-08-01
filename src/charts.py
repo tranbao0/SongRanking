@@ -56,34 +56,62 @@ def _group_videos(videos: list) -> dict[str, list]:
     return groups
 
 
+# Both variants resolve each video's snapshots with an index seek against
+# view_snapshots' (video_id, snapshot_date) primary key rather than reading
+# them. The straightforward "select every snapshot for the genre and keep
+# the last one per video in Python" costs one row per video per day tracked
+# - hundreds of thousands of rows within a few months of daily snapshots,
+# every one of them materialised as a sqlite3.Row - to produce at most two
+# numbers per video. These ask for exactly those two numbers instead, so
+# cost scales with the video count and not with how long history has been
+# accumulating.
+_LATEST_VIEWS_SQL = """
+    SELECT v.video_id,
+           (SELECT s.views FROM view_snapshots s
+             WHERE s.video_id = v.video_id
+             ORDER BY s.snapshot_date DESC LIMIT 1) AS latest,
+           NULL AS baseline
+    FROM videos v
+    JOIN channels c ON c.channel_id = v.channel_id
+    WHERE c.genre = ?
+"""
+
+_LATEST_AND_BASELINE_VIEWS_SQL = """
+    SELECT v.video_id,
+           (SELECT s.views FROM view_snapshots s
+             WHERE s.video_id = v.video_id
+             ORDER BY s.snapshot_date DESC LIMIT 1) AS latest,
+           (SELECT s.views FROM view_snapshots s
+             WHERE s.video_id = v.video_id AND s.snapshot_date <= ?
+             ORDER BY s.snapshot_date DESC LIMIT 1) AS baseline
+    FROM videos v
+    JOIN channels c ON c.channel_id = v.channel_id
+    WHERE c.genre = ?
+"""
+
+
 def _latest_and_baseline_views(conn, genre: str, window_days: int | None) -> dict[str, dict]:
     """
     Per video_id: {"latest": int, "baseline": int | None}. baseline is the
     snapshot nearest but not after (today - window_days); None if there's
     no snapshot that old yet (too little history to compute an accurate
     delta, so callers should skip rather than guess).
+
+    Videos with no snapshots at all are omitted entirely, so a caller
+    can't mistake "never measured" for a real zero.
     """
-    rows = conn.execute(
-        """
-        SELECT vs.video_id, vs.snapshot_date, vs.views
-        FROM view_snapshots vs
-        JOIN videos v ON v.video_id = vs.video_id
-        JOIN channels c ON c.channel_id = v.channel_id
-        WHERE c.genre = ?
-        ORDER BY vs.video_id, vs.snapshot_date
-        """,
-        (genre,),
-    ).fetchall()
+    if window_days:
+        cutoff = (date.today() - timedelta(days=window_days)).isoformat()
+        rows = conn.execute(_LATEST_AND_BASELINE_VIEWS_SQL, (cutoff, genre))
+    else:
+        # No baseline is needed for cumulative/newest, so it isn't looked up.
+        rows = conn.execute(_LATEST_VIEWS_SQL, (genre,))
 
-    cutoff = (date.today() - timedelta(days=window_days)).isoformat() if window_days else None
-
-    result: dict[str, dict] = {}
-    for row in rows:
-        entry = result.setdefault(row["video_id"], {"latest": None, "baseline": None})
-        entry["latest"] = row["views"]
-        if cutoff is not None and row["snapshot_date"] <= cutoff:
-            entry["baseline"] = row["views"]
-    return result
+    return {
+        row["video_id"]: {"latest": row["latest"], "baseline": row["baseline"]}
+        for row in rows
+        if row["latest"] is not None
+    }
 
 
 def _build_group_entry(members: list, views_by_id: dict) -> dict | None:

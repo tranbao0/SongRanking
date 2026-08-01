@@ -185,7 +185,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
     # finishes it's immediately handed to the encode pool, so encoding for
     # earlier songs overlaps with downloading of later ones instead of the
     # two stages being coupled to one shared worker count. Every clip except
-    # the very first/last is trimmed on the side(s) touching a neighbor —
+    # the very first/last is trimmed on the side(s) touching a neighbor -
     # that sliver is instead rendered by the transition stage below, which
     # blends it into the adjacent clip. Trim amounts are decided from each
     # song's fixed position in `countdown`, before any downloads finish, so

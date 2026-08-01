@@ -21,14 +21,21 @@ def take_snapshot() -> int:
     today = date.today().isoformat()
     conn = db.get_connection()
     try:
-        already_done = {
-            row["video_id"]
-            for row in conn.execute(
-                "SELECT video_id FROM view_snapshots WHERE snapshot_date = ?", (today,)
+        # Resolved in SQL (via idx_snapshots_date) rather than by loading
+        # today's snapshot rows and every tracked video into Python and
+        # differencing them - on a re-run later the same day that read back
+        # the whole day's inserts just to discard all of them.
+        pending = conn.execute(
+            """
+            SELECT v.video_id, v.url
+            FROM videos v
+            WHERE NOT EXISTS (
+                SELECT 1 FROM view_snapshots s
+                WHERE s.video_id = v.video_id AND s.snapshot_date = ?
             )
-        }
-        videos = conn.execute("SELECT video_id, url FROM videos").fetchall()
-        pending = [v for v in videos if v["video_id"] not in already_done]
+            """,
+            (today,),
+        ).fetchall()
         if not pending:
             print("  [snapshot] Nothing pending, all tracked videos already have today's snapshot")
             return 0

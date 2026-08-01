@@ -32,10 +32,20 @@ MIN_DURATION = 90
 MAX_DURATION = 720
 
 
+def is_blocked_title(title: str) -> bool:
+    """
+    The title-only half of is_valid_mv, split out for callers that pay to
+    learn a video's duration. A blocklisted title can never pass whatever
+    its duration turns out to be, so catalog.py rejects those before
+    spending YouTube quota fetching durations it can't use.
+    """
+    return bool(BLOCKLIST.search(title))
+
+
 def is_valid_mv(title: str, duration: int) -> bool:
     """Return True if the video is likely an official single/MV."""
     if duration < MIN_DURATION or duration > MAX_DURATION:
         return False
-    if BLOCKLIST.search(title):
+    if is_blocked_title(title):
         return False
     return True

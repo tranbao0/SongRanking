@@ -45,13 +45,27 @@ CREATE TABLE IF NOT EXISTS view_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id);
-CREATE INDEX IF NOT EXISTS idx_snapshots_video ON view_snapshots(video_id);
 """
 
-# Created after _MIGRATIONS run, since it indexes a column (videos.song_id)
-# that only exists on fresh databases via that migration.
+# Created after _MIGRATIONS run, since one of them indexes a column
+# (videos.song_id) that only exists on fresh databases via that migration.
+#
+# idx_snapshots_video is dropped rather than created: view_snapshots'
+# PRIMARY KEY (video_id, snapshot_date) already has video_id as its leading
+# column, so a separate index on video_id alone could never be chosen over
+# it - confirmed with EXPLAIN QUERY PLAN, which uses the primary key's
+# implicit index for every query in this codebase. It only ever cost write
+# time on each day's snapshot insert.
+#
+# What was actually missing is the reverse: snapshot.take_snapshot filters
+# by snapshot_date alone to find videos still pending for today, which the
+# primary key can't serve (wrong column order) and which was therefore a
+# full table scan growing by one row per video per day.
 _POST_MIGRATION_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_videos_song ON videos(song_id);
+CREATE INDEX IF NOT EXISTS idx_snapshots_date ON view_snapshots(snapshot_date);
+CREATE INDEX IF NOT EXISTS idx_channels_genre ON channels(genre);
+DROP INDEX IF EXISTS idx_snapshots_video;
 """
 
 # Columns added after the initial release - ALTER TABLE ADD COLUMN doesn't

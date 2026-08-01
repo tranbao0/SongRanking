@@ -40,7 +40,7 @@ def batch_fetch_metadata(urls, max_workers: int = 8) -> dict:
     """
     Fetch metadata for many videos concurrently via yt-dlp.
 
-    yt-dlp has no batch endpoint, so each URL is still its own subprocess —
+    yt-dlp has no batch endpoint, so each URL is still its own subprocess -
     but running them on a thread pool instead of one at a time means the
     wall-clock cost is ~len(urls)/max_workers subprocess calls instead of
     len(urls), which matters once lists run into the hundreds.
