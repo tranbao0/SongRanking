@@ -145,6 +145,41 @@ _EXISTING_VIDEOS_SQL = """
 """
 
 
+try:
+    from googleapiclient.errors import HttpError  # type: ignore
+    _HTTP_ERRORS: tuple = (HttpError,)
+except ImportError:  # googleapiclient is only needed for the API backend
+    _HTTP_ERRORS = ()
+
+# YouTube reasons meaning the day's quota is gone. Every remaining channel
+# would fail the same way, so the run stops rather than burning through
+# 600-odd channels logging the same error - and stopping leaves the
+# already-committed ones to be skipped cheaply on the next run.
+_QUOTA_REASONS = {"quotaExceeded", "dailyLimitExceeded", "rateLimitExceeded", "userRateLimitExceeded"}
+
+
+def _is_quota_error(error) -> bool:
+    reason = ""
+    for detail in getattr(error, "error_details", None) or []:
+        if isinstance(detail, dict):
+            reason = detail.get("reason", "") or reason
+    if not reason:
+        reason = str(error)
+    return any(r in reason for r in _QUOTA_REASONS)
+
+
+def _mark_synced(conn, channel_id: str, video_count: int | None) -> None:
+    """
+    Record that this channel is done for now. Storing the count is what
+    makes the next run cost one unit for it instead of a full walk.
+    """
+    conn.execute(
+        "UPDATE channels SET last_catalog_sync = ?, last_known_video_count = ? WHERE channel_id = ?",
+        (datetime.now().isoformat(), video_count, channel_id),
+    )
+    conn.commit()
+
+
 def _existing_videos(conn, channel_id: str) -> list:
     """
     Everything a new upload on `channel_id` should be matched against:
@@ -240,6 +275,17 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
                 playlist_id, video_count = _channel_status(youtube, channel_id)
                 if playlist_id is None:
                     print(f"  {progress} {channel_id}: no uploads playlist (channel deleted/private?), skipping")
+                    continue
+
+                if video_count == 0:
+                    # A channel that has never published anything still
+                    # reports an uploads playlist ID, but that playlist
+                    # doesn't exist - asking for its items is a 404. Record
+                    # the count so the unchanged-channel check below skips
+                    # it for one unit next time.
+                    print(f"  {progress} {channel_id}: no uploads yet, skipping")
+                    _mark_synced(conn, channel_id, video_count)
+                    processed += 1
                     continue
 
                 if video_count is not None and video_count == row["last_known_video_count"]:
@@ -367,6 +413,27 @@ def sync_videos(channel_ids: list[str] | None = None) -> int:
                 print(f"  [catalog] Stopped after {processed}/{total} channel(s) - "
                       f"already-synced channels will be skipped on the next `sync` run.")
                 break
+
+            except _HTTP_ERRORS as e:
+                # One channel failing must not end the run. A roster of
+                # several hundred always contains a few that are deleted,
+                # private, region-blocked, or whose uploads playlist has
+                # gone missing - and a bootstrap that aborts on the first
+                # of them never reaches the rest.
+                if _is_quota_error(e):
+                    print(f"  [catalog] YouTube quota exhausted: {e}")
+                    print(f"  [catalog] Stopped after {processed}/{total} channel(s) - "
+                          f"already-synced channels will be skipped on the next `sync` run.")
+                    break
+
+                status = getattr(getattr(e, "resp", None), "status", "?")
+                print(f"  {progress} {channel_id}: YouTube returned {status}, skipping this channel")
+                # Marked synced so a permanently broken channel isn't
+                # re-attempted on every future run. A channel that starts
+                # working again changes its video count, which brings it
+                # back through the normal path.
+                _mark_synced(conn, channel_id, row["last_known_video_count"])
+                continue
 
         return upserted
     finally:
