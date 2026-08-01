@@ -68,6 +68,36 @@ def discover_genre(genre: str) -> list[dict]:
     return list(merged.values())
 
 
+def _purge_excluded(conn, genre: str) -> int:
+    """
+    Remove excluded channels and everything catalogued from them: their
+    videos, and any song left holding no videos as a result.
+
+    Deleting the videos matters as much as the channel row. A chart reads
+    videos joined to channels, so an excluded channel's uploads would keep
+    charting under the genre they were wrongly tagged with until they were
+    removed too. Returns the number of channels dropped.
+    """
+    excluded = _excluded_channel_ids(genre)
+    if not excluded:
+        return 0
+
+    params = list(excluded)
+    placeholders = ",".join("?" for _ in params)
+    conn.execute(
+        f"""DELETE FROM view_snapshots WHERE video_id IN
+            (SELECT video_id FROM videos WHERE channel_id IN ({placeholders}))""",
+        params,
+    )
+    conn.execute(f"DELETE FROM videos WHERE channel_id IN ({placeholders})", params)
+    conn.execute(
+        "DELETE FROM songs WHERE song_id NOT IN "
+        "(SELECT song_id FROM videos WHERE song_id IS NOT NULL)"
+    )
+    cursor = conn.execute(f"DELETE FROM channels WHERE channel_id IN ({placeholders})", params)
+    return cursor.rowcount
+
+
 def sync_channels(genres: list[str]) -> dict[str, int]:
     """
     Run discovery for each genre and upsert results into data/registry.db.
@@ -77,6 +107,14 @@ def sync_channels(genres: list[str]) -> dict[str, int]:
     counts = {}
     try:
         for genre in genres:
+            # Excluded channels are dropped from the registry, not merely
+            # left out of this run's discovery. Filtering discover_genre()'s
+            # output alone would silently do nothing for a channel already
+            # catalogued - the upsert below only inserts and updates - so
+            # adding an entry to the exclude file would appear to have no
+            # effect on exactly the channel it was written for.
+            _purge_excluded(conn, genre)
+
             channels = discover_genre(genre)
             conn.executemany(
                 """

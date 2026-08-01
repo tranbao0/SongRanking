@@ -42,6 +42,15 @@ _SHARED_CHANNEL_VIDEO_THRESHOLD = 400
 # several minutes, which looks identical to a hang.
 _PAGE_LOG_INTERVAL = 10
 
+# Confirmed-artist names shorter than this are dropped from the matching
+# roster. "I" and "N" are both genuinely Wikidata-confirmed kpop acts, but
+# a one-character name matches the word "I" in any English title: measured
+# on a real registry, "I" alone falsely confirmed 296 videos on channels
+# that were not kpop at all, which was the bulk of the leak. Those two
+# artists' own uploads are lost from shared channels as a result, which is
+# the accepted cost of not mislabelling everything else as theirs.
+_MIN_ARTIST_NAME_LENGTH = 2
+
 
 def _channel_status(youtube, channel_id: str) -> tuple[str | None, int | None]:
     """
@@ -175,7 +184,7 @@ def _confirmed_artists(conn) -> tuple[dict[str, list[tuple[str, re.Pattern]]], d
     home_channels: dict[str, str] = {}
     for row in rows:
         name = row["display_name"].strip()
-        if not name:
+        if len(name) < _MIN_ARTIST_NAME_LENGTH:
             continue
         patterns.setdefault(row["genre"], []).append((name, song_grouping.artist_pattern(name)))
         home_channels[name] = row["channel_id"]

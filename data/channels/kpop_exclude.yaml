@@ -1,2 +1,16 @@
 # kpop channel IDs to exclude regardless of source (e.g. mislabeled entries).
 # - channel_id: UCxxxxxxxxxxxxxxxxxxxxxx
+#
+# kworb seeds this genre from Korea's YouTube chart, which ranks whatever
+# charts *in* Korea rather than what is Korean - so international acts with
+# a Korean audience arrive tagged as kpop. Their uploads are also labelled
+# impeccably by their own labels ("Official Video", "Official Lyric
+# Video"), so no title-level filter can reject them: they look exactly
+# like the K-pop uploads we want. The channel itself has to be pruned
+# here. See providers/kworb.py's module docstring.
+
+- channel_id: UCxH0sQJKG6Aq9-vFIPnDZ2A   # The Vibe Guide - EDM aggregator
+- channel_id: UCgwv23FVv3lqh567yagXfNg   # DisneyMusicVEVO - Disney soundtracks
+- channel_id: UCd7A6xDlGoar2vHDvVm1CqA   # Oasis - Britpop
+- channel_id: UCIJAlAYCNN8RACtDDsy9K6g   # Novelbright - Japanese rock
+- channel_id: UCN9HPn2fq-NL8M5_kp4RWZQ   # Sia - Australian pop
