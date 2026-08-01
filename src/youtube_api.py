@@ -13,6 +13,9 @@ import os
 import re
 from datetime import date, datetime
 
+import api_budget
+from mv_filter import is_valid_mv
+
 
 def _months_since(release_date: date) -> int:
     """Whole months elapsed since `release_date` (minimum 1)."""
@@ -27,27 +30,6 @@ try:
     load_dotenv()
 except ImportError:
     pass
-
-# Mirror the same blocklist used by search.py so filtering is consistent
-# whether we use yt-dlp search or the YouTube API.
-_BLOCKLIST = re.compile(
-    r"\b("
-    r"compilation|playlist|mixtape|medley"
-    r"|top\s*\d+"
-    r"|best\s+of"
-    r"|all\s+songs?"
-    r"|full\s+album"
-    r"|greatest\s+hits"
-    r"|mash.?up"
-    r"|collection"
-    r"|ranking"
-    r"|mix"
-    r")\b",
-    re.IGNORECASE,
-)
-
-_MIN_DURATION = 90
-_MAX_DURATION = 720
 
 
 def _get_client():
@@ -86,6 +68,7 @@ def fetch_metadata(url: str) -> dict:
     youtube  = _get_client()
     video_id = _extract_video_id(url)
 
+    api_budget.record_youtube_units(1)
     response = youtube.videos().list(
         part="statistics,snippet",
         id=video_id,
@@ -138,6 +121,18 @@ def batch_fetch_metadata(urls: list[str], max_workers: int = 10) -> dict[str, di
     chunks = [ids[i:i + 50] for i in range(0, len(ids), 50)]
 
     def _fetch_chunk(chunk):
+        # Caught per-chunk rather than left to propagate: chunks run
+        # concurrently, so one hitting the budget limit shouldn't discard
+        # results other chunks already fetched successfully. Callers
+        # already treat a missing URL in the result dict as "fetch
+        # failed, skip" (see chart_state.pre_fetch_all), so returning an
+        # empty result here degrades the same way a single failed video
+        # already does.
+        try:
+            api_budget.record_youtube_units(1)
+        except api_budget.QuotaExceededError as e:
+            print(f"  [youtube_api] {e}")
+            return []
         youtube  = _get_client()
         response = youtube.videos().list(
             part="statistics,snippet",
@@ -169,6 +164,7 @@ def search_kpop(query: str, limit: int = 50, filter_mv: bool = True) -> list[dic
     youtube  = _get_client()
     fetch_n  = min(50, limit * 2 if filter_mv else limit)
 
+    api_budget.record_youtube_units(100)  # search.list costs 100 units, list methods cost 1
     search_resp = youtube.search().list(
         part="snippet",
         q=query,
@@ -181,6 +177,7 @@ def search_kpop(query: str, limit: int = 50, filter_mv: bool = True) -> list[dic
     if not video_ids:
         return []
 
+    api_budget.record_youtube_units(1)
     stats_resp = youtube.videos().list(
         part="statistics,snippet,contentDetails",
         id=",".join(video_ids),
@@ -213,11 +210,7 @@ def search_kpop(query: str, limit: int = 50, filter_mv: bool = True) -> list[dic
 
     if filter_mv:
         before  = len(songs)
-        songs   = [
-            s for s in songs
-            if _MIN_DURATION <= s["duration"] <= _MAX_DURATION
-            and not _BLOCKLIST.search(s["title"])
-        ]
+        songs   = [s for s in songs if is_valid_mv(s["title"], s["duration"])]
         removed = before - len(songs)
         if removed:
             print(f"  Filtered out {removed} non-MV result(s) via YouTube API.")

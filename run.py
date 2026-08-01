@@ -8,6 +8,11 @@ Usage:
   python run.py search --q "blackpink songs"
   python run.py search --q "blackpink songs" --limit 10
   python run.py clean
+
+  python run.py sync                      # refresh channels/videos/view snapshots for all genres
+  python run.py sync --genre kpop         # refresh a single genre (repeatable)
+
+  python run.py chart --name kpop_alltime # render a named chart from data/charts.yaml
 """
 
 import json
@@ -62,11 +67,15 @@ def main():
     )
     parser.add_argument(
         "command",
-        choices=["csv", "search", "clean"],
+        choices=["csv", "search", "clean", "sync", "chart"],
         help="Command to run",
     )
     parser.add_argument("--q", metavar="QUERY", default="kpop songs",
                         help='Search query (search mode only, default: "kpop songs")')
+    parser.add_argument("--genre", action="append", metavar="GENRE",
+                        help="Genre to sync (sync mode only; repeatable, default: all known genres)")
+    parser.add_argument("--name", metavar="CHART_NAME",
+                        help="Chart to compute, from data/charts.yaml (chart mode only)")
     parser.add_argument("--limit", type=int, default=None,
                         help="Max songs to process")
     parser.add_argument("--no-filter", dest="no_filter", action="store_true",
@@ -76,6 +85,24 @@ def main():
     parser.add_argument("--encode-workers", type=int, default=3,
                         help="Concurrent ffmpeg overlay encodes (default: 3)")
     args = parser.parse_args()
+
+    if args.command == "sync":
+        import discovery, catalog, snapshot
+
+        genres = args.genre or discovery.KNOWN_GENRES
+        print(f"Syncing channels for: {', '.join(genres)}")
+        channel_counts = discovery.sync_channels(genres)
+        for genre, count in channel_counts.items():
+            print(f"  {genre}: {count} channel(s)")
+
+        print("Syncing video catalog...")
+        video_count = catalog.sync_videos()
+        print(f"  {video_count} video(s) upserted")
+
+        print("Taking view snapshot...")
+        snapshot_count = snapshot.take_snapshot()
+        print(f"  {snapshot_count} snapshot row(s) inserted")
+        return
 
     ensure_yt_dlp_up_to_date()
 
@@ -97,6 +124,16 @@ def main():
 
     elif args.command == "clean":
         run_pipeline(clean_titles=True)
+
+    elif args.command == "chart":
+        if not args.name:
+            parser.error("chart mode requires --name (see data/charts.yaml)")
+        run_pipeline(
+            chart_name=args.name,
+            limit=args.limit,
+            download_workers=args.download_workers,
+            encode_workers=args.encode_workers,
+        )
 
 
 if __name__ == "__main__":

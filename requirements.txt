@@ -3,3 +3,6 @@ google-genai
 google-api-python-client
 python-dotenv
 Pillow
+requests
+beautifulsoup4
+PyYAML

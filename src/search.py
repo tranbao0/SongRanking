@@ -14,9 +14,10 @@ Swap in youtube_api.py (see src/youtube_api.py) once an API key is available.
 
 import subprocess
 import sys
-import re
 import argparse
 from datetime import date
+
+from mv_filter import is_valid_mv
 
 
 PRINT_TEMPLATE = (
@@ -32,39 +33,6 @@ def _months_since(release_date: date) -> int:
     if today.day < release_date.day:
         months -= 1
     return max(1, months)
-
-# Titles matching this pattern are almost certainly compilations, playlists,
-# or aggregator videos rather than individual official MVs.
-_BLOCKLIST = re.compile(
-    r"\b("
-    r"compilation|playlist|mixtape|medley"
-    r"|top\s*\d+"
-    r"|best\s+of"
-    r"|all\s+songs?"
-    r"|full\s+album"
-    r"|greatest\s+hits"
-    r"|mash.?up"
-    r"|collection"
-    r"|ranking"
-    r"|mix"           # "kpop mix 2024" — distinct from "remix" (no word boundary match)
-    r")\b",
-    re.IGNORECASE,
-)
-
-# Official MV duration window: 90 s (short singles) → 720 s (extended cuts).
-# Anything shorter is a teaser/clip; longer is a live set or compilation.
-_MIN_DURATION = 90
-_MAX_DURATION = 720
-
-
-def _is_valid_mv(song: dict) -> bool:
-    """Return True if the video is likely an official single/MV."""
-    dur = song.get("duration") or 0
-    if dur < _MIN_DURATION or dur > _MAX_DURATION:
-        return False
-    if _BLOCKLIST.search(song["title"]):
-        return False
-    return True
 
 
 def search_kpop(query: str, limit: int = 50, filter_mv: bool = True) -> list[dict]:
@@ -134,7 +102,7 @@ def search_kpop(query: str, limit: int = 50, filter_mv: bool = True) -> list[dic
 
     if filter_mv:
         before = len(songs)
-        songs  = [s for s in songs if _is_valid_mv(s)]
+        songs  = [s for s in songs if is_valid_mv(s["title"], s.get("duration") or 0)]
         removed = before - len(songs)
         if removed:
             print(f"  Filtered out {removed} non-MV result(s) "

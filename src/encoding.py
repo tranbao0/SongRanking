@@ -139,6 +139,18 @@ def _build_overlay_phase_cmd(codec, raw_clip, overlay_png, cw, ch, fps, trim_sta
 _DOWNLOAD_FALLBACK_CLIENT = "android"
 
 
+def _probe_duration(path):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return None
+
+
 def download_song(rank, title, url, start="00:01:00", end="00:01:15"):
     """
     I/O-bound stage: pull the clip down with yt-dlp. Runs in the download
@@ -149,7 +161,7 @@ def download_song(rank, title, url, start="00:01:00", end="00:01:15"):
     raw_clip = f"{CLIPS_DIR}/raw_{slug}_rank{rank}.mp4"
 
     def _attempt(extra_args):
-        return subprocess.run([
+        result = subprocess.run([
             "yt-dlp",
             "--download-sections", f"*{start}-{end}",
             "-S", "res:1080,vcodec:h264,ext:mp4:m4a",
@@ -158,6 +170,17 @@ def download_song(rank, title, url, start="00:01:00", end="00:01:15"):
             "-o", raw_clip,
             url,
         ], capture_output=True, text=True, encoding="utf-8", errors="replace")
+        # yt-dlp can exit 0 even when the section download itself produced
+        # nothing usable — e.g. a video bucketed into a player-client
+        # experiment whose adaptive-format URLs reject the byte-range
+        # requests --download-sections relies on. ffmpeg then writes an
+        # empty file while yt-dlp still reports success, so exit code
+        # alone isn't a reliable success signal — the output has to
+        # actually probe as a real clip too.
+        if result.returncode == 0 and _probe_duration(raw_clip) is None:
+            result.returncode = 1
+            result.stderr += "\n(postcheck) downloaded file has no readable duration — treating as a failed attempt"
+        return result
 
     _log(f"  [rank {rank}] Downloading clip...")
     result = _attempt([])
@@ -168,15 +191,6 @@ def download_song(rank, title, url, start="00:01:00", end="00:01:15"):
         raise RuntimeError(f"DOWNLOAD failed (yt-dlp exit {result.returncode}): {result.stderr[-500:]}")
 
     return raw_clip
-
-
-def _probe_duration(path):
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", path],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
-    return float(result.stdout.strip())
 
 
 def encode_song(style, raw_clip, rank, title, artist, peak, entry_type,
@@ -231,7 +245,9 @@ def encode_song(style, raw_clip, rank, title, artist, peak, entry_type,
     # length than the crossfade every interior clip gets instead.
     boundary_duration   = transition_cfg.get("duration", 1.0)
 
-    full_dur     = _probe_duration(raw_clip)
+    full_dur = _probe_duration(raw_clip)
+    if full_dur is None:
+        raise RuntimeError(f"OVERLAY failed: rank {rank} raw clip has no readable duration (corrupt/empty download).")
     window_start = head_trim
     window_end   = full_dur - tail_trim
     lead_bare    = boundary_duration if head_trim == 0 else 0.0

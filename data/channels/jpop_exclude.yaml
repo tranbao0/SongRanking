@@ -1,0 +1,4 @@
+# jpop channel IDs to exclude regardless of source — kworb's jp.html chart
+# mixes in non-jpop artists popular in Japan (e.g. K-pop acts); add those
+# channel IDs here as they're spotted.
+# - channel_id: UCxxxxxxxxxxxxxxxxxxxxxx

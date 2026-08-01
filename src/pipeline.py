@@ -17,10 +17,14 @@ except ImportError:
 
 from overlay import load_style
 from encoding import detect_hw_encoder, download_song, encode_song, encode_transition, concatenate_clips, _log
+from heatmap import pick_clip
 from chart_state import (
     DATA_FILE, load_history, songs_from_search, pre_fetch_all,
     determine_badges, save_run_state, load_songs, clean_csv_titles,
 )
+
+_DEFAULT_START = "00:01:00"
+_DEFAULT_END   = "00:01:15"
 
 # Use YouTube Data API if key is present, otherwise fall back to yt-dlp.
 _YT_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
@@ -54,7 +58,8 @@ def _avg(times):
 
 
 def run_pipeline(search=None, limit=None, no_filter=False,
-                  download_workers=6, encode_workers=3, clean_titles=False):
+                  download_workers=6, encode_workers=3, clean_titles=False,
+                  chart_name=None):
     """
     K-pop song ranking video generator. Programmatic entry point — the CLI
     (run.py) parses args and calls this directly.
@@ -66,7 +71,19 @@ def run_pipeline(search=None, limit=None, no_filter=False,
     os.makedirs(CLIPS_DIR, exist_ok=True)
     style = load_style(STYLE_FILE)
 
-    if search:
+    if chart_name:
+        from charts import compute_chart
+        csv_path = os.path.join("data", "charts", f"{chart_name}.csv")
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        print(f'Computing chart "{chart_name}"...\n')
+        results = compute_chart(chart_name)
+        if not results:
+            print("Chart produced no results (registry empty for this genre — run `sync` first?). Exiting.")
+            return
+        history = load_history(csv_path)
+        songs   = songs_from_search(results, history)
+    elif search:
+        csv_path = DATA_FILE
         from title_cleaner import clean_titles as clean_titles_fn
         search_limit = limit or 20
         print(f'Searching YouTube: "{search}" (fetching top {search_limit})...\n')
@@ -74,21 +91,22 @@ def run_pipeline(search=None, limit=None, no_filter=False,
         if not results:
             print("No search results returned. Exiting.")
             return
-        history = load_history(DATA_FILE)
+        history = load_history(csv_path)
         songs   = songs_from_search(results, history)
         print("Cleaning up titles via AI...")
         songs = clean_titles_fn(songs)
 
         # Merge in any CSV songs that weren't returned by the search
-        if os.path.exists(DATA_FILE):
-            csv_songs   = load_songs(DATA_FILE)
+        if os.path.exists(csv_path):
+            csv_songs   = load_songs(csv_path)
             search_urls = {s["url"] for s in songs}
             extra       = [s for s in csv_songs if s["url"] not in search_urls]
             if extra:
                 print(f"  Merging {len(extra)} existing CSV song(s) into ranking.\n")
                 songs = songs + extra
     else:
-        songs = load_songs(DATA_FILE)
+        csv_path = DATA_FILE
+        songs = load_songs(csv_path)
         if limit:
             songs.sort(key=lambda s: int(s.get("rank") or 9999))
             songs = songs[:limit]
@@ -128,9 +146,19 @@ def run_pipeline(search=None, limit=None, no_filter=False,
 
     def _download(song):
         t0 = time.monotonic()
+        start = song.get("start") or _DEFAULT_START
+        end   = song.get("end")   or _DEFAULT_END
+        # No explicit override on this song (start/end still at the
+        # placeholder defaults) -- use the heatmap to pick a clip instead
+        # of blindly downloading the same fixed 00:01:00-00:01:15 window
+        # for every song.
+        if start == _DEFAULT_START and end == _DEFAULT_END:
+            picked_start, picked_end = pick_clip(song["url"])
+            start, end = f"{picked_start:.2f}", f"{picked_end:.2f}"
+            _log(f"  [rank {song['rank']}] Heatmap picked clip at {picked_start:.1f}s-{picked_end:.1f}s")
         raw_clip = download_song(
             song["rank"], song["title"], song["url"],
-            start=song.get("start", "00:01:00"), end=song.get("end", "00:01:15"),
+            start=start, end=end,
         )
         dl_times[song["rank"]] = time.monotonic() - t0
         return raw_clip
@@ -275,8 +303,8 @@ def run_pipeline(search=None, limit=None, no_filter=False,
         concat_time = time.monotonic() - t0
         print("Compilation saved -> final_compilation.mp4\n")
 
-    save_run_state(ranked, DATA_FILE)
-    print("Updated CSV for next run.\n")
+    save_run_state(ranked, csv_path)
+    print(f"Updated {csv_path} for next run.\n")
 
     total_time = time.monotonic() - t_pipeline_start
     dl_span    = dl_stage_end - dl_stage_start

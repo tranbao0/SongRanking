@@ -1,0 +1,32 @@
+# Named chart definitions consumed by charts.compute_chart().
+# metric: cumulative (all-time views) | gained (views gained over window_days) | newest (latest release)
+# window_days: only used by "gained"; null for cumulative/newest.
+- name: kpop_alltime
+  genre: kpop
+  metric: cumulative
+  window_days: null
+  limit: 200
+
+- name: kpop_weekly_gainers
+  genre: kpop
+  metric: gained
+  window_days: 7
+  limit: 50
+
+- name: kpop_newest
+  genre: kpop
+  metric: newest
+  window_days: null
+  limit: 50
+
+- name: jpop_alltime
+  genre: jpop
+  metric: cumulative
+  window_days: null
+  limit: 100
+
+- name: jpop_newest
+  genre: jpop
+  metric: newest
+  window_days: null
+  limit: 50
