@@ -16,7 +16,7 @@ import time
 # Shared by every yt-dlp call site (metadata fetch, heatmap extraction,
 # clip download) since they can all trip the same wall and YouTube
 # doesn't rate-limit them separately.
-_MIN_LAUNCH_INTERVAL = float(os.environ.get("YTDLP_MIN_REQUEST_INTERVAL", 1.5))
+_MIN_LAUNCH_INTERVAL = float(os.environ.get("YTDLP_MIN_REQUEST_INTERVAL", 0.35))
 _launch_lock = threading.Lock()
 _last_launch = 0.0
 
@@ -40,3 +40,22 @@ def throttle() -> None:
 # attempts) since it requires the named browser to be installed, closed
 # or cookie-DB-readable, and logged into YouTube.
 COOKIES_BROWSER = os.environ.get("YTDLP_COOKIES_BROWSER", "edge")
+
+# Reading cookies straight out of a running Chromium browser's profile
+# needs that profile's DB unlocked *and* (as of Chrome/Edge's App-Bound
+# Encryption rollout) yt-dlp able to decrypt v20 cookies, which plain
+# DPAPI can no longer do on its own - see
+# https://github.com/yt-dlp/yt-dlp/issues/10927. A cookies.txt file
+# exported once via a browser extension sidesteps both problems, so it's
+# preferred over COOKIES_BROWSER whenever it's configured. Never commit
+# the file this points to - it carries a live YouTube session.
+COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE")
+
+
+def cookie_args() -> list[str]:
+    """yt-dlp CLI args for the cookies fallback tier: a cookies.txt file
+    if one's configured, else falling back to reading the browser's own
+    (often locked/undecryptable) cookie store directly."""
+    if COOKIES_FILE:
+        return ["--cookies", COOKIES_FILE]
+    return ["--cookies-from-browser", COOKIES_BROWSER]

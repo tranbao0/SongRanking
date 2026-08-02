@@ -15,6 +15,7 @@ assets/clips/_concat_list.txt
 
 # API keys and secrets
 .env
+cookies.txt
 
 # Python cache
 __pycache__/

@@ -15,6 +15,7 @@ Three components: a discovery/data layer, a chart engine, and a render pipeline.
 - [Guide: manual channel curation](#guide-manual-channel-curation)
 - [Guide: keeping song grouping accurate](#guide-keeping-song-grouping-accurate)
 - [API spend safeguards](#api-spend-safeguards)
+- [yt-dlp bot-check fallback](#yt-dlp-bot-check-fallback)
 - [Automated grouping audits](#automated-grouping-audits)
 - [Data files](#data-files)
 - [Tuning worker pools](#tuning-worker-pools)
@@ -27,6 +28,7 @@ This is a working pipeline, not a turnkey product. Cloning it and running `sync`
 - **Channel coverage requires manual curation, not just Wikidata.** Wikidata only links artists to their *own* channel; label, distributor, and broadcaster channels - which carry a large share of real uploads - have no entry there at all and have to be added to `data/channels/<genre>_manual.yaml` by hand. Skip this and your registry is missing most of what actually charts. See [manual channel curation](#guide-manual-channel-curation).
 - **The automated grouping tiers alone are not good enough for a fresh channel.** They merge the easy cases; a channel's first sync still leaves real duplicates (the same song as separate chart entries) that need an actual read-through to catch, especially cross-channel duplicates and judgment-heavy presentation-format calls no regex or one-shot AI chunk can resolve. Budget for either running the manual review process yourself (see [keeping song grouping accurate](#guide-keeping-song-grouping-accurate)) or setting up the [automated audit hook](#automated-grouping-audits) - which itself needs a coding-agent CLI installed and authenticated separately, it is not covered by your `.env` API keys.
 - **API keys have real, separate limits to manage.** `YOUTUBE_API_KEY` is required for `sync`/`chart` and its quota is fixed by Google regardless of your billing tier. `GEMINI_API_KEY` is optional, but a large first sync is meaningfully more accurate with it than without. See [API spend safeguards](#api-spend-safeguards).
+- **The render pipeline's clip downloads can hit YouTube's bot-check wall outright** ("Sign in to confirm you're not a bot"), independent of anything above - this is IP/session-level, not something pacing requests fixes. The pipeline retries through an alternate client and finally exported browser cookies automatically, but that last tier needs a one-time `cookies.txt` export - see [yt-dlp bot-check fallback](#yt-dlp-bot-check-fallback).
 - **You have to define your own charts.** `data/charts.yaml` ships empty - see [adding or customizing a chart](#guide-adding-or-customizing-a-chart).
 - **Render workers need tuning to your own hardware/connection**, or the render step bottlenecks somewhere you didn't expect - see [tuning worker pools](#tuning-worker-pools).
 
@@ -287,6 +289,27 @@ On the current registry that costs less than it sounds.
 The free tiers already merge the predictable cases, and the residue the AI tier would judge is dominated by pairs that should stay separate anyway - remixes, and different songs by one artist whose titles overlap because the artist's name dominates them.
 
 A budget-stopped `sync` resumes from the least-recently-synced channel on the next run - no completed work is redone.
+
+## yt-dlp bot-check fallback
+
+Every yt-dlp call in the render pipeline (clip download in `encoding.py`, heatmap extraction in `heatmap.py`) can hit YouTube's "Sign in to confirm you're not a bot" wall. Two distinct causes look identical in the error message, so there are two distinct fixes, tried in order automatically:
+
+1. **Rate-triggered** - firing many yt-dlp requests at once is what actually trips this in practice. `src/shared/ytdlp_throttle.py` paces every yt-dlp launch (across every worker thread and call site: metadata fetch, heatmap extraction, clip download) at least `YTDLP_MIN_REQUEST_INTERVAL` seconds apart (default 0.35).
+2. **IP/session-flagged** - no amount of pacing gets past this; only an authenticated request does. The pipeline retries with the `android` player client first (fixes a separate, unrelated extraction bucketing issue), then as a last resort with cookies from a real logged-in session.
+
+That last resort needs a one-time export, since reading cookies directly out of a running browser's profile is unreliable on Windows: the profile's cookie DB is locked while the browser is open, and recent Chrome/Edge encrypt cookies with App-Bound Encryption, which yt-dlp cannot decrypt from a separate process ([yt-dlp#10927](https://github.com/yt-dlp/yt-dlp/issues/10927)) even once the lock is out of the way.
+
+**One-time setup:**
+
+1. Install the **"Get cookies.txt LOCALLY"** extension (Chrome Web Store, also installs on Chromium Edge).
+2. Log into YouTube in that browser, go to youtube.com, click the extension, export cookies for the site. It writes Netscape format directly (starts with `# Netscape HTTP Cookie File`) - no conversion needed.
+3. Save the export as `cookies.txt` in the repo root (git-ignored already).
+4. Add to `.env`:
+   ```bash
+   YTDLP_COOKIES_FILE=cookies.txt
+   ```
+
+Never commit that file - it carries a live YouTube session. If `YTDLP_COOKIES_FILE` is unset, the fallback instead tries `--cookies-from-browser` on `YTDLP_COOKIES_BROWSER` (default `edge`), which works only if that browser is closed and its cookies aren't App-Bound-encrypted - the file-based export is the reliable path.
 
 ## Automated grouping audits
 

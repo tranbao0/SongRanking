@@ -15,7 +15,7 @@ from render.overlay import (
     build_overlay_phase_filter_complex, build_transition_filter_complex,
 )
 from shared.youtube_api import extract_video_id
-from shared.ytdlp_throttle import throttle, COOKIES_BROWSER
+from shared.ytdlp_throttle import throttle, cookie_args
 
 CLIPS_DIR = "assets/clips"
 
@@ -253,8 +253,8 @@ def download_song(rank, url, start="00:01:00", end="00:01:15"):
         _log(f"  [rank {rank}] Default client failed, retrying with '{_DOWNLOAD_FALLBACK_CLIENT}' client...")
         result = _attempt(["--extractor-args", f"youtube:player_client={_DOWNLOAD_FALLBACK_CLIENT}"])
     if result.returncode != 0:
-        _log(f"  [rank {rank}] '{_DOWNLOAD_FALLBACK_CLIENT}' client failed, retrying with '{COOKIES_BROWSER}' browser cookies...")
-        result = _attempt(["--cookies-from-browser", COOKIES_BROWSER])
+        _log(f"  [rank {rank}] '{_DOWNLOAD_FALLBACK_CLIENT}' client failed, retrying with cookies...")
+        result = _attempt(cookie_args())
     if result.returncode != 0:
         raise RuntimeError(f"DOWNLOAD failed (yt-dlp exit {result.returncode}): {result.stderr[-500:]}")
 

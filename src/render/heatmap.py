@@ -25,19 +25,25 @@ import random
 
 import yt_dlp
 
-from shared.ytdlp_throttle import throttle, COOKIES_BROWSER
+from shared.ytdlp_throttle import throttle, COOKIES_BROWSER, COOKIES_FILE
 
 CLIP_DURATION  = 15.0
 HEAT_THRESHOLD = 0.6
 DEFAULT_START  = 60.0  # matches the old fixed 00:01:00
 
 
-def _extract_info(url, player_client=None, cookies_from_browser=None):
+def _extract_info(url, player_client=None, use_cookies=False):
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
     if player_client:
         opts["extractor_args"] = {"youtube": {"player_client": [player_client]}}
-    if cookies_from_browser:
-        opts["cookiesfrombrowser"] = (cookies_from_browser,)
+    if use_cookies:
+        # A cookies.txt file (see ytdlp_throttle.COOKIES_FILE) is preferred
+        # over reading the browser's own cookie store directly - same
+        # reasoning as encoding.download_song's matching fallback tier.
+        if COOKIES_FILE:
+            opts["cookiefile"] = COOKIES_FILE
+        else:
+            opts["cookiesfrombrowser"] = (COOKIES_BROWSER,)
     throttle()
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
@@ -61,7 +67,7 @@ def _fetch_heatmap(url):
             # Last resort when the wall is an IP/session flag rather than
             # a client-experiment bucket - see encoding.download_song's
             # matching third tier.
-            info = _extract_info(url, cookies_from_browser=COOKIES_BROWSER)
+            info = _extract_info(url, use_cookies=True)
     return info.get("heatmap"), info.get("duration")
 
 
