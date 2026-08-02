@@ -87,7 +87,7 @@ class TakeSnapshotPendingTest(unittest.TestCase):
 
         add_channel(self.conn, "UC_a")
         for i in range(3):
-            add_video(self.conn, f"v{i}", "UC_a")
+            add_video(self.conn, f"v{i}", "UC_a", song_id=i + 1)
         self.conn.commit()
 
         patcher = mock.patch.object(db, "get_connection", return_value=self.conn)
@@ -95,8 +95,18 @@ class TakeSnapshotPendingTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def _run_with_views(self, views_by_url):
-        with mock.patch.object(snapshot, "batch_fetch_metadata",
-                               return_value={u: {"views": v} for u, v in views_by_url.items()}) as fetch:
+        def _fake_fetch(urls, on_result=None, **kwargs):
+            results = {}
+            for url in urls:
+                if url not in views_by_url:
+                    continue
+                meta = {"views": views_by_url[url]}
+                results[url] = meta
+                if on_result:
+                    on_result(url, meta)
+            return results
+
+        with mock.patch.object(snapshot, "batch_fetch_metadata", side_effect=_fake_fetch) as fetch:
             inserted = snapshot.take_snapshot()
         return inserted, fetch
 
@@ -130,6 +140,19 @@ class TakeSnapshotPendingTest(unittest.TestCase):
             "SELECT video_id FROM view_snapshots WHERE snapshot_date = ?", (self.today,)
         ).fetchall()
         self.assertEqual([r["video_id"] for r in rows], ["v0"])
+
+    def test_ungrouped_videos_are_never_fetched(self):
+        """
+        song_id NULL means a blocked non-song upload (or one mid-regroup
+        after a decouple) - never a real song, so it must not cost a fetch.
+        """
+        add_video(self.conn, "blocked", "UC_a", song_id=None)
+        self.conn.commit()
+
+        inserted, fetch = self._run_with_views(self._urls("v0", "v1", "v2", "blocked"))
+        self.assertEqual(inserted, 3)
+        requested = set(fetch.call_args[0][0])
+        self.assertNotIn("https://www.youtube.com/watch?v=blocked", requested)
 
 
 if __name__ == "__main__":

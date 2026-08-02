@@ -10,8 +10,13 @@ uploads (official MV, performance video, dance practice, etc.) that
 song_grouping.py has already clustered via videos.song_id. Views are
 summed across a group's members; one representative member (the
 highest-individual-views one) supplies the url/title used for rendering.
-Ungrouped videos (song_id NULL) are treated as their own singleton group,
-so behavior for those is unchanged from before grouping existed.
+
+Videos with song_id NULL are excluded entirely, not charted as their own
+singleton: song_grouping always assigns a real MV a song_id, matching an
+existing song or minting a new one, so NULL here only ever means a
+blocked non-song upload (teaser, "making of", etc.) kept for catalog
+dedup, or a video mid-regroup after a decouple - neither belongs in a
+chart.
 """
 
 from datetime import date, datetime, timedelta
@@ -19,7 +24,7 @@ from pathlib import Path
 
 import yaml
 
-from registry import db
+from registry import db, snapshot
 from shared.dates import months_since
 
 CHARTS_FILE = Path(__file__).parent.parent / "data" / "charts.yaml"
@@ -41,18 +46,17 @@ def _video_rows(conn, genre: str) -> list:
         FROM videos v
         JOIN channels c ON c.channel_id = v.channel_id
         LEFT JOIN songs s ON s.song_id = v.song_id
-        WHERE c.genre = ?
+        WHERE c.genre = ? AND v.song_id IS NOT NULL
         """,
         (genre,),
     ).fetchall()
 
 
-def _group_videos(videos: list) -> dict[str, list]:
-    """Group video rows by song_id; an ungrouped video is its own singleton group."""
-    groups: dict[str, list] = {}
+def _group_videos(videos: list) -> dict[int, list]:
+    """Group video rows by song_id."""
+    groups: dict[int, list] = {}
     for v in videos:
-        key = f"song:{v['song_id']}" if v["song_id"] is not None else f"video:{v['video_id']}"
-        groups.setdefault(key, []).append(v)
+        groups.setdefault(v["song_id"], []).append(v)
     return groups
 
 
@@ -114,6 +118,74 @@ def _latest_and_baseline_views(conn, genre: str, window_days: int | None) -> dic
     }
 
 
+# Refreshing every tracked video before every chart computation costs one
+# YouTube API unit per 50 videos regardless of how small the chart is (see
+# shared.youtube_api.batch_fetch_metadata) - for a 200-song chart drawn
+# from a genre with ~15,000 tracked videos, that's paying for a ~300-unit
+# genre-wide sweep to serve a request that only needed a few hundred of
+# them, and it only gets more lopsided as the registry grows. `sync`'s own
+# daily pass already re-measures every tracked video regardless of what
+# any chart needs, so it remains the backstop that guarantees nothing is
+# missed for more than a day; this pool only has to hold what could
+# plausibly change *this chart's* outcome right now.
+_CANDIDATE_RECENT_DAYS = 90  # a viral new release - the "APT." case - is how a video jumps into contention between two `sync` runs
+_CANDIDATE_BUFFER = 3        # top (limit * buffer) songs by last-known views: the only ones actually close enough to be competitive
+
+_CANDIDATE_ROWS_SQL = """
+    SELECT v.video_id, v.song_id, v.published_at,
+           (SELECT s.views FROM view_snapshots s
+             WHERE s.video_id = v.video_id
+             ORDER BY s.snapshot_date DESC LIMIT 1) AS last_views
+    FROM videos v
+    JOIN channels c ON c.channel_id = v.channel_id
+    WHERE c.genre = ? AND v.song_id IS NOT NULL
+"""
+
+
+def _candidate_video_ids(conn, genre: str, limit: int) -> list[str]:
+    """
+    Videos worth fetching a fresh view count for before computing this
+    chart, rather than every video tracked in the genre - see the module
+    comment above for why the rest is left to `sync`. A video qualifies
+    if any of these hold:
+
+      - never snapshotted: no baseline to even guess a rank from, so it
+        could debut anywhere, including first.
+      - published within _CANDIDATE_RECENT_DAYS: a new release going
+        viral is how a video jumps into contention between two `sync`
+        runs, and that's always a recent release, never a catalog title
+        that's been sitting untouched for years.
+      - a member of one of the current top (limit * _CANDIDATE_BUFFER)
+        songs by last-known cumulative views (whatever the most recent
+        snapshot on file says, even if stale) - the only songs actually
+        close enough to the cutoff to matter.
+
+    Every member of a qualifying song is included, not just the one that
+    triggered it, so the group's cumulative total is refreshed
+    consistently rather than mixing one fresh member with stale ones.
+    """
+    rows = conn.execute(_CANDIDATE_ROWS_SQL, (genre,)).fetchall()
+
+    recent_cutoff = (date.today() - timedelta(days=_CANDIDATE_RECENT_DAYS)).isoformat()
+    candidates: set[str] = set()
+    groups: dict[int, list] = {}
+
+    for r in rows:
+        if r["last_views"] is None or r["published_at"][:10] >= recent_cutoff:
+            candidates.add(r["video_id"])
+        groups.setdefault(r["song_id"], []).append(r)
+
+    ranked_groups = sorted(
+        groups.values(),
+        key=lambda members: sum(r["last_views"] or 0 for r in members),
+        reverse=True,
+    )
+    for members in ranked_groups[:limit * _CANDIDATE_BUFFER]:
+        candidates.update(r["video_id"] for r in members)
+
+    return list(candidates)
+
+
 def _build_group_entry(members: list, views_by_id: dict) -> dict | None:
     """
     Compute everything a chart might need from one song group: summed
@@ -165,6 +237,19 @@ def compute_chart(name: str) -> list[dict]:
 
     conn = db.get_connection()
     try:
+        # Charts read view_snapshots, but nothing else in the chart path
+        # takes one - only `sync` did, so a chart run following a sync
+        # that never reached its snapshot step (quota exhaustion, a
+        # crash, or simply never having been run) silently computed
+        # against zero view data instead of surfacing that. Narrowed to a
+        # candidate pool rather than every tracked video - see
+        # _candidate_video_ids - and a no-op for anything in that pool
+        # that already has today's snapshot.
+        candidate_ids = _candidate_video_ids(conn, genre, limit)
+        print(f"  Refreshing view data for genre {genre!r} "
+              f"({len(candidate_ids)} candidate video(s))...")
+        snapshot.take_snapshot(video_ids=candidate_ids)
+
         groups = _group_videos(_video_rows(conn, genre))
 
         # "gained" is the only metric that needs a baseline snapshot; the

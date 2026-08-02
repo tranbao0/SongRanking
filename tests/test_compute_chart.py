@@ -50,7 +50,7 @@ class ComputeChartTest(unittest.TestCase):
         )
         add_video(self.conn, "mv", "UC_a", title="Grouped Song (Official MV)", song_id=1)
         add_video(self.conn, "practice", "UC_a", title="Grouped Song (Dance Practice)", song_id=1)
-        add_video(self.conn, "solo", "UC_a", title="Ungrouped Song")
+        add_video(self.conn, "solo", "UC_a", title="Ungrouped Song", song_id=2)
         self._snapshot("mv", 0, 700)
         self._snapshot("practice", 0, 300)
         self._snapshot("solo", 0, 900)
@@ -79,9 +79,9 @@ class ComputeChartTest(unittest.TestCase):
                              "https://www.youtube.com/watch?v=high")
 
     def test_gained_ranks_by_delta_and_skips_videos_without_a_baseline(self):
-        add_video(self.conn, "steady", "UC_a", title="Steady")
-        add_video(self.conn, "surging", "UC_a", title="Surging")
-        add_video(self.conn, "brand_new", "UC_a", title="Brand New")
+        add_video(self.conn, "steady", "UC_a", title="Steady", song_id=1)
+        add_video(self.conn, "surging", "UC_a", title="Surging", song_id=2)
+        add_video(self.conn, "brand_new", "UC_a", title="Brand New", song_id=3)
         self._snapshot("steady", 10, 1000)
         self._snapshot("steady", 0, 1100)
         self._snapshot("surging", 10, 500)
@@ -95,8 +95,8 @@ class ComputeChartTest(unittest.TestCase):
         self.assertEqual([r["title"] for r in results], ["Surging", "Steady"])
 
     def test_newest_ranks_by_publish_date(self):
-        add_video(self.conn, "old", "UC_a", title="Old", published_at="2020-01-01T00:00:00Z")
-        add_video(self.conn, "new", "UC_a", title="New", published_at="2026-01-01T00:00:00Z")
+        add_video(self.conn, "old", "UC_a", title="Old", published_at="2020-01-01T00:00:00Z", song_id=1)
+        add_video(self.conn, "new", "UC_a", title="New", published_at="2026-01-01T00:00:00Z", song_id=2)
         self._snapshot("old", 0, 100)
         self._snapshot("new", 0, 100)
         self.conn.commit()
@@ -106,7 +106,7 @@ class ComputeChartTest(unittest.TestCase):
 
     def test_limit_is_applied(self):
         for i in range(5):
-            add_video(self.conn, f"v{i}", "UC_a", title=f"Song {i}")
+            add_video(self.conn, f"v{i}", "UC_a", title=f"Song {i}", song_id=i + 1)
             self._snapshot(f"v{i}", 0, i * 100)
         self.conn.commit()
 
@@ -114,7 +114,20 @@ class ComputeChartTest(unittest.TestCase):
             self.assertEqual(len(charts.compute_chart("t")), 2)
 
     def test_videos_without_snapshots_do_not_chart(self):
-        add_video(self.conn, "unmeasured", "UC_a", title="Unmeasured")
+        add_video(self.conn, "unmeasured", "UC_a", title="Unmeasured", song_id=1)
+        self.conn.commit()
+
+        with self._define():
+            self.assertEqual(charts.compute_chart("t"), [])
+
+    def test_ungrouped_videos_never_chart(self):
+        """
+        song_id NULL means a blocked non-song upload (teaser, "making of",
+        etc.) or one mid-regroup after a decouple - never treated as its
+        own singleton chart entry.
+        """
+        add_video(self.conn, "teaser", "UC_a", title="Teaser")
+        self._snapshot("teaser", 0, 999999)
         self.conn.commit()
 
         with self._define():
@@ -127,7 +140,7 @@ class ComputeChartTest(unittest.TestCase):
             self.assertEqual(charts.compute_chart("t"), [])
 
     def test_unknown_metric_is_rejected(self):
-        add_video(self.conn, "v1", "UC_a")
+        add_video(self.conn, "v1", "UC_a", song_id=1)
         self._snapshot("v1", 0, 1)
         self.conn.commit()
 
@@ -135,7 +148,7 @@ class ComputeChartTest(unittest.TestCase):
             charts.compute_chart("t")
 
     def test_result_shape_matches_what_songs_from_search_consumes(self):
-        add_video(self.conn, "v1", "UC_a", title="Song", published_at="2024-05-13T00:00:00Z")
+        add_video(self.conn, "v1", "UC_a", title="Song", published_at="2024-05-13T00:00:00Z", song_id=1)
         self._snapshot("v1", 0, 1234)
         self.conn.commit()
 
