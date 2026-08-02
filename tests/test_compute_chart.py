@@ -113,6 +113,17 @@ class ComputeChartTest(unittest.TestCase):
         with self._define(limit=2):
             self.assertEqual(len(charts.compute_chart("t")), 2)
 
+    def test_a_passed_limit_overrides_the_yaml_definitions_limit(self):
+        """The CLI's --limit takes priority over data/charts.yaml's own limit."""
+        for i in range(5):
+            add_video(self.conn, f"v{i}", "UC_a", title=f"Song {i}", song_id=i + 1)
+            self._snapshot(f"v{i}", 0, i * 100)
+        self.conn.commit()
+
+        with self._define(limit=2):
+            self.assertEqual(len(charts.compute_chart("t", limit=4)), 4)
+            self.assertEqual(len(charts.compute_chart("t")), 2)
+
     def test_videos_without_snapshots_do_not_chart(self):
         add_video(self.conn, "unmeasured", "UC_a", title="Unmeasured", song_id=1)
         self.conn.commit()

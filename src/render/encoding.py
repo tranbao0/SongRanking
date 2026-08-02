@@ -14,8 +14,17 @@ from render.overlay import (
     build_overlay_image, build_filter_complex, build_bare_filter_complex,
     build_overlay_phase_filter_complex, build_transition_filter_complex,
 )
+from shared.youtube_api import extract_video_id
 
 CLIPS_DIR = "assets/clips"
+
+# Raw clips are cached here permanently, keyed by video ID rather than by
+# chart rank (which shifts run to run) - so a song still on the chart next
+# time reuses the exact same clip instead of re-downloading it, and reuses
+# the exact same window rather than re-rolling heatmap.pick_clip's random
+# choice among hot sections (see pipeline.py's _download). Never evicted:
+# a 15s clip is small even at thousands of songs.
+RAW_CACHE_DIR = f"{CLIPS_DIR}/raw"
 
 _print_lock = threading.Lock()
 
@@ -179,14 +188,32 @@ def _cached_duration(path):
     return duration
 
 
-def download_song(rank, title, url, start="00:01:00", end="00:01:15"):
+def cached_clip_path(url: str) -> str:
+    """Where `url`'s raw clip lives in the cache, whether or not it exists yet."""
+    return f"{RAW_CACHE_DIR}/{extract_video_id(url)}.mp4"
+
+
+def cached_clip(url: str) -> str | None:
+    """The cached raw clip for `url` if one's already been downloaded, else None."""
+    path = cached_clip_path(url)
+    return path if os.path.exists(path) else None
+
+
+def download_song(rank, url, start="00:01:00", end="00:01:15"):
     """
-    I/O-bound stage: pull the clip down with yt-dlp. Runs in the download
-    pool - sized larger than the encode pool since it's network-bound, not
-    CPU/GPU-bound.
+    I/O-bound stage: pull the clip down with yt-dlp into the raw-clip
+    cache (RAW_CACHE_DIR), keyed by video ID rather than by rank/title so
+    a later run reuses the file outright - see RAW_CACHE_DIR. Overwrites
+    any existing cache entry for this video, which is what a caller wants
+    when it already decided (see pipeline.py's _download) that this call
+    is for an explicit start/end override rather than a cache-eligible
+    default clip.
+
+    Runs in the download pool - sized larger than the encode pool since
+    it's network-bound, not CPU/GPU-bound.
     """
-    slug     = safe_filename(title)
-    raw_clip = f"{CLIPS_DIR}/raw_{slug}_rank{rank}.mp4"
+    os.makedirs(RAW_CACHE_DIR, exist_ok=True)
+    raw_clip = cached_clip_path(url)
 
     def _attempt(extra_args):
         result = subprocess.run([
@@ -231,7 +258,7 @@ def download_song(rank, title, url, start="00:01:00", end="00:01:15"):
 
 def encode_song(style, raw_clip, rank, title, artist, peak, entry_type,
                 views, release_date, months_on_chart, views_gained=None, rank_change="",
-                codec=None, head_trim=0.0, tail_trim=0.0):
+                codec=None, head_trim=0.0, tail_trim=0.0, clips_dir=CLIPS_DIR):
     """
     CPU/GPU-bound stage: builds this clip's own timeline -
 
@@ -248,13 +275,18 @@ def encode_song(style, raw_clip, rank, title, artist, peak, entry_type,
 
     Runs in the encode pool - sized to match actual hardware/software encode
     capacity, independently of how many downloads are in flight. Leaves
-    raw_clip on disk; the transition-building stage still needs the clip's
-    true (untrimmed) edges, and the caller cleans it up once every
-    transition touching this clip is done.
+    raw_clip on disk - the transition-building stage still needs the
+    clip's true (untrimmed) edges, and it stays there permanently after
+    that too, since it lives in the raw-clip cache (see RAW_CACHE_DIR).
+
+    `clips_dir` is where this run's own output (segments, phases, the
+    overlay PNG) lands - a per-chart subfolder chosen by the caller, kept
+    separate from RAW_CACHE_DIR's global by-video-ID cache and from every
+    other chart's output.
     """
     slug        = safe_filename(title)
-    final_clip  = f"{CLIPS_DIR}/seg_{slug}_rank{rank}.mp4"
-    overlay_png = f"{CLIPS_DIR}/overlay_{slug}_rank{rank}.png"
+    final_clip  = f"{clips_dir}/seg_{slug}_rank{rank}.mp4"
+    overlay_png = f"{clips_dir}/overlay_{slug}_rank{rank}.png"
 
     _log(f"  [rank {rank}] Rendering overlay...")
     img = build_overlay_image(
@@ -299,32 +331,32 @@ def encode_song(style, raw_clip, rank, title, artist, peak, entry_type,
     phases = []
     try:
         if lead_bare:
-            p = f"{CLIPS_DIR}/phase_{slug}_rank{rank}_lead.mp4"
+            p = f"{clips_dir}/phase_{slug}_rank{rank}_lead.mp4"
             _run_ffmpeg(_build_bare_cmd, codec, (raw_clip, cw, ch, fps, window_start, lead_bare, p),
                         f"OVERLAY[rank {rank}]")
             phases.append(p)
 
-        p = f"{CLIPS_DIR}/phase_{slug}_rank{rank}_in.mp4"
+        p = f"{clips_dir}/phase_{slug}_rank{rank}_in.mp4"
         _run_ffmpeg(_build_overlay_phase_cmd, codec,
                     (raw_clip, overlay_png, cw, ch, fps, window_start + lead_bare, overlay_duration,
                      overlay_enter, False, p),
                     f"OVERLAY[rank {rank}]")
         phases.append(p)
 
-        p = f"{CLIPS_DIR}/phase_{slug}_rank{rank}_static.mp4"
+        p = f"{clips_dir}/phase_{slug}_rank{rank}_static.mp4"
         _run_ffmpeg(_build_encode_cmd, codec,
                     (raw_clip, overlay_png, cw, ch, p, fps, static_start, static_end - static_start),
                     f"OVERLAY[rank {rank}]")
         phases.append(p)
 
-        p = f"{CLIPS_DIR}/phase_{slug}_rank{rank}_out.mp4"
+        p = f"{clips_dir}/phase_{slug}_rank{rank}_out.mp4"
         _run_ffmpeg(_build_overlay_phase_cmd, codec,
                     (raw_clip, overlay_png, cw, ch, fps, static_end, overlay_duration, overlay_exit, True, p),
                     f"OVERLAY[rank {rank}]")
         phases.append(p)
 
         if trail_bare:
-            p = f"{CLIPS_DIR}/phase_{slug}_rank{rank}_trail.mp4"
+            p = f"{clips_dir}/phase_{slug}_rank{rank}_trail.mp4"
             _run_ffmpeg(_build_bare_cmd, codec,
                         (raw_clip, cw, ch, fps, window_end - trail_bare, trail_bare, p),
                         f"OVERLAY[rank {rank}]")

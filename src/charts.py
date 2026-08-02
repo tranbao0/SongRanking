@@ -228,11 +228,16 @@ def _build_group_entry(members: list, views_by_id: dict) -> dict | None:
     }
 
 
-def compute_chart(name: str) -> list[dict]:
+def compute_chart(name: str, limit: int | None = None) -> list[dict]:
+    """
+    `limit`, when given, overrides the chart definition's own limit (e.g.
+    the CLI's --limit) - narrows the candidate-refresh pool and how many
+    entries are returned, without touching data/charts.yaml.
+    """
     definition = _load_definition(name)
     genre       = definition["genre"]
     metric      = definition["metric"]
-    limit       = definition["limit"]
+    limit       = limit if limit is not None else definition["limit"]
     window_days = definition.get("window_days")
 
     conn = db.get_connection()

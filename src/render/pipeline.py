@@ -16,7 +16,10 @@ except ImportError:
     pass
 
 from render.overlay import load_style
-from render.encoding import detect_hw_encoder, download_song, encode_song, encode_transition, concatenate_clips, _log
+from render.encoding import (
+    detect_hw_encoder, download_song, encode_song, encode_transition, concatenate_clips, _log,
+    cached_clip,
+)
 from render.heatmap import pick_clip
 from render.chart_state import (
     DATA_FILE, load_history, songs_from_search, pre_fetch_all,
@@ -68,7 +71,6 @@ def run_pipeline(search=None, limit=None, no_filter=False,
         clean_csv_titles(DATA_FILE)
         return
 
-    os.makedirs(CLIPS_DIR, exist_ok=True)
     style = load_style(STYLE_FILE)
 
     if chart_name:
@@ -77,7 +79,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
         csv_path = os.path.join("data", "charts", f"{chart_name}.csv")
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
         print(f'Computing chart "{chart_name}"...\n')
-        results = compute_chart(chart_name)
+        results = compute_chart(chart_name, limit=limit)
         if not results:
             print("Chart produced no results (registry empty for this genre - run `sync` first?). Exiting.")
             return
@@ -114,6 +116,17 @@ def run_pipeline(search=None, limit=None, no_filter=False,
             songs.sort(key=lambda s: int(s.get("rank") or 9999))
             songs = songs[:limit]
             print(f"  Using top {limit} songs from CSV.\n")
+
+    # Segments, transitions, and the final compilation for this run all land
+    # in their own subfolder, named after the CSV they're tied to (a chart's
+    # own data/charts/<name>.csv, or data/songs.csv for csv/search runs) -
+    # so different charts' encoded output never mixes in one flat directory.
+    # Raw clips are the one exception: they live in encoding.RAW_CACHE_DIR,
+    # shared across every run, since the same video is the same clip
+    # regardless of which chart it's being rendered for.
+    run_slug = os.path.splitext(os.path.basename(csv_path))[0]
+    clips_dir = os.path.join(CLIPS_DIR, run_slug)
+    os.makedirs(clips_dir, exist_ok=True)
 
     ranked = pre_fetch_all(songs, batch_fetch_metadata)
     determine_badges(ranked)
@@ -152,17 +165,23 @@ def run_pipeline(search=None, limit=None, no_filter=False,
         start = song.get("start") or _DEFAULT_START
         end   = song.get("end")   or _DEFAULT_END
         # No explicit override on this song (start/end still at the
-        # placeholder defaults) -- use the heatmap to pick a clip instead
-        # of blindly downloading the same fixed 00:01:00-00:01:15 window
-        # for every song.
+        # placeholder defaults): the clip is whatever the cache already
+        # has for this video, or - on the first run for it - a fresh
+        # heatmap pick. Skipping pick_clip on a cache hit isn't just an
+        # optimization: pick_clip rolls a random hot section on every
+        # call, so re-running it each time would silently pick a
+        # different window run to run instead of reusing the one already
+        # rendered before.
         if start == _DEFAULT_START and end == _DEFAULT_END:
+            cached = cached_clip(song["url"])
+            if cached:
+                _log(f"  [rank {song['rank']}] Using cached clip")
+                dl_times[song["rank"]] = time.monotonic() - t0
+                return cached
             picked_start, picked_end = pick_clip(song["url"])
             start, end = f"{picked_start:.2f}", f"{picked_end:.2f}"
             _log(f"  [rank {song['rank']}] Heatmap picked clip at {picked_start:.1f}s-{picked_end:.1f}s")
-        raw_clip = download_song(
-            song["rank"], song["title"], song["url"],
-            start=start, end=end,
-        )
+        raw_clip = download_song(song["rank"], song["url"], start=start, end=end)
         dl_times[song["rank"]] = time.monotonic() - t0
         return raw_clip
 
@@ -180,6 +199,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
             views_gained=song["_views_gained"],
             rank_change=song["_rank_change"],
             codec=codec, head_trim=head_trim, tail_trim=tail_trim,
+            clips_dir=clips_dir,
         )
         enc_times[song["rank"]] = time.monotonic() - t0
         return result
@@ -248,7 +268,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
     ]
 
     def _build_transition(rank_a, rank_b):
-        out_path = f"{CLIPS_DIR}/trans_rank{rank_a}_rank{rank_b}.mp4"
+        out_path = f"{clips_dir}/trans_rank{rank_a}_rank{rank_b}.mp4"
         t0 = time.monotonic()
         result = encode_transition(
             raw_by_rank[rank_a], raw_by_rank[rank_b], cw, ch, fps, out_path,
@@ -272,12 +292,9 @@ def run_pipeline(search=None, limit=None, no_filter=False,
                     _log(f"  ERROR: Transition rank {pair[0]}->{pair[1]} - {e}\n")
         trans_stage_end = time.monotonic()
 
-    # raw clips are only needed by the per-clip encode (its own overlay PNG
-    # is cleaned up inside encode_song already) and by the transitions
-    # touching them - both are done now, safe to clean up.
-    for raw_clip in raw_by_rank.values():
-        if os.path.exists(raw_clip):
-            os.remove(raw_clip)
+    # Raw clips are deliberately NOT cleaned up here: they live in
+    # encoding.RAW_CACHE_DIR, keyed by video ID, so a song still on the
+    # chart next run reuses the same file instead of re-downloading it.
 
     # Reassemble in countdown order, interleaving each song's segment with
     # the transition into its successor (when one was built).
@@ -302,9 +319,10 @@ def run_pipeline(search=None, limit=None, no_filter=False,
         # visibly breaks playback in players that lean on hardware decode
         # (confirmed reproducing in VLC, Discord's embedded player, and
         # mobile players - video freezes/blacks out right at each seam).
-        concatenate_clips(segments, codec=codec, cw=cw, ch=ch, fps=fps)
+        compilation_path = f"{clips_dir}/final_compilation.mp4"
+        concatenate_clips(segments, output_path=compilation_path, codec=codec, cw=cw, ch=ch, fps=fps)
         concat_time = time.monotonic() - t0
-        print("Compilation saved -> final_compilation.mp4\n")
+        print(f"Compilation saved -> {compilation_path}\n")
 
     save_run_state(ranked, csv_path)
     print(f"Updated {csv_path} for next run.\n")

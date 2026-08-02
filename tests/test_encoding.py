@@ -71,8 +71,9 @@ class DownloadProbeInteractionTest(unittest.TestCase):
     def test_successful_download_seeds_the_cache(self):
         with mock.patch.object(encoding.subprocess, "run", side_effect=self._completed(0)), \
              mock.patch.object(encoding, "_probe_duration", return_value=15.0) as probe:
-            raw = encoding.download_song(1, "Song", "https://example/watch?v=x")
+            raw = encoding.download_song(1, "https://example.com/watch?v=aaaaaaaaaaa")
 
+        self.assertEqual(raw, encoding.cached_clip_path("https://example.com/watch?v=aaaaaaaaaaa"))
         self.assertEqual(encoding._duration_cache[raw], 15.0)
         self.assertEqual(probe.call_count, 1)
         # Downstream consumers now get it for free.
@@ -87,7 +88,7 @@ class DownloadProbeInteractionTest(unittest.TestCase):
         """
         with mock.patch.object(encoding.subprocess, "run", side_effect=self._completed(0)), \
              mock.patch.object(encoding, "_probe_duration", side_effect=[None, 15.0]) as probe:
-            raw = encoding.download_song(2, "Song", "https://example/watch?v=y")
+            raw = encoding.download_song(2, "https://example.com/watch?v=bbbbbbbbbbb")
 
         self.assertEqual(probe.call_count, 2)
         self.assertEqual(encoding._duration_cache[raw], 15.0)
@@ -96,9 +97,38 @@ class DownloadProbeInteractionTest(unittest.TestCase):
         with mock.patch.object(encoding.subprocess, "run", side_effect=self._completed(1)), \
              mock.patch.object(encoding, "_probe_duration", return_value=None):
             with self.assertRaises(RuntimeError):
-                encoding.download_song(3, "Song", "https://example/watch?v=z")
+                encoding.download_song(3, "https://example.com/watch?v=ccccccccccc")
 
         self.assertEqual(encoding._duration_cache, {})
+
+
+class RawClipCacheTest(unittest.TestCase):
+    """
+    Guards the raw-clip cache keying: by video ID (stable across runs),
+    not by rank/title (which shift as the chart re-ranks) - see
+    RAW_CACHE_DIR and pipeline.py's _download.
+    """
+
+    def test_cache_path_is_keyed_by_video_id_not_rank_or_title(self):
+        url = "https://www.youtube.com/watch?v=aaaaaaaaaaa"
+        self.assertEqual(
+            encoding.cached_clip_path(url),
+            f"{encoding.RAW_CACHE_DIR}/aaaaaaaaaaa.mp4",
+        )
+
+    def test_same_video_different_urls_share_one_cache_path(self):
+        watch_url = "https://www.youtube.com/watch?v=aaaaaaaaaaa"
+        short_url = "https://youtu.be/aaaaaaaaaaa"
+        self.assertEqual(encoding.cached_clip_path(watch_url), encoding.cached_clip_path(short_url))
+
+    def test_cached_clip_is_none_when_nothing_is_downloaded_yet(self):
+        with mock.patch.object(encoding.os.path, "exists", return_value=False):
+            self.assertIsNone(encoding.cached_clip("https://www.youtube.com/watch?v=aaaaaaaaaaa"))
+
+    def test_cached_clip_returns_the_path_once_downloaded(self):
+        url = "https://www.youtube.com/watch?v=aaaaaaaaaaa"
+        with mock.patch.object(encoding.os.path, "exists", return_value=True):
+            self.assertEqual(encoding.cached_clip(url), encoding.cached_clip_path(url))
 
 
 class SafeFilenameTest(unittest.TestCase):
