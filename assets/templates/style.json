@@ -17,56 +17,56 @@
   },
 
   "bar": {
-    "solid_height":   180,
-    "fade_height":    90,
-    "bottom_margin":  56,
+    "solid_height":   150,
+    "fade_height":    76,
+    "bottom_margin":  40,
     "color":          [8, 9, 18],
     "opacity":        0.93,
-    "margin_left":    56,
-    "margin_right":   56,
-    "padding_top":    24,
-    "padding_bottom": 24
+    "margin_left":    48,
+    "margin_right":   48,
+    "padding_top":    18,
+    "padding_bottom": 18
   },
 
   "rank": {
-    "fontsize":      60,
+    "fontsize":      50,
     "color":         [255, 199, 46],
     "shadow_color":  [0, 0, 0],
     "shadow_alpha":  130,
-    "shadow_offset": [0, 3]
+    "shadow_offset": [0, 2]
   },
 
   "rank_change": {
-    "chip_gap":   28,
-    "fontsize":   26,
+    "chip_gap":   22,
+    "fontsize":   22,
     "color_up":   [0, 255, 136],
     "color_down": [255, 68, 68],
     "color_same": [170, 170, 170]
   },
 
   "divider": {
-    "gap":    28,
+    "gap":    24,
     "width":  2,
     "color":  [255, 255, 255],
     "alpha":  55
   },
 
   "title": {
-    "fontsize":          46,
+    "fontsize":          39,
     "color":             [255, 255, 255],
-    "max_width_reserve": 260,
-    "separator":         "  •  ",
+    "max_width_reserve": 220,
+    "separator":         "  by  ",
     "separator_color":   [130, 134, 160],
-    "artist_fontsize":   27,
+    "artist_fontsize":   23,
     "artist_color":      [160, 165, 195]
   },
 
   "row_gap": -2,
 
   "stats": {
-    "group_gap":   40,
-    "value_gap":   10,
-    "fontsize":    28,
+    "group_gap":   34,
+    "value_gap":   9,
+    "fontsize":    24,
     "label_color": [175, 178, 200],
     "items": [
       {"key": "released", "label": "RELEASED:",           "value_color": [200, 205, 255]},
@@ -79,14 +79,14 @@
   },
 
   "badge": {
-    "diameter":      176,
-    "margin_right":  64,
+    "diameter":      150,
+    "margin_right":  54,
     "center_y_offset": 0,
     "ring_color":    [255, 255, 255],
     "ring_alpha":    140,
     "ring_width":    3,
-    "fontsize":      28,
-    "min_fontsize":  16,
+    "fontsize":      24,
+    "min_fontsize":  14,
     "line_gap":      4,
     "text_color":    [255, 255, 255]
   },

@@ -1,4 +1,5 @@
 import json
+import unicodedata
 from functools import lru_cache
 
 from PIL import Image, ImageDraw, ImageFont
@@ -24,12 +25,19 @@ def _rgba(c, alpha=255):
 
 def _measure(draw, font, text):
     """Ink bounding box offsets/size for `text` as if drawn at (0, 0)."""
+    # NFC first: some sources (e.g. copy-pasted artist names) hand us
+    # decomposed Unicode - a base letter plus a combining accent as two
+    # codepoints. Pillow's default (non-raqm) layout draws those as two
+    # separate glyphs instead of composing them, so a combining accent
+    # with no precomposed glyph in the font renders as a tofu box.
+    text = unicodedata.normalize("NFC", text)
     l, t, r, b = draw.textbbox((0, 0), text, font=font)
     return l, t, r - l, b - t
 
 
 def _draw_text(draw, x, y, text, font, fill):
     """Draw `text` so its ink top-left lands exactly at (x, y). Returns (w, h)."""
+    text = unicodedata.normalize("NFC", text)
     l, t, w, h = _measure(draw, font, text)
     draw.text((x - l, y - t), text, font=font, fill=fill)
     return w, h
@@ -85,7 +93,8 @@ def build_overlay_image(style, *, rank, title, artist, peak, release_date, month
     bar = style["bar"]
     solid_h = bar["solid_height"]
     fade_h  = bar["fade_height"]
-    bar_bottom = ch - bar.get("bottom_margin", 0)
+    bottom_margin = bar.get("bottom_margin", 0)
+    bar_bottom = ch - bottom_margin
     bar_top = bar_bottom - solid_h
     fade_top = bar_top - fade_h
     bar_color = _rgb(bar["color"])
@@ -97,16 +106,25 @@ def build_overlay_image(style, *, rank, title, artist, peak, release_date, month
     # ── Gradient fades above and below the solid bar ────────────────────────
     # Everything else (rank, stats, badge) is drawn with flat fills per the
     # style constraints. Flat bar_color throughout - the fade is purely an
-    # alpha ramp, so only the mask varies down the strip. The bottom fade is
-    # just the top one flipped, so the bar dissolves into the footage below
-    # it the same way it dissolves in from above, instead of stopping dead
-    # at a hard rectangle edge.
+    # alpha ramp, so only the mask varies down the strip.
     fade_img = Image.new("RGBA", (cw, fade_h), (*bar_color, 0))
     fade_img.putalpha(_valpha_ramp(cw, fade_h, bar_alpha))
     img.paste(fade_img, (0, fade_top), fade_img)
     draw.rectangle([0, bar_top, cw, bar_bottom], fill=(*bar_color, int(bar_alpha)))
-    bottom_fade_img = fade_img.transpose(Image.FLIP_TOP_BOTTOM)
-    img.paste(bottom_fade_img, (0, bar_bottom), bottom_fade_img)
+
+    # The bottom fade is capped to bottom_margin (rather than reusing fade_h
+    # like the top fade does) so it always finishes dissolving to fully
+    # transparent right at the canvas edge. Since the canvas ends bottom_
+    # margin px below the bar, a fade taller than that gets hard-clipped
+    # mid-gradient - visible as a sharp cutoff line that reads as a floating
+    # box instead of the bar bleeding into the footage below it.
+    bottom_fade_h = min(fade_h, bottom_margin)
+    if bottom_fade_h > 0:
+        bottom_fade_img = Image.new("RGBA", (cw, bottom_fade_h), (*bar_color, 0))
+        bottom_fade_img.putalpha(
+            _valpha_ramp(cw, bottom_fade_h, bar_alpha).transpose(Image.FLIP_TOP_BOTTOM)
+        )
+        img.paste(bottom_fade_img, (0, bar_bottom), bottom_fade_img)
 
     left_x  = bar["margin_left"]
     right_x = cw - bar["margin_right"]
