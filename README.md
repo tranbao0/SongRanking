@@ -5,6 +5,7 @@ Three components: a discovery/data layer, a chart engine, and a render pipeline.
 
 ## Table of contents
 
+- [Before you start](#before-you-start)
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
 - [Setup](#setup)
@@ -12,10 +13,24 @@ Three components: a discovery/data layer, a chart engine, and a render pipeline.
 - [Guide: adding a new genre](#guide-adding-a-new-genre)
 - [Guide: adding or customizing a chart](#guide-adding-or-customizing-a-chart)
 - [Guide: manual channel curation](#guide-manual-channel-curation)
+- [Guide: keeping song grouping accurate](#guide-keeping-song-grouping-accurate)
 - [API spend safeguards](#api-spend-safeguards)
+- [Automated grouping audits](#automated-grouping-audits)
 - [Data files](#data-files)
 - [Tuning worker pools](#tuning-worker-pools)
 - [Tests](#tests)
+
+## Before you start
+
+This is a working pipeline, not a turnkey product. Cloning it and running `sync` produces *something*, but not something good, until a few things are done by hand - none of these are bugs waiting to be fixed later, they're inherent to what this project is doing:
+
+- **Channel coverage requires manual curation, not just Wikidata.** Wikidata only links artists to their *own* channel; label, distributor, and broadcaster channels - which carry a large share of real uploads - have no entry there at all and have to be added to `data/channels/<genre>_manual.yaml` by hand. Skip this and your registry is missing most of what actually charts. See [manual channel curation](#guide-manual-channel-curation).
+- **The automated grouping tiers alone are not good enough for a fresh channel.** They merge the easy cases; a channel's first sync still leaves real duplicates (the same song as separate chart entries) that need an actual read-through to catch, especially cross-channel duplicates and judgment-heavy presentation-format calls no regex or one-shot AI chunk can resolve. Budget for either running the manual review process yourself (see [keeping song grouping accurate](#guide-keeping-song-grouping-accurate)) or setting up the [automated audit hook](#automated-grouping-audits) - which itself needs a coding-agent CLI installed and authenticated separately, it is not covered by your `.env` API keys.
+- **API keys have real, separate limits to manage.** `YOUTUBE_API_KEY` is required for `sync`/`chart` and its quota is fixed by Google regardless of your billing tier. `GEMINI_API_KEY` is optional, but a large first sync is meaningfully more accurate with it than without. See [API spend safeguards](#api-spend-safeguards).
+- **You have to define your own charts.** `data/charts.yaml` ships empty - see [adding or customizing a chart](#guide-adding-or-customizing-a-chart).
+- **Render workers need tuning to your own hardware/connection**, or the render step bottlenecks somewhere you didn't expect - see [tuning worker pools](#tuning-worker-pools).
+
+If you only do the [Setup](#setup) steps below and nothing else, `sync` will run without erroring - it just won't produce a registry worth charting from.
 
 ## Architecture
 
@@ -227,6 +242,22 @@ That matters because charts read videos joined to channels, so an excluded chann
 Only official artist, label, distributor or broadcaster channels belong in the manual file.
 Fan lyric-video channels and re-uploaders carry the right genre but the wrong uploads: their views are separate from the official release, so counting them splits a song's audience across copies instead of measuring it.
 
+## Guide: keeping song grouping accurate
+
+`sync`'s deterministic + AI grouping tiers (see [Architecture](#architecture)) handle the common case cheaply, but they are structurally limited, not just imperfectly tuned:
+
+- The AI tier only ever sees one chunk of one channel at a time, so it cannot catch the same song uploaded to a *different* channel (an artist's own channel and a label/aggregator channel like a broadcaster both posting the same MV).
+- Neither tier can apply judgment to genuinely ambiguous cases - is a `(Rock Ver.)` tag a real rearrangement or just a stage cut? Is a bracketed `[Artist TV Behind]` show name actually behind-the-scenes footage, or a real performance video released under a branded show? - the kind of call that only comes from reading the title (and often the native-script text) directly.
+
+`docs/manual-grouping-prompt.md` is the accumulated methodology for doing that reading by hand, built up over repeated audits of this project's own registry: the decided rules (what merges, what doesn't), a large "Precedents from prior runs" section of worked examples, and the exact SQL for applying a fix once you've found one. It's meant to be pasted directly into a fresh coding-agent session (Claude Code or similar) pointed at your `data/registry.db`.
+
+**When you need this:**
+- After a channel's *first* sync (its whole catalog is unreviewed).
+- After any sync that adds an unusually large batch to one channel (e.g. a full back-catalog dump).
+- Periodically, regardless of volume, to catch cross-channel duplicates the per-channel tiers structurally can't see.
+
+That's exactly the trigger set [the automated audit hook](#automated-grouping-audits) below runs on your behalf if you set it up - the doc above is what it reads, and it applies the same rules a human session would. Running it by hand is the fallback if you'd rather not (or can't yet) configure that hook.
+
 ## API spend safeguards
 
 `src/shared/api_budget.py` tracks daily usage for the YouTube Data API and Gemini API in `data/.api_usage.json` (resets at midnight, git-ignored).
@@ -256,6 +287,35 @@ On the current registry that costs less than it sounds.
 The free tiers already merge the predictable cases, and the residue the AI tier would judge is dominated by pairs that should stay separate anyway - remixes, and different songs by one artist whose titles overlap because the artist's name dominates them.
 
 A budget-stopped `sync` resumes from the least-recently-synced channel on the next run - no completed work is redone.
+
+## Automated grouping audits
+
+`src/registry/grouping_audit.py` hands the registry to a subscription-based coding-agent CLI (Claude Code by default) for the judgment-heavy review described in [keeping song grouping accurate](#guide-keeping-song-grouping-accurate), automatically, as part of `sync`.
+
+**This needs its own one-time setup and does nothing out of the box.** It shells out to a CLI (`claude -p` by default) that must already be installed *and authenticated* on the machine running `sync` - there is no API key for this in `.env`, the subprocess inherits whatever login state that CLI already has. If it isn't installed, `sync` logs a one-line warning and moves on; the audit is skipped, the sync itself is not affected.
+
+Three independent triggers, checked after every `sync`, any one of which is enough:
+
+| Trigger | Fires when | Scope handed to the agent |
+|---|---|---|
+| New channel | A channel appeared in `channels` this sync | Just that channel's full catalog |
+| Volume spike | One channel's new-upload count this sync ≥ `GROUPING_AUDIT_VOLUME_THRESHOLD` | Just that channel |
+| Periodic backstop | `GROUPING_AUDIT_EVERY_N_SYNCS` syncs have passed with neither of the above | A general cross-channel duplicate sweep |
+
+Override in `.env`:
+
+```bash
+GROUPING_AGENT_CLI=claude -p          # which CLI to invoke - point elsewhere if you use a different agent
+GROUPING_AUDIT_EVERY_N_SYNCS=7        # periodic backstop cadence, in number of syncs
+GROUPING_AUDIT_VOLUME_THRESHOLD=50    # new uploads on one channel in one sync that counts as a "spike"
+GROUPING_AGENT_TIMEOUT=3600           # seconds to wait before giving up on the agent
+```
+
+The agent runs headless (its prompt piped over stdin, one shot, no back-and-forth), reads `docs/manual-grouping-prompt.md` for the full methodology, and is told to apply fixes directly rather than propose a diff - safe here because this is a lone unattended pass with nothing else writing to `data/registry.db` at the same time. It's also told to fold anything it learns that isn't already in that doc's precedents section back into it, so the next audit (human or agent) inherits the judgment call instead of re-deriving it.
+
+It's safe to run alongside routine syncs, and safe to skip a cycle if the agent CLI isn't available: a missed correction just sits as a minor chart inaccuracy until the next audit catches it. `view_snapshots` keys on `video_id`, not `song_id`, and a chart re-aggregates through `videos.song_id` at render time - so a late grouping fix never loses or corrupts anything already collected.
+
+State (which trigger last fired, how many quiet syncs since) lives in `data/.grouping_audit_state.json`, git-ignored like the other sidecar caches.
 
 ### What a run actually spends
 

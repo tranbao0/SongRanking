@@ -10,6 +10,7 @@ data/*.db-shm
 data/.yt_dlp_update_check.json
 data/.api_usage.json
 data/.manual-grouping-progress.json
+data/.grouping_audit_state.json
 assets/clips/_concat_list.txt
 
 # API keys and secrets

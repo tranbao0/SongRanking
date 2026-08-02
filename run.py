@@ -95,10 +95,13 @@ def main():
     args = parser.parse_args()
 
     if args.command == "sync":
-        from registry import discovery, catalog, snapshot
+        from registry import discovery, catalog, snapshot, grouping_audit
 
         genres = args.genre or discovery.KNOWN_GENRES
         print(f"Syncing channels for: {', '.join(genres)}")
+
+        audit_snapshot = grouping_audit.snapshot_before_sync()
+
         channel_counts = discovery.sync_channels(genres)
         for genre, count in channel_counts.items():
             print(f"  {genre}: {count} channel(s)")
@@ -110,6 +113,8 @@ def main():
         print("Taking view snapshot...")
         snapshot_count = sum(snapshot.take_snapshot(genre=g) for g in genres)
         print(f"  {snapshot_count} snapshot row(s) inserted")
+
+        grouping_audit.audit_after_sync(audit_snapshot)
         return
 
     if args.command == "decouple":
