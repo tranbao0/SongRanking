@@ -18,6 +18,7 @@ channels it found that were worth keeping are curated in the manual yaml.
 from datetime import date
 from pathlib import Path
 
+import requests
 import yaml
 
 from registry import db
@@ -106,21 +107,35 @@ def _purge_excluded(conn, genre: str) -> int:
 def sync_channels(genres: list[str]) -> dict[str, int]:
     """
     Run discovery for each genre and upsert results into data/registry.db.
-    Returns {genre: channel_count} for reporting.
+    Committed per genre rather than once at the end, and one genre's
+    Wikidata failure doesn't take the rest down with it - discover_channels
+    already retries a transient error itself (see wikidata.py), so a genre
+    only lands here if that's exhausted. Returns {genre: channel_count} for
+    reporting; a genre whose discovery failed is omitted from it.
     """
     conn = db.get_connection()
     counts = {}
     try:
         for genre in genres:
+            print(f"  [discovery] {genre}: querying Wikidata and manual sources...")
+
             # Excluded channels are dropped from the registry, not merely
             # left out of this run's discovery. Filtering discover_genre()'s
             # output alone would silently do nothing for a channel already
             # catalogued - the upsert below only inserts and updates - so
             # adding an entry to the exclude file would appear to have no
-            # effect on exactly the channel it was written for.
+            # effect on exactly the channel it was written for. Independent
+            # of the Wikidata query below, so it's committed on its own and
+            # applies even when that query ends up failing.
             _purge_excluded(conn, genre)
+            conn.commit()
 
-            channels = discover_genre(genre)
+            try:
+                channels = discover_genre(genre)
+            except requests.RequestException as e:
+                print(f"  [discovery] {genre}: Wikidata query failed ({e}), skipping this genre")
+                continue
+
             conn.executemany(
                 """
                 INSERT INTO channels (channel_id, genre, display_name, source, source_ref, added_date)
@@ -133,8 +148,8 @@ def sync_channels(genres: list[str]) -> dict[str, int]:
                 """,
                 channels,
             )
+            conn.commit()
             counts[genre] = len(channels)
-        conn.commit()
     finally:
         conn.close()
     return counts

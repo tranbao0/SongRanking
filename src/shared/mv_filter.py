@@ -31,10 +31,35 @@ BLOCKLIST = re.compile(
     # the song they promote, but that only makes them singletons; the
     # decision that they aren't songs at all belongs here.
     r"|trailer|preview|documentary|recap|interview|spoiler|unboxing|vlog|reaction"
-    r"|behind[\s-]the[\s-]scenes"
+    r"|behind[\s-]the[\s-]scenes?"
     r"|making\s+(?:film|of)"
     r"|concept\s+(?:film|photo|clip|trailer)"
     r"|episode|ep\.\s*\d"
+
+    # "Behind" and "making" as standalone video-type markers, distinct from
+    # the phrase forms above. A manual audit of ~15,000 already-catalogued
+    # titles found the bare-phrase rule above only catches "behind the
+    # scenes" and "making film/of" literally, missing every other shape a
+    # label channel actually uses: "MV Shooting Behind", "Stage Behind",
+    # "Live Clip Behind", "VCR Behind", "MV Making Video", the Korean
+    # equivalents (never had a pattern here at all), etc. - roughly 750
+    # videos across the registry, none of them a song. Anchored to a
+    # production/format noun (mv, stage, clip, practice, vcr, concert,
+    # shooting, bonus) rather than a bare "\bbehind\b", because a bare
+    # match is unsafe: real song titles contain "Behind" as an ordinary
+    # word ("Behind U", "Behind You", "Hands Behind My Back", "Behind The
+    # Shine", "Behind the page" are all genuine OST/single titles, not
+    # behind-the-scenes footage) and a bare match would silently drop
+    # those. If a future audit finds another unanchored shape slipping
+    # through, add it here rather than loosening the anchor. The filler
+    # between anchor and "behind" allows quote marks too (real titles wrap
+    # the anchor in quotes, e.g. "'Live Clip' Behind"), not just bare words.
+    r"|(?:mv|m/v|music\s+video|lyric\s+video|stage|clip|practice|vcr|concert|shooting|bonus|encore|performance(?:\s+video)?)"
+    r"[\s'\"]*(?:[\w'\"]+[\s'\"]*){0,2}?behind\b"
+    r"|behind\s+(?:the\s+)?(?:[\w']+\s+){0,2}?(?:stage|cut)\b"
+    r"|mv\s*making|m/v\s*making|making\s+video|making\s+movie"
+    r"|shooting\s+sketch|shoot\s+sketch"
+    r"|비하인드|메이킹|촬영\s*(?:현장|비하인드)|제작\s*현장"
 
     # Phrase-anchored on purpose: "Highlight" is itself a K-pop group, so a
     # bare word match here would reject that artist's entire catalogue.

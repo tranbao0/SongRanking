@@ -131,6 +131,9 @@ python run.py chart --name kpop_alltime --limit 10
 python run.py decouple                  # clear song assignments for every genre
 python run.py decouple --genre kpop     # one genre only
 python run.py decouple --yes            # skip the confirmation (scripts)
+
+python run.py regroup                   # re-derive groupings decouple cleared
+python run.py regroup --genre kpop      # one genre only
 ```
 
 Grouping is additive: a video's `song_id` is set once and never re-derived, which is what keeps a daily `sync` cheap.
@@ -146,6 +149,10 @@ It never deletes videos. Only the grouping goes.
 
 The prompt reports both counts, and requires you to type `decouple` rather than accept a `y`.
 A timestamped backup is written before anything changes, so an accidental run costs no quota to undo - restore the `.pre-decouple.db` file.
+
+`regroup` is the other half: it runs the videos `decouple` left with a NULL `song_id` back through the same grouping tiers, channel by channel.
+It makes no YouTube API call - every candidate was already fetched and MV-filtered on a prior sync, so only the grouping is redone, not the catalogue.
+It costs nothing beyond whatever the AI tier spends (subject to the same daily Gemini budget as `sync`), and is safe to interrupt and re-run: a channel with nothing left ungrouped is skipped.
 
 - `sync` only updates `data/registry.db` - no download/render.
 - `chart` only reads what `sync` last recorded - no fresh YouTube fetch.

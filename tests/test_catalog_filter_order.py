@@ -91,6 +91,32 @@ class FilterOrderTest(unittest.TestCase):
 
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0], 0)
 
+    def test_blocklisted_titles_are_recorded_with_no_song(self):
+        """
+        A blocked title (teaser, making-of, behind-the-scenes, ...) is kept
+        as a video row with song_id NULL rather than dropped - so it never
+        counts as its own chart entry, but its video_id still lands in
+        `videos` and stops a later sync's pagination from walking past it
+        again (see the comment on `blocked` in sync_videos).
+        """
+        uploads = [
+            self._upload("keep", "BTS - Dynamite Official MV"),
+            self._upload("teaser", "BTS - Dynamite Teaser"),
+            self._upload("making", "BTS Dynamite MV Making Video"),
+        ]
+        self._run_sync(uploads)
+        rows = {
+            r["video_id"]: r["song_id"]
+            for r in self.conn.execute("SELECT video_id, song_id FROM videos").fetchall()
+        }
+        self.assertIn("keep", rows)
+        self.assertIsNotNone(rows["keep"])
+        self.assertIn("teaser", rows)
+        self.assertIsNone(rows["teaser"])
+        self.assertIn("making", rows)
+        self.assertIsNone(rows["making"])
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM songs").fetchone()[0], 1)
+
     def test_the_kept_video_is_actually_stored(self):
         self._run_sync([self._upload("keep", "BTS - Dynamite Official MV")])
         rows = self.conn.execute("SELECT video_id, channel_id FROM videos").fetchall()

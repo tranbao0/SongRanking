@@ -10,12 +10,19 @@ Deliberately does not filter on "instance of" (P31) - restricting to
 requirement is the genre tag itself.
 """
 
+import random
 import re
+import time
 from datetime import date
 
 import requests
 
 SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
+
+# A transient blip (timeout, connection reset, a 5xx) shouldn't cost an
+# entire sync's channel discovery for every genre - see discover_channels.
+_MAX_ATTEMPTS = 3
+_BACKOFF_BASE = 2.0
 
 # One YouTube channel ID (P2397) per artist is typical; genre (P136) subclass
 # reasoning (P279*) catches artists tagged with a more specific sub-genre.
@@ -42,6 +49,35 @@ GENRE_QIDS = {
 _QID_RE = re.compile(r"Q\d+$")
 
 
+def _query_bindings(genre_qid: str) -> list[dict]:
+    """
+    Run the SPARQL query, retrying a transient failure (timeout, connection
+    error, a 5xx) up to _MAX_ATTEMPTS times before letting it propagate.
+    Raises requests.RequestException if every attempt fails - the caller
+    (discovery.sync_channels) decides how to treat one genre's discovery
+    failing without taking the rest of the run down with it.
+    """
+    last_exc: requests.RequestException | None = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            response = requests.get(
+                SPARQL_ENDPOINT,
+                params={"query": _QUERY.format(genre_qid=genre_qid), "format": "json"},
+                headers=_HEADERS,
+                timeout=30,
+            )
+            response.raise_for_status()
+            return response.json()["results"]["bindings"]
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt == _MAX_ATTEMPTS - 1:
+                break
+            delay = _BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 1.0)
+            print(f"  [wikidata] Query failed ({e}) - retrying in {delay:.1f}s")
+            time.sleep(delay)
+    raise last_exc
+
+
 def discover_channels(genre: str) -> list[dict]:
     """
     Return channel entries for `genre` found via Wikidata.
@@ -51,14 +87,7 @@ def discover_channels(genre: str) -> list[dict]:
     if genre_qid is None:
         return []
 
-    response = requests.get(
-        SPARQL_ENDPOINT,
-        params={"query": _QUERY.format(genre_qid=genre_qid), "format": "json"},
-        headers=_HEADERS,
-        timeout=30,
-    )
-    response.raise_for_status()
-    bindings = response.json()["results"]["bindings"]
+    bindings = _query_bindings(genre_qid)
 
     channels = []
     for row in bindings:

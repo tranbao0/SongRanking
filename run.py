@@ -16,6 +16,9 @@ Usage:
 
   python run.py decouple                  # clear song groupings so they can be redone
   python run.py decouple --genre kpop     # one genre only
+
+  python run.py regroup                   # re-derive groupings for videos decouple left ungrouped
+  python run.py regroup --genre kpop      # one genre only
 """
 
 import json
@@ -70,7 +73,7 @@ def main():
     )
     parser.add_argument(
         "command",
-        choices=["csv", "search", "clean", "sync", "chart", "decouple"],
+        choices=["csv", "search", "clean", "sync", "chart", "decouple", "regroup"],
         help="Command to run",
     )
     parser.add_argument("--yes", action="store_true",
@@ -101,11 +104,11 @@ def main():
             print(f"  {genre}: {count} channel(s)")
 
         print("Syncing video catalog...")
-        video_count = catalog.sync_videos()
+        video_count = catalog.sync_videos(genres=genres)
         print(f"  {video_count} video(s) upserted")
 
         print("Taking view snapshot...")
-        snapshot_count = snapshot.take_snapshot()
+        snapshot_count = sum(snapshot.take_snapshot(genre=g) for g in genres)
         print(f"  {snapshot_count} snapshot row(s) inserted")
         return
 
@@ -116,6 +119,15 @@ def main():
         if len(genres) > 1:
             parser.error("decouple takes at most one --genre")
         decouple_mod.decouple(genre=genres[0], assume_yes=args.yes)
+        return
+
+    if args.command == "regroup":
+        from registry import regroup as regroup_mod
+
+        genres = args.genre or [None]
+        if len(genres) > 1:
+            parser.error("regroup takes at most one --genre")
+        regroup_mod.regroup_all(genre=genres[0])
         return
 
     ensure_yt_dlp_up_to_date()
