@@ -221,6 +221,22 @@ class NormalizeTitleTest(unittest.TestCase):
     def test_hangul_titles_are_preserved(self):
         self.assertEqual(normalize_title("에스파 Supernova Official MV"), "에스파 supernova")
 
+    def test_award_show_live_performances_match_the_official_upload(self):
+        """
+        "Live at <award show>" and "live from <event>" name a performance
+        the same way "Official MV" names a studio cut - both should
+        normalize to the same key so tier 1 links them without needing
+        the AI tier to recognise it every time.
+        """
+        self.assertTrue(self._same(
+            "ROSÉ & Bruno Mars - APT. (Official Music Video)",
+            "ROSÉ & Bruno Mars - APT. (Live at the 68th Annual Grammy Awards)",
+        ))
+        self.assertTrue(self._same(
+            "ROSÉ & Bruno Mars - APT. (Official Music Video)",
+            "ROSÉ & Bruno Mars - APT. (live from 2024 MAMA AWARDS)",
+        ))
+
 
 class MatchKeyTest(unittest.TestCase):
     def test_key_is_bare_title_without_artists(self):

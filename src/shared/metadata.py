@@ -1,44 +1,17 @@
 import concurrent.futures
-import os
 import re
 import subprocess
-import threading
-import time
 import json
 from datetime import date
 
 from shared.dates import months_since
+from shared.ytdlp_throttle import throttle as _throttle
 
 # yt-dlp's fatal line looks like "ERROR: [youtube] <video_id>: <reason>" -
 # the ID makes every video's message unique text, which would otherwise
 # defeat grouping identical failures (e.g. a bot-check wall hit by
 # thousands of videos in the same run) into one line.
 _ERROR_ID_PREFIX_RE = re.compile(r"^ERROR:\s*\[\w+\]\s*[\w-]+:\s*")
-
-# Firing many yt-dlp requests at once is what actually trips YouTube's
-# bot-check wall in practice - a burst against a large pending list came
-# back 429 ("Too Many Requests") then "Sign in to confirm you're not a
-# bot" on nearly every video. Unlike the Data API, yt-dlp has no quota to
-# negotiate against, only YouTube's own request-rate heuristics, so the
-# fix is pacing rather than budgeting: every launch waits for this long
-# to have passed since the last one, no matter how many worker threads
-# are free to fire immediately. Configurable because the right interval
-# depends on how aggressively YouTube is currently rate-limiting, which
-# isn't something this codebase can observe directly.
-_MIN_LAUNCH_INTERVAL = float(os.environ.get("YTDLP_MIN_REQUEST_INTERVAL", 1.5))
-_launch_lock = threading.Lock()
-_last_launch = 0.0
-
-
-def _throttle() -> None:
-    """Block until at least _MIN_LAUNCH_INTERVAL has passed since the last
-    yt-dlp launch (across every thread), then claim this slot."""
-    global _last_launch
-    with _launch_lock:
-        wait = _last_launch + _MIN_LAUNCH_INTERVAL - time.monotonic()
-        if wait > 0:
-            time.sleep(wait)
-        _last_launch = time.monotonic()
 
 
 def _error_reason(e: subprocess.CalledProcessError) -> str:

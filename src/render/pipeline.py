@@ -85,8 +85,30 @@ def run_pipeline(search=None, limit=None, no_filter=False,
             return
         history = load_history(csv_path)
         songs   = songs_from_search(results, history)
-        print("Cleaning up titles via AI...")
-        songs = clean_titles_fn(songs)
+
+        # A song already on this chart's CSV keeps its previously-cleaned
+        # title/artist rather than being re-sent to Gemini from its raw
+        # source title every run - compute_chart always returns the full
+        # chart (unlike search's small fresh-results set), so without this
+        # every run would re-clean the same ~200 songs it cleaned last time.
+        cleaned = {
+            row["url"]: (row["title"], row["artist"])
+            for row in load_songs(csv_path)
+        } if os.path.exists(csv_path) else {}
+
+        new_songs = []
+        for song in songs:
+            cached = cleaned.get(song["url"])
+            if cached:
+                song["title"], song["artist"] = cached
+            else:
+                new_songs.append(song)
+
+        if new_songs:
+            print(f"Cleaning up titles via AI for {len(new_songs)} new song(s)...")
+            clean_titles_fn(new_songs)
+        else:
+            print("No new songs on this chart - reusing already-cleaned titles.\n")
     elif search:
         csv_path = DATA_FILE
         from shared.title_cleaner import clean_titles as clean_titles_fn

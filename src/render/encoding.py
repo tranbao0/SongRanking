@@ -15,6 +15,7 @@ from render.overlay import (
     build_overlay_phase_filter_complex, build_transition_filter_complex,
 )
 from shared.youtube_api import extract_video_id
+from shared.ytdlp_throttle import throttle, COOKIES_BROWSER
 
 CLIPS_DIR = "assets/clips"
 
@@ -216,6 +217,7 @@ def download_song(rank, url, start="00:01:00", end="00:01:15"):
     raw_clip = cached_clip_path(url)
 
     def _attempt(extra_args):
+        throttle()
         result = subprocess.run([
             "yt-dlp",
             "--download-sections", f"*{start}-{end}",
@@ -250,6 +252,9 @@ def download_song(rank, url, start="00:01:00", end="00:01:15"):
     if result.returncode != 0:
         _log(f"  [rank {rank}] Default client failed, retrying with '{_DOWNLOAD_FALLBACK_CLIENT}' client...")
         result = _attempt(["--extractor-args", f"youtube:player_client={_DOWNLOAD_FALLBACK_CLIENT}"])
+    if result.returncode != 0:
+        _log(f"  [rank {rank}] '{_DOWNLOAD_FALLBACK_CLIENT}' client failed, retrying with '{COOKIES_BROWSER}' browser cookies...")
+        result = _attempt(["--cookies-from-browser", COOKIES_BROWSER])
     if result.returncode != 0:
         raise RuntimeError(f"DOWNLOAD failed (yt-dlp exit {result.returncode}): {result.stderr[-500:]}")
 
@@ -454,7 +459,7 @@ def concatenate_clips(clip_paths, output_path="final_compilation.mp4", codec=Non
     video) and gives a continuous, monotonically increasing timeline.
     """
     list_file = f"{output_path}.concat.txt"
-    with open(list_file, "w") as f:
+    with open(list_file, "w", encoding="utf-8") as f:
         for path in clip_paths:
             abs_path = os.path.abspath(path).replace("\\", "/")
             f.write(f"file '{abs_path}'\n")

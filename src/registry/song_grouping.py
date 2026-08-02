@@ -76,7 +76,7 @@ _AI_CHUNK_WORKERS = 4
 
 _VIDEO_TYPE_KEYWORDS = (
     "official", "mv", "m/v", "lyric", "performance", "practice",
-    "choreography", "video", "audio", "visualizer",
+    "choreography", "video", "audio", "visualizer", "live",
 )
 
 _BRACKET_RE = re.compile(r"[\(\[\{][^\)\]\}]*[\)\]\}]")

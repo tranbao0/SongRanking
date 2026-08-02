@@ -100,6 +100,23 @@ class BlockedTitleTest(unittest.TestCase):
         self.assertTrue(is_valid_mv("[Live Clip] Artist - Song", 300))
         self.assertFalse(is_valid_mv("SMTOWN LIVE Concert Stage", 7200))
 
+    def test_award_show_live_performances_are_not_blocked(self):
+        """
+        "Live at/from <event>" names an award-show or broadcast performance
+        the same way "Live Clip" or "Performance" does, just without either
+        of those exact words - it should survive equally.
+        """
+        for title in ["ROSÉ & Bruno Mars - APT. (Live at the 68th Annual Grammy Awards)",
+                      "ROSÉ & Bruno Mars - APT. (live from 2024 MAMA AWARDS)",
+                      "ROSÉ & PSY - APT. (live from SUMMERSWAG 2025)"]:
+            with self.subTest(title=title):
+                self.assertFalse(is_blocked_title(title))
+                self.assertTrue(is_valid_mv(title, 200))
+
+    def test_bare_live_without_a_venue_is_still_rejected(self):
+        """Only "live at/from/in" is allowlisted - a bare "Live" is not."""
+        self.assertTrue(is_blocked_title("BABYMONSTER Live Q&A"))
+
     def test_missing_duration_defaults_to_rejection(self):
         """catalog passes 0 when a duration lookup failed."""
         self.assertFalse(is_valid_mv("BTS - Dynamite (Official MV)", 0))

@@ -25,15 +25,20 @@ import random
 
 import yt_dlp
 
+from shared.ytdlp_throttle import throttle, COOKIES_BROWSER
+
 CLIP_DURATION  = 15.0
 HEAT_THRESHOLD = 0.6
 DEFAULT_START  = 60.0  # matches the old fixed 00:01:00
 
 
-def _extract_info(url, player_client=None):
+def _extract_info(url, player_client=None, cookies_from_browser=None):
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
     if player_client:
         opts["extractor_args"] = {"youtube": {"player_client": [player_client]}}
+    if cookies_from_browser:
+        opts["cookiesfrombrowser"] = (cookies_from_browser,)
+    throttle()
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
@@ -50,7 +55,13 @@ def _fetch_heatmap(url):
         # Mirrors encoding.download_song's client fallback: some
         # videos/sessions get bucketed into a restricted experiment that
         # the default client can't extract at all.
-        info = _extract_info(url, player_client="android")
+        try:
+            info = _extract_info(url, player_client="android")
+        except yt_dlp.utils.DownloadError:
+            # Last resort when the wall is an IP/session flag rather than
+            # a client-experiment bucket - see encoding.download_song's
+            # matching third tier.
+            info = _extract_info(url, cookies_from_browser=COOKIES_BROWSER)
     return info.get("heatmap"), info.get("duration")
 
 

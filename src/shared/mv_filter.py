@@ -102,7 +102,15 @@ ALLOWED_TYPES = re.compile(
     # live clip has the song as its focal point just as a studio cut does.
     # Full concert films don't slip in behind this: MAX_DURATION rejects
     # them, and recap/highlight edits are named in BLOCKLIST.
-    r"|performance|\bstage\b|live\s+clip"
+    #
+    # "live at/from/in ..." catches award-show and broadcast performance
+    # titles ("Live at the 68th Annual Grammy Awards", "live from 2024 MAMA
+    # AWARDS") that name a venue/event rather than the word "clip" or
+    # "performance" itself. Bare "live" alone isn't matched - that would
+    # also catch "Livestream" in spirit and titles like "Live Q&A" - but
+    # BLOCKLIST already removes the vlog/reaction/etc. shapes that would
+    # otherwise slip through this wider net.
+    r"|performance|\bstage\b|live\s+clip|live\s+(?:at|from|in)\b"
     r"|visualizer"          # static/looping visual, but the song is the content
     r"|official\s+audio|\baudio\b"
     r")",

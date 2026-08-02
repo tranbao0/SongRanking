@@ -73,8 +73,9 @@ def build_overlay_image(style, *, rank, title, artist, peak, release_date, month
 
     The bar sits `bottom_margin` px above the frame's bottom edge so it isn't
     covered by YouTube's timeline/scrubber overlay during playback. The only
-    gradient in the design is the bar's own fade-to-solid background; every
-    other element (rank, badge, stats) is flat-colored per the style config.
+    gradients in the design are the bar's own fade-to-solid top edge and its
+    mirrored solid-to-fade bottom edge; every other element (rank, badge,
+    stats) is flat-colored per the style config.
     """
     fb = style["font_bold"]
     fr = style["font_regular"]
@@ -93,15 +94,19 @@ def build_overlay_image(style, *, rank, title, artist, peak, release_date, month
     img = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # ── Gradient fade above the solid bar, then the solid bar itself ───────
-    # This is the only gradient in the whole design - everything else below
-    # (rank, stats, badge) is drawn with flat fills per the style constraints.
-    # Flat bar_color throughout - the fade is purely an alpha ramp, so only
-    # the mask varies down the strip.
+    # ── Gradient fades above and below the solid bar ────────────────────────
+    # Everything else (rank, stats, badge) is drawn with flat fills per the
+    # style constraints. Flat bar_color throughout - the fade is purely an
+    # alpha ramp, so only the mask varies down the strip. The bottom fade is
+    # just the top one flipped, so the bar dissolves into the footage below
+    # it the same way it dissolves in from above, instead of stopping dead
+    # at a hard rectangle edge.
     fade_img = Image.new("RGBA", (cw, fade_h), (*bar_color, 0))
     fade_img.putalpha(_valpha_ramp(cw, fade_h, bar_alpha))
     img.paste(fade_img, (0, fade_top), fade_img)
     draw.rectangle([0, bar_top, cw, bar_bottom], fill=(*bar_color, int(bar_alpha)))
+    bottom_fade_img = fade_img.transpose(Image.FLIP_TOP_BOTTOM)
+    img.paste(bottom_fade_img, (0, bar_bottom), bottom_fade_img)
 
     left_x  = bar["margin_left"]
     right_x = cw - bar["margin_right"]
