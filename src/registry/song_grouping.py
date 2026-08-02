@@ -109,7 +109,7 @@ _TRAILING_MARKER_RE = re.compile(
 
 _GROUP_PROMPT = """\
 You are grouping YouTube video titles that are different uploads of the SAME underlying \
-song (e.g. an official MV, a dance practice video, or a lyric/cover upload of the same song \
+song (e.g. an official MV, a dance practice video, or a lyric upload of the same song \
 all count as the same song). Do NOT group different songs together, even by the same artist - \
 titles that look similar or near-identical in English/romanization can still be different \
 songs. If a title includes Hangul (or other native-script) text, treat that text as the most \
@@ -117,8 +117,10 @@ reliable signal of song identity: compare it precisely, character by character, 
 titles' native-script text differs at all - including a small added qualifier like a number \
 or hanja - they are DIFFERENT songs, never the same song under a different title style. \
 Do NOT group promotional/behind-the-scenes content with the song itself, even from the same \
-release - album trailers, "making of" videos, photo session / behind-the-scenes footage, and \
-similar are NOT the song and must stay in their own singleton group. A re-arranged version of \
+release - album trailers, "making of"/"making video"/메이킹 videos, "MV Behind"/"Stage Behind"/\
+"Shooting Sketch"/비하인드/촬영 비하인드 footage, and similar are NOT the song and must stay in \
+their own singleton group, never merged into the real song's group even when the surrounding \
+title is otherwise identical. A re-arranged version of \
 a song is also a DIFFERENT song, not another upload of the original: remixes, acoustic \
 versions, instrumental versions, sped-up/slowed versions and similar re-workings each stay in \
 their own group, even when the title is otherwise identical to the original. Only group \

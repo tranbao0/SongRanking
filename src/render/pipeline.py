@@ -73,6 +73,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
 
     if chart_name:
         from charts import compute_chart
+        from shared.title_cleaner import clean_titles as clean_titles_fn
         csv_path = os.path.join("data", "charts", f"{chart_name}.csv")
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
         print(f'Computing chart "{chart_name}"...\n')
@@ -82,6 +83,8 @@ def run_pipeline(search=None, limit=None, no_filter=False,
             return
         history = load_history(csv_path)
         songs   = songs_from_search(results, history)
+        print("Cleaning up titles via AI...")
+        songs = clean_titles_fn(songs)
     elif search:
         csv_path = DATA_FILE
         from shared.title_cleaner import clean_titles as clean_titles_fn

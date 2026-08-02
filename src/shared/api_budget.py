@@ -63,10 +63,17 @@ def _save(data: dict) -> None:
 def _record(key: str, amount: int, limit: int, api_name: str) -> None:
     with _LOCK:
         data = _load()
-        projected = data.get(key, 0) + amount
+        previous = data.get(key, 0)
+        projected = previous + amount
         ratio = projected / limit
 
         if ratio >= STOP_THRESHOLD:
+            # Deliberately not printed here: callers hit this on every
+            # remaining chunk/request once the budget is gone (hundreds of
+            # times in one run), so raising and letting each caller report
+            # it once - rather than here, on every attempt - is what keeps
+            # this from flooding the log. See youtube_api.batch_fetch_metadata
+            # and gemini_client.call_gemini for the once-per-run prints.
             raise QuotaExceededError(
                 f"{api_name} usage would reach {projected}/{limit} ({ratio:.0%}) - "
                 f"stopping before the free-tier budget is exceeded."
@@ -75,7 +82,10 @@ def _record(key: str, amount: int, limit: int, api_name: str) -> None:
         data[key] = projected
         _save(data)
 
-        if ratio >= WARN_THRESHOLD:
+        # Edge-triggered (only the call that crosses the threshold prints),
+        # not level-triggered - otherwise every call for the rest of the day
+        # once past 80% repeats the same warning.
+        if ratio >= WARN_THRESHOLD > previous / limit:
             print(f"[api_budget] WARNING: {api_name} usage at {projected}/{limit} ({ratio:.0%})")
 
 

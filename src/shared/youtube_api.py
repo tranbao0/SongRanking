@@ -100,10 +100,16 @@ def _published_date(item: dict) -> date:
 
 
 def _meta_from_item(item: dict) -> dict:
-    """The metadata shape shared with the yt-dlp backend."""
+    """
+    The metadata shape shared with the yt-dlp backend. `duration` is 0 for
+    an item fetched without contentDetails in its `part` - present so
+    catalog.py's MV-duration check can share this fetch (and its yt-dlp
+    quota fallback) instead of running its own separate videos().list call.
+    """
     release_date = _published_date(item)
     return {
         "views":           int(item["statistics"].get("viewCount", 0)),
+        "duration":        parse_iso_duration(item.get("contentDetails", {}).get("duration", "")),
         "release_year":    release_date.year,
         "release_date":    release_date.strftime("%Y.%m.%d"),
         "years_on_chart":  max(1, date.today().year - release_date.year + 1),
@@ -120,14 +126,17 @@ def _search_result_from_item(item: dict) -> dict:
         "title":       item["snippet"]["title"],
         "uploader":    item["snippet"]["channelTitle"],
         "upload_date": item["snippet"].get("publishedAt", "")[:10],
-        "duration":    parse_iso_duration(item["contentDetails"].get("duration", "")),
         "url":         f"https://www.youtube.com/watch?v={video_id}",
     }
 
 
-def batch_fetch_metadata(urls: list[str], max_workers: int = 10) -> dict[str, dict]:
+def batch_fetch_metadata(urls: list[str], max_workers: int = 10, on_result=None) -> dict[str, dict]:
     """
-    Fetch metadata for many videos at once, returning {url: meta}.
+    Fetch metadata for many videos at once, returning {url: meta}. `meta`
+    includes `duration` (seconds) alongside the view/release fields, so
+    catalog.py's MV-duration check can share this fetch - and its yt-dlp
+    quota fallback below - instead of running a separate videos().list
+    call of its own.
 
     Packing IDs 50 to a request cuts quota use by up to 50x against
     fetching one at a time, and the packed requests are then run
@@ -138,6 +147,18 @@ def batch_fetch_metadata(urls: list[str], max_workers: int = 10) -> dict[str, di
     are simply absent from the result. Callers already treat a missing
     URL as "couldn't fetch, skip" (see chart_state.pre_fetch_all), so
     partial results degrade the same way a single dead video does.
+
+    A chunk that's turned away by the quota guard is not treated the same
+    as a dead video, though: its IDs are retried through yt-dlp (see
+    shared.metadata, which returns the identical {url: meta} shape) once
+    every chunk has had a chance to run, so a quota cutoff mid-batch
+    degrades to "slower" rather than "silently missing" for the rest of
+    that batch.
+
+    If given, on_result(url, meta) is called as each video's metadata
+    becomes available - once per completed 50-ID chunk on this path, and
+    per-video on the yt-dlp fallback - so a caller can persist progress
+    incrementally rather than only after the whole list resolves.
     """
     url_by_id: dict[str, str] = {}
     for url in urls:
@@ -146,18 +167,22 @@ def batch_fetch_metadata(urls: list[str], max_workers: int = 10) -> dict[str, di
         except ValueError:
             continue
 
-    def _fetch(chunk: list[str]) -> list[dict]:
+    def _fetch(chunk: list[str]) -> list[dict] | None:
         # Budget is checked per chunk rather than up front, and its
         # refusal is caught here rather than raised: chunks run
         # concurrently, so one hitting the limit must not discard results
-        # its siblings already fetched.
+        # its siblings already fetched. None (as opposed to an empty
+        # list) signals "blocked by budget", so the caller can tell that
+        # apart from "asked, and there was nothing there". Not printed
+        # here - once the budget is gone every remaining chunk hits this
+        # the same way, so the caller reports it once, after the loop,
+        # instead of once per chunk.
         try:
             api_budget.record_youtube_units(UNITS_PER_LIST)
-        except api_budget.QuotaExceededError as e:
-            print(f"  [youtube_api] {e}")
-            return []
+        except api_budget.QuotaExceededError:
+            return None
         response = get_client().videos().list(
-            part="statistics,snippet", id=",".join(chunk),
+            part="statistics,snippet,contentDetails", id=",".join(chunk),
         ).execute()
         return response.get("items", [])
 
@@ -165,11 +190,38 @@ def batch_fetch_metadata(urls: list[str], max_workers: int = 10) -> dict[str, di
     if not chunks:
         return {}
 
+    total_chunks = len(chunks)
+    # Only a large call needs a progress trickle - most calls resolve in a
+    # handful of chunks well within a second.
+    log_interval = max(1, total_chunks // 10)
+
     results: dict[str, dict] = {}
+    quota_blocked_ids: list[str] = []
+    done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        for items in pool.map(_fetch, chunks):
-            for item in items:
-                results[url_by_id[item["id"]]] = _meta_from_item(item)
+        for chunk, items in zip(chunks, pool.map(_fetch, chunks)):
+            if items is None:
+                quota_blocked_ids.extend(chunk)
+            else:
+                for item in items:
+                    url = url_by_id[item["id"]]
+                    meta = _meta_from_item(item)
+                    results[url] = meta
+                    if on_result:
+                        on_result(url, meta)
+            done += 1
+            if total_chunks > 20 and done % log_interval == 0:
+                print(f"  [youtube_api] ...{done}/{total_chunks} chunk(s) fetched")
+
+    if quota_blocked_ids:
+        from shared.metadata import batch_fetch_metadata as ytdlp_batch_fetch_metadata
+
+        fallback_urls = [url_by_id[vid] for vid in quota_blocked_ids]
+        print(f"  [youtube_api] Quota exhausted after {len(results)} video(s) - "
+              f"falling back to yt-dlp for the remaining {len(fallback_urls)}.")
+        results.update(ytdlp_batch_fetch_metadata(fallback_urls, max_workers=max_workers, on_result=on_result))
+
+    print(f"  [youtube_api] Fetched metadata for {len(results)}/{len(url_by_id)} video(s).")
     return results
 
 

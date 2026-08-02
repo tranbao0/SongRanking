@@ -121,10 +121,12 @@ class BatchFetchMetadataTest(unittest.TestCase):
 
         client, _ = self._client_returning([[_video(f"{i:011d}")] for i in range(3)])
         with mock.patch.object(api_budget, "record_youtube_units", side_effect=_record), \
-             mock.patch.object(youtube_api, "get_client", return_value=client):
+             mock.patch.object(youtube_api, "get_client", return_value=client), \
+             mock.patch("shared.metadata.batch_fetch_metadata", return_value={}) as ytdlp_fallback:
             result = youtube_api.batch_fetch_metadata(
                 [f"https://youtu.be/{i:011d}" for i in range(120)], max_workers=1)
         self.assertTrue(result, "results fetched before the limit must survive")
+        ytdlp_fallback.assert_called_once()  # the quota-blocked chunks, retried via yt-dlp
 
 
 class SearchTest(unittest.TestCase):

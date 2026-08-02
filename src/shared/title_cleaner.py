@@ -10,10 +10,17 @@ for whichever chunk failed - chunks are independent, so one bad response
 doesn't lose the whole batch.
 """
 
+import concurrent.futures
 import json
 
 from shared import gemini_client
 from shared.gemini_client import call_gemini, chunked
+
+# Chunks are independent - each cleans a disjoint slice of `songs` in place -
+# so running them concurrently only hides each call's network latency.
+# Capped the same as song_grouping's AI chunking so a large chart doesn't
+# open a burst wide enough to trip a rate limit.
+_CHUNK_WORKERS = 4
 
 _PROMPT_TEMPLATE = """\
 You clean up YouTube video metadata for a K-pop song ranking overlay.
@@ -62,14 +69,24 @@ def clean_titles(songs: list[dict]) -> list[dict]:
     """
     Call Gemini to clean up raw YouTube titles and uploader names, in
     small chunks rather than one large request (keeps each prompt
-    focused, and one bad/failed chunk doesn't affect the rest).
+    focused, and one bad/failed chunk doesn't affect the rest). Chunks
+    run concurrently since they're independent - see _CHUNK_WORKERS.
 
     Modifies the 'title' and 'artist' keys in-place on each song dict.
     Returns the same list (modified).
     """
     if not gemini_client.is_available():
         return songs
-    for chunk in chunked(songs):
-        _clean_chunk(chunk)
+
+    chunks = chunked(songs)
+    if len(chunks) <= 1:
+        for chunk in chunks:
+            _clean_chunk(chunk)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(_CHUNK_WORKERS, len(chunks))
+        ) as pool:
+            list(pool.map(_clean_chunk, chunks))
+
     print(f"  [title_cleaner] Cleaned {len(songs)} title(s) via Gemini.\n")
     return songs

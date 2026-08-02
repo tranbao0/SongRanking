@@ -87,6 +87,11 @@ def chunked(items: list, size: int = CHUNK_SIZE) -> list[list]:
 # reason for each would bury everything else in the log.
 _UNAVAILABLE_REPORTED = False
 
+# Same reasoning as _UNAVAILABLE_REPORTED: once the daily budget is gone,
+# every remaining chunk in the run hits it the same way, so this is
+# reported once rather than once per chunk.
+_QUOTA_REPORTED = False
+
 
 def is_available() -> bool:
     """
@@ -165,7 +170,10 @@ def call_gemini(prompt: str, model: str = MODEL) -> str | None:
         try:
             api_budget.record_gemini_request()
         except api_budget.QuotaExceededError as e:
-            print(f"  [gemini_client] {e}")
+            global _QUOTA_REPORTED
+            if not _QUOTA_REPORTED:
+                print(f"  [gemini_client] {e}")
+                _QUOTA_REPORTED = True
             return None
 
         try:
