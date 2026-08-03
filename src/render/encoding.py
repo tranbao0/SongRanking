@@ -148,6 +148,15 @@ def _build_overlay_phase_cmd(codec, raw_clip, overlay_png, cw, ch, fps, trim_sta
 # mismatch so the clip still concatenates cleanly with 1080p neighbors.
 _DOWNLOAD_FALLBACK_CLIENT = "android"
 
+# The cookies tier needs its own client rather than reusing
+# _DOWNLOAD_FALLBACK_CLIENT: yt-dlp outright refuses to pair the android
+# client with cookies ("Skipping client android since it does not support
+# cookies"), so a cookies-tier attempt that doesn't override the client
+# falls back to the default adaptive-format rotation - right back into the
+# same SABR wall the android tier exists to dodge. mweb accepts cookies and
+# still serves the same progressive format 18.
+_COOKIES_TIER_CLIENT = "mweb"
+
 
 def _probe_duration(path):
     """Always spawns ffprobe. Use _cached_duration for files known to be final."""
@@ -195,9 +204,73 @@ def cached_clip_path(url: str) -> str:
 
 
 def cached_clip(url: str) -> str | None:
-    """The cached raw clip for `url` if one's already been downloaded, else None."""
+    """
+    The cached raw clip for `url` if one's already been downloaded *and*
+    still probes as a real clip, else None. A stale entry can be corrupt/
+    empty - e.g. a previous run got killed mid-download - and existence
+    alone doesn't tell them apart, so this probes the same way download_song
+    validates a fresh attempt rather than trusting the file is there.
+    """
     path = cached_clip_path(url)
-    return path if os.path.exists(path) else None
+    if not os.path.exists(path):
+        return None
+    if _cached_duration(path) is None:
+        return None
+    return path
+
+
+def _parse_time_to_seconds(t):
+    """
+    `HH:MM:SS`/`MM:SS`/plain-seconds -> float seconds. download_song's
+    start/end come in either shape - the CSV default ("00:01:00") or
+    heatmap.pick_clip's already-numeric seconds - and the leading-silence
+    correction below needs to do arithmetic on them regardless of which one
+    a given caller passed in.
+    """
+    if ":" in t:
+        secs = 0.0
+        for part in t.split(":"):
+            secs = secs * 60 + float(part)
+        return secs
+    return float(t)
+
+
+_LEADING_SILENCE_NOISE_DB = "-50dB"
+_LEADING_SILENCE_MIN_DUR = 0.3
+
+
+def _leading_silence_duration(path, probe_window=8.0):
+    """
+    Seconds of true silence at the very start of `path`'s audio, or 0.0 if
+    none is detected (including on probe failure). Exists because heatmap.
+    pick_clip starts a clip 1 second before the video's "most replayed"
+    spike - usually the chorus/drop - and plenty of songs have a real
+    production pause right before that downbeat, so the clip's own audio
+    sometimes opens on dead air instead of content. That's inaudible on its
+    own clip but lands right where the crossfade into it happens, so the
+    transition appears to fade into silence and then hard-cut into the song
+    a second or two later. See download_song's use of this.
+    """
+    # silencedetect logs its findings at ffmpeg's *info* level, not error -
+    # "-v error" (used everywhere else in this file) would silently discard
+    # the very lines this function parses, so this call needs its own,
+    # more permissive verbosity instead.
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-t", str(probe_window), "-i", path,
+         "-af", f"silencedetect=noise={_LEADING_SILENCE_NOISE_DB}:d={_LEADING_SILENCE_MIN_DUR}",
+         "-f", "null", "-"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    for line in result.stderr.splitlines():
+        m = re.search(r"silence_start:\s*([\d.]+)", line)
+        if m:
+            if float(m.group(1)) > 0.05:
+                return 0.0  # silence starts mid-clip, not at the head - nothing to correct
+            continue
+        m = re.search(r"silence_end:\s*[\d.]+\s*\|\s*silence_duration:\s*([\d.]+)", line)
+        if m:
+            return float(m.group(1))
+    return 0.0
 
 
 def download_song(rank, url, start="00:01:00", end="00:01:15"):
@@ -216,12 +289,12 @@ def download_song(rank, url, start="00:01:00", end="00:01:15"):
     os.makedirs(RAW_CACHE_DIR, exist_ok=True)
     raw_clip = cached_clip_path(url)
 
-    def _attempt(extra_args):
+    def _attempt(extra_args, window_start=start, window_end=end):
         throttle()
         result = subprocess.run([
             "yt-dlp",
-            "--download-sections", f"*{start}-{end}",
-            "-S", "res:1080,vcodec:h264,ext:mp4:m4a",
+            "--download-sections", f"*{window_start}-{window_end}",
+            "-S", "res:1440,vcodec:h264,ext:mp4:m4a",
             *extra_args,
             "--no-playlist",
             "-o", raw_clip,
@@ -254,9 +327,29 @@ def download_song(rank, url, start="00:01:00", end="00:01:15"):
         result = _attempt(["--extractor-args", f"youtube:player_client={_DOWNLOAD_FALLBACK_CLIENT}"])
     if result.returncode != 0:
         _log(f"  [rank {rank}] '{_DOWNLOAD_FALLBACK_CLIENT}' client failed, retrying with cookies...")
-        result = _attempt(cookie_args())
+        result = _attempt(["--extractor-args", f"youtube:player_client={_COOKIES_TIER_CLIENT}", *cookie_args()])
     if result.returncode != 0:
         raise RuntimeError(f"DOWNLOAD failed (yt-dlp exit {result.returncode}): {result.stderr[-500:]}")
+
+    # One corrective pass for leading silence (see _leading_silence_duration).
+    # Capped at half the window so a clip that's genuinely mostly silent
+    # (a broken download, not just a pre-drop pause) doesn't get shifted
+    # arbitrarily far from the section heatmap.pick_clip actually chose.
+    window_span = _parse_time_to_seconds(end) - _parse_time_to_seconds(start)
+    silence = _leading_silence_duration(raw_clip)
+    if 0 < silence < window_span * 0.5:
+        shifted_start = _parse_time_to_seconds(start) + silence
+        shifted_end = _parse_time_to_seconds(end) + silence
+        _log(f"  [rank {rank}] {silence:.2f}s of leading silence - re-downloading shifted forward...")
+        # --force-overwrites: this attempt targets the same raw_clip path the
+        # already-successful first attempt just wrote, so without it yt-dlp
+        # sees the destination file already exists and silently skips the
+        # download instead of replacing it with the shifted window.
+        shifted = _attempt(["--force-overwrites"], window_start=f"{shifted_start:.2f}", window_end=f"{shifted_end:.2f}")
+        if shifted.returncode == 0:
+            result = shifted
+        else:
+            _log(f"  [rank {rank}] shifted re-download failed, keeping original clip")
 
     return raw_clip
 

@@ -13,6 +13,16 @@ than what belongs to a genre, so it kept introducing acts from other
 genres entirely, and their uploads are labelled impeccably enough by
 their own labels that no title-level filter could tell them apart. The
 channels it found that were worth keeping are curated in the manual yaml.
+
+A third yaml, `<genre>_manual_videos.yaml`, pins individual videos rather
+than whole channels - for a genre song that sits on a channel which is
+mostly something else entirely (a movie studio's channel, a late-night
+show's channel), where adding the channel via the manual yaml above would
+pull in everything else it has ever posted. Each pinned video still needs
+a row in `channels` (videos have a NOT NULL FK to it), so one is
+synthesized here with source "manual_video" - catalog.py recognizes that
+source and fetches only the pinned video ID(s) for it, never that
+channel's upload history.
 """
 
 from datetime import date
@@ -56,12 +66,44 @@ def _excluded_channel_ids(genre: str) -> set[str]:
     return {e["channel_id"] if isinstance(e, dict) else e for e in entries}
 
 
+def manual_videos(genre: str) -> list[dict]:
+    """
+    Individually pinned videos for `genre`, from `<genre>_manual_videos.yaml`.
+    Each entry names the real channel that uploaded it - catalog.py uses
+    that to fetch just this video rather than the channel's history.
+    """
+    entries = _load_yaml_list(CHANNELS_DIR / f"{genre}_manual_videos.yaml")
+    return [
+        {
+            "video_id":     e["video_id"],
+            "channel_id":   e["channel_id"],
+            "genre":        genre,
+            "display_name": e.get("display_name", e["video_id"]),
+        }
+        for e in entries
+    ]
+
+
 def discover_genre(genre: str) -> list[dict]:
     """
     Cross-reference all sources for one genre and return the merged,
     de-duplicated, exclude-filtered channel list (not yet persisted).
     """
     merged: dict[str, dict] = {}
+
+    # Lowest priority: a placeholder so a pinned video's channel has
+    # somewhere to live (see module docstring). setdefault, not
+    # assignment - a channel that's also tracked in full below keeps that
+    # fuller entry, since its normal walk already reaches the pinned video.
+    for video in manual_videos(genre):
+        merged.setdefault(video["channel_id"], {
+            "channel_id":   video["channel_id"],
+            "genre":        genre,
+            "display_name": f"{video['display_name']} (pinned video only)",
+            "source":       "manual_video",
+            "source_ref":   None,
+            "added_date":   date.today().isoformat(),
+        })
 
     for entry in wikidata.discover_channels(genre):
         merged[entry["channel_id"]] = entry

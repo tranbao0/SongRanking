@@ -1,6 +1,6 @@
 """
 YouTube "most replayed" heatmap detection, used to pick where a song's
-15-second clip starts instead of a fixed 00:01:00.
+clip starts instead of a fixed 00:01:00.
 
 YouTube's own web player shows a heat graph under the scrubber built from
 per-segment replay intensity ("heat markers") baked into the same watch-page
@@ -27,9 +27,17 @@ import yt_dlp
 
 from shared.ytdlp_throttle import throttle, COOKIES_BROWSER, COOKIES_FILE
 
-CLIP_DURATION  = 15.0
-HEAT_THRESHOLD = 0.6
+CLIP_DURATION  = 20.0
+HEAT_THRESHOLD = 0.7
 DEFAULT_START  = 60.0  # matches the old fixed 00:01:00
+
+# A heat marker in these opening seconds is usually the logo/intro bump or
+# an autoplay scrub-back artifact, not a real "most replayed" moment - and
+# picking it verbatim (start_time - 1.0) can land the clip right on 00:00,
+# which looks like a broken/empty cold open. Excluded from candidates
+# entirely so a picked clip never opens that early, no matter how hot the
+# marker is.
+MIN_SECTION_START = 3.0
 
 
 def _extract_info(url, player_client=None, use_cookies=False):
@@ -94,12 +102,18 @@ def pick_clip(url, clip_duration=CLIP_DURATION, default_start=DEFAULT_START):
     Pick a `clip_duration`-second (start, end) window in seconds to download
     for `url`.
 
-    When a heatmap is available: collapses it into hot sections (>=
-    HEAT_THRESHOLD intensity), rolls a dice among them if there's more than
-    one, then starts the clip 1 second before that section begins rather
-    than exactly on top of it. Falls back to the video's single hottest
-    marker if no section clears the threshold, and to `default_start` if
-    the video has no heatmap at all or extraction fails outright.
+    When a heatmap is available: prefers markers at or after
+    MIN_SECTION_START (see its comment), collapsing them into hot sections
+    (>= HEAT_THRESHOLD intensity) and rolling a dice among them if there's
+    more than one, then starting the clip 1 second before that section
+    begins rather than exactly on top of it. Falls back to the single
+    hottest marker at or after MIN_SECTION_START if no section clears the
+    threshold there. Only if the video's heat data is entirely confined to
+    its opening seconds does it fall back further, to the hottest marker
+    overall - still floored to MIN_SECTION_START so the clip never opens on
+    00:00. `default_start` is reserved for when the video has no heatmap at
+    all, or extraction fails outright - never as a substitute for real heat
+    data just because it happened to cluster near the start.
     """
     try:
         heatmap, duration = _fetch_heatmap(url)
@@ -109,12 +123,15 @@ def pick_clip(url, clip_duration=CLIP_DURATION, default_start=DEFAULT_START):
     if not heatmap:
         return default_start, default_start + clip_duration
 
-    sections = _hot_sections(heatmap)
-    section = random.choice(sections) if sections else max(heatmap, key=lambda p: p["value"])
+    candidates = [p for p in heatmap if p["start_time"] >= MIN_SECTION_START]
+    pool = candidates or heatmap
 
-    start = max(section["start_time"] - 1.0, 0.0)
+    sections = _hot_sections(pool)
+    section = random.choice(sections) if sections else max(pool, key=lambda p: p["value"])
+
+    start = max(section["start_time"] - 1.0, MIN_SECTION_START)
     end   = start + clip_duration
     if duration and end > duration:
         end   = duration
-        start = max(end - clip_duration, 0.0)
+        start = max(end - clip_duration, MIN_SECTION_START)
     return start, end

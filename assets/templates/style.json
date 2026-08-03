@@ -13,15 +13,16 @@
     "overlay_type":      "wiperight",
     "overlay_exit_type": "wipeleft",
     "overlay_duration":  0.5,
-    "duration":          1.0
+    "duration":          0.6
   },
 
   "bar": {
-    "solid_height":   150,
-    "fade_height":    76,
-    "bottom_margin":  40,
+    "solid_height":   132,
+    "fade_height":    18,
+    "bottom_margin":  50,
     "color":          [8, 9, 18],
     "opacity":        0.93,
+    "opacity_right":  0.15,
     "margin_left":    48,
     "margin_right":   48,
     "padding_top":    18,
@@ -39,8 +40,8 @@
   "rank_change": {
     "chip_gap":   22,
     "fontsize":   22,
-    "color_up":   [0, 255, 136],
-    "color_down": [255, 68, 68],
+    "color_up":   [110, 231, 183],
+    "color_down": [248, 113, 113],
     "color_same": [170, 170, 170]
   },
 
@@ -74,8 +75,8 @@
       {"key": "months",    "label": "MONTHS ON CHARTS:",   "value_color": [105, 255, 113]},
       {"key": "views",     "label": "VIEWS:",              "value_color": [255, 215, 0]}
     ],
-    "delta_color_up":   [0, 255, 136],
-    "delta_color_down": [255, 68, 68]
+    "delta_color_up":   [110, 231, 183],
+    "delta_color_down": [248, 113, 113]
   },
 
   "badge": {

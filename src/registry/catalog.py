@@ -25,15 +25,20 @@ different: it shares youtube_api.batch_fetch_metadata with snapshot.py's
 view-count fetch, so a chunk the quota guard turns away falls back to
 yt-dlp (see _fetch_durations) instead of ending the run over what's
 usually the smaller half of a channel's quota cost.
+
+A channel tracked via discovery.py's manual-videos yaml (source
+"manual_video") skips all of the above: it never lists a playlist, is
+never MV-filtered, and is handled by _sync_manual_video_channel instead -
+see that function's docstring.
 """
 
 import re
 from datetime import date, datetime
 
-from registry import db, song_grouping
+from registry import db, discovery, song_grouping
 from shared import api_budget
 from shared.mv_filter import is_blocked_title, is_valid_mv
-from shared.youtube_api import batch_fetch_metadata, get_client
+from shared.youtube_api import batch_fetch_metadata, chunked_ids, get_client
 
 # Channels above this video count are treated as likely shared/label
 # channels (e.g. "HYBE LABELS" or "1theK" hosting many different acts)
@@ -247,6 +252,75 @@ def _confirmed_artists(conn) -> tuple[dict[str, list[tuple[str, re.Pattern]]], d
     return patterns, home_channels
 
 
+def _sync_manual_video_channel(
+    conn, youtube, channel_id: str, genre: str, sibling_channel_ids: list[str],
+) -> int:
+    """
+    Fetch only this channel's individually pinned videos (discovery.py's
+    manual-videos yaml) - never its upload history, since a "manual_video"
+    source channel is typically mostly a different genre (a movie studio,
+    a late-night show) and only one specific upload belongs here.
+
+    `sibling_channel_ids` are every other "manual_video" channel in this
+    genre, folded into the grouping context alongside this channel's own
+    existing videos. Pinned videos of the same song routinely land on
+    different real channels - a studio's official upload and a talk
+    show's performance clip of it - and group_channel_videos only ever
+    compares videos it's handed together, so without this a per-channel
+    call could never recognize the two as one song. Skips MV title/
+    duration filtering entirely: a pinned video is already a deliberate,
+    one-by-one human choice, unlike a channel walk's mv_filter heuristics.
+    """
+    pinned = discovery.manual_videos(genre)
+    own_pinned_ids = {v["video_id"] for v in pinned if v["channel_id"] == channel_id}
+    existing = _existing_videos(conn, channel_id)
+    known_ids = {r["video_id"] for r in existing}
+    new_ids = [vid for vid in own_pinned_ids if vid not in known_ids]
+    if not new_ids:
+        return 0
+
+    details: dict[str, dict] = {}
+    for chunk in chunked_ids(new_ids):
+        response = youtube.videos().list(part="snippet", id=",".join(chunk)).execute()
+        api_budget.record_youtube_units(1)
+        for item in response.get("items", []):
+            details[item["id"]] = item["snippet"]
+
+    new_video_dicts = [
+        {
+            "video_id":      vid,
+            "title":         details[vid]["title"],
+            "url":           f"https://www.youtube.com/watch?v={vid}",
+            "published_at":  details[vid]["publishedAt"],
+            "discovered_at": date.today().isoformat(),
+        }
+        for vid in new_ids if vid in details
+    ]
+    if not new_video_dicts:
+        return 0
+
+    sibling_existing = []
+    for sibling_id in sibling_channel_ids:
+        if sibling_id != channel_id:
+            sibling_existing.extend(_existing_videos(conn, sibling_id))
+
+    song_map = song_grouping.group_channel_videos(conn, channel_id, existing + sibling_existing, new_video_dicts)
+    rows_to_upsert = [
+        {**v, "channel_id": channel_id, "song_id": song_map.get(v["video_id"])}
+        for v in new_video_dicts
+    ]
+    conn.executemany(
+        """
+        INSERT INTO videos (video_id, channel_id, title, url, published_at, discovered_at, song_id)
+        VALUES (:video_id, :channel_id, :title, :url, :published_at, :discovered_at, :song_id)
+        ON CONFLICT(video_id) DO UPDATE SET title=excluded.title, song_id=excluded.song_id
+        """,
+        rows_to_upsert,
+    )
+    conn.commit()
+    return len(new_video_dicts)
+
+
 def sync_videos(channel_ids: list[str] | None = None, genres: list[str] | None = None) -> int:
     """
     Discover new uploads for the given channels (all tracked channels,
@@ -298,10 +372,25 @@ def sync_videos(channel_ids: list[str] | None = None, genres: list[str] | None =
         upserted = 0
         processed = 0
 
+        manual_video_siblings: dict[str, list[str]] = {}
+        for row in rows:
+            if row["source"] == "manual_video":
+                manual_video_siblings.setdefault(row["genre"], []).append(row["channel_id"])
+
         for i, row in enumerate(rows, start=1):
             channel_id = row["channel_id"]
             progress = f"[catalog {i}/{total}]"
             try:
+                if row["source"] == "manual_video":
+                    added = _sync_manual_video_channel(
+                        conn, youtube, channel_id, row["genre"], manual_video_siblings[row["genre"]],
+                    )
+                    _mark_synced(conn, channel_id, None)
+                    upserted += added
+                    processed += 1
+                    print(f"  {progress} {channel_id}: pinned video(s) checked, {added} new upserted")
+                    continue
+
                 playlist_id, video_count = _channel_status(youtube, channel_id)
                 if playlist_id is None:
                     print(f"  {progress} {channel_id}: no uploads playlist (channel deleted/private?), skipping")

@@ -1,0 +1,41 @@
+# Individually pinned kpop videos - for a song that sits on a channel
+# which is mostly a *different* genre (a movie studio, a late-night talk
+# show), where adding the whole channel to kpop_manual.yaml would also
+# pull in everything else that channel has ever posted.
+#
+# - video_id: xxxxxxxxxxx
+#   channel_id: UCxxxxxxxxxxxxxxxxxxxxxx
+#   display_name: Free-text label, for readability only (not matched against anything)
+#
+# Unlike kpop_manual.yaml, catalog.py never walks this channel's upload
+# history - it fetches only the video_id(s) pinned to it here, and skips
+# MV title/duration filtering entirely (a pinned video is already a
+# deliberate one-by-one choice).
+
+# KPop Demon Hunters (Netflix, 2025) - official soundtrack videos, on
+# Sony Pictures Animation's channel (not otherwise kpop).
+- video_id: yebNIHKAC4A
+  channel_id: UCnLuLSV-Oi0ctqjxGgxFlmg
+  display_name: HUNTR/X - Golden
+- video_id: 983bBbJx0Mk
+  channel_id: UCnLuLSV-Oi0ctqjxGgxFlmg
+  display_name: Saja Boys - Soda Pop
+- video_id: QGsevnbItdU
+  channel_id: UCnLuLSV-Oi0ctqjxGgxFlmg
+  display_name: HUNTR/X - How It's Done
+- video_id: l8Dr7vzMSVE
+  channel_id: UCnLuLSV-Oi0ctqjxGgxFlmg
+  display_name: HUNTR/X - Takedown (feat. TWICE)
+- video_id: cWppAbqm9I8
+  channel_id: UCnLuLSV-Oi0ctqjxGgxFlmg
+  display_name: Saja Boys - Your Idol
+- video_id: TbMEMCvFbZk
+  channel_id: UCnLuLSV-Oi0ctqjxGgxFlmg
+  display_name: HUNTR/X - What It Sounds Like
+
+# Deliberately no talk-show/awards-show performance clips here (Tonight
+# Show, Kimmel, Oscars, etc. all exist for "Golden"). No other song in
+# the registry has its broadcaster performances tracked - that class of
+# content isn't reachable through any artist's own or label channel, so
+# adding it here but not everywhere else would count this soundtrack by
+# a looser standard than every other song on the chart.

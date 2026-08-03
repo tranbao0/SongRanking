@@ -2,7 +2,7 @@ import json
 import unicodedata
 from functools import lru_cache
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 
 def load_style(path="assets/templates/style.json"):
@@ -47,6 +47,20 @@ def _text_w(draw, font, text):
     return _measure(draw, font, text)[2]
 
 
+def _draw_baseline(draw, x, baseline_y, text, font, fill):
+    """
+    Draw `text` with its left edge at x and its baseline at baseline_y, then
+    return its advance width. Used for runs of mixed-size text that need to
+    read as one line (title + "by" + artist) - centering each piece on its
+    own ink bbox instead would drift them apart, since bbox height depends
+    on the specific string (a bare-caps title has no descender; "by" does),
+    so same-sized text ends up sitting at visibly different heights.
+    """
+    text = unicodedata.normalize("NFC", text)
+    draw.text((x, baseline_y), text, font=font, fill=fill, anchor="ls")
+    return draw.textlength(text, font=font)
+
+
 def _valpha_ramp(width, height, max_alpha):
     """
     A width x height 8-bit mask ramping 0 -> max_alpha top to bottom, each
@@ -58,6 +72,21 @@ def _valpha_ramp(width, height, max_alpha):
     column = Image.new("L", (1, max(height, 1)))
     column.putdata([int(max_alpha * (y / max(height - 1, 1))) for y in range(height)])
     return column.resize((max(width, 1), max(height, 1)), Image.NEAREST)
+
+
+def _halpha_ramp(width, height, max_alpha, min_alpha):
+    """
+    A width x height 8-bit mask ramping max_alpha -> min_alpha left to
+    right, each column a single flat value - the horizontal counterpart to
+    _valpha_ramp, built one pixel tall and stretched with NEAREST for the
+    same reason (only the height changes, so no resampling needed).
+    """
+    row = Image.new("L", (max(width, 1), 1))
+    row.putdata([
+        int(max_alpha + (min_alpha - max_alpha) * (x / max(width - 1, 1)))
+        for x in range(width)
+    ])
+    return row.resize((max(width, 1), max(height, 1)), Image.NEAREST)
 
 
 def _fit_fontsize(draw, font_path, text, max_width, start_size, min_size):
@@ -99,18 +128,30 @@ def build_overlay_image(style, *, rank, title, artist, peak, release_date, month
     fade_top = bar_top - fade_h
     bar_color = _rgb(bar["color"])
     bar_alpha = bar["opacity"] * 255
+    # The whole bar - fades and solid alike - also dims left to right, down
+    # to this floor at the right edge, so it reads as one long horizontal
+    # blur rather than a uniform-opacity rectangle with only its top/bottom
+    # edges soft.
+    min_alpha = bar_alpha * bar.get("opacity_right", 1.0)
 
     img = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
     # ── Gradient fades above and below the solid bar ────────────────────────
     # Everything else (rank, stats, badge) is drawn with flat fills per the
-    # style constraints. Flat bar_color throughout - the fade is purely an
-    # alpha ramp, so only the mask varies down the strip.
+    # style constraints. Each region's alpha is the product of its vertical
+    # fraction ramp (0->1 for the top fade, flat 1 for the solid strip, 1->0
+    # for the bottom fade) and the shared horizontal ramp - ImageChops.
+    # multiply does that per-pixel product directly on the 8-bit masks.
+    h_fade_top = _halpha_ramp(cw, fade_h, bar_alpha, min_alpha)
+    v_fade_top = _valpha_ramp(cw, fade_h, 255)
     fade_img = Image.new("RGBA", (cw, fade_h), (*bar_color, 0))
-    fade_img.putalpha(_valpha_ramp(cw, fade_h, bar_alpha))
+    fade_img.putalpha(ImageChops.multiply(v_fade_top, h_fade_top))
     img.paste(fade_img, (0, fade_top), fade_img)
-    draw.rectangle([0, bar_top, cw, bar_bottom], fill=(*bar_color, int(bar_alpha)))
+
+    solid_img = Image.new("RGBA", (cw, solid_h), (*bar_color, 0))
+    solid_img.putalpha(_halpha_ramp(cw, solid_h, bar_alpha, min_alpha))
+    img.paste(solid_img, (0, bar_top), solid_img)
 
     # The bottom fade is capped to bottom_margin (rather than reusing fade_h
     # like the top fade does) so it always finishes dissolving to fully
@@ -120,10 +161,10 @@ def build_overlay_image(style, *, rank, title, artist, peak, release_date, month
     # box instead of the bar bleeding into the footage below it.
     bottom_fade_h = min(fade_h, bottom_margin)
     if bottom_fade_h > 0:
+        h_fade_bottom = _halpha_ramp(cw, bottom_fade_h, bar_alpha, min_alpha)
+        v_fade_bottom = _valpha_ramp(cw, bottom_fade_h, 255).transpose(Image.FLIP_TOP_BOTTOM)
         bottom_fade_img = Image.new("RGBA", (cw, bottom_fade_h), (*bar_color, 0))
-        bottom_fade_img.putalpha(
-            _valpha_ramp(cw, bottom_fade_h, bar_alpha).transpose(Image.FLIP_TOP_BOTTOM)
-        )
+        bottom_fade_img.putalpha(ImageChops.multiply(v_fade_bottom, h_fade_bottom))
         img.paste(bottom_fade_img, (0, bar_bottom), bottom_fade_img)
 
     left_x  = bar["margin_left"]
@@ -154,13 +195,14 @@ def build_overlay_image(style, *, rank, title, artist, peak, release_date, month
     max_title_w = right_x - text_x - t["max_width_reserve"]
 
     title_font  = _font(fb, t["fontsize"])
-    sep_font    = _font(fr, t["artist_fontsize"])
+    # "by" always renders in the artist's own font/size, never the title's -
+    # it's part of the same visual unit as the artist name, not the title.
     artist_font = _font(fr, t["artist_fontsize"])
 
     # The separator and artist are fixed for the whole loop, so they're
     # measured once instead of re-measured on every character dropped.
     artist_text = artist.upper()
-    fixed_w = _text_w(draw, sep_font, t["separator"]) + _text_w(draw, artist_font, artist_text)
+    fixed_w = _text_w(draw, artist_font, t["separator"]) + _text_w(draw, artist_font, artist_text)
 
     display_title = title
     full_w = _text_w(draw, title_font, display_title) + fixed_w
@@ -183,8 +225,14 @@ def build_overlay_image(style, *, rank, title, artist, peak, release_date, month
     title_h = sum(title_font.getmetrics())
     value_h = sum(value_font.getmetrics())
 
-    row1_y = content_top
-    row1_center_y = row1_y + title_h / 2
+    # Centered in the padded content area rather than pinned to content_top:
+    # the block's actual height (from fixed font metrics) is smaller than
+    # the space padding_top/padding_bottom leave for it, so anchoring to the
+    # top dumped all that slack below row 2 - title hugging the bar's top
+    # edge while a visibly empty gap sat under the stats row.
+    block_h = title_h + style["row_gap"] + value_h
+    row1_y = content_top + max(0, (content_bottom - content_top - block_h) / 2)
+    row1_baseline = row1_y + title_font.getmetrics()[0]
     row2_y = row1_y + title_h + style["row_gap"]
     row2_center_y = row2_y + value_h / 2
     block_bottom = row2_y + value_h
@@ -211,17 +259,16 @@ def build_overlay_image(style, *, rank, title, artist, peak, release_date, month
     draw.line([(div_x, row1_y), (div_x, block_bottom)],
               fill=_rgba(d["color"], d["alpha"]), width=d["width"])
 
-    # ── Row 1: title • artist ───────────────────────────────────────────────
-    tw, th = _draw_text(draw, text_x, row1_center_y - title_h / 2, display_title, title_font, _rgba(t["color"]))
-
-    sep_h = _measure(draw, sep_font, t["separator"])[3]
+    # ── Row 1: title, then "by" + artist sharing one baseline ──────────────
+    # All three pieces sit on row1_baseline rather than each being centered
+    # on its own ink bbox, so "by ARTIST" (smaller, regular weight) reads as
+    # part of the same text line as the title instead of floating at a
+    # slightly different height. "by" always uses artist_font (same size/
+    # weight as the artist name), never the title's font.
+    tw = _draw_baseline(draw, text_x, row1_baseline, display_title, title_font, _rgba(t["color"]))
     sep_x = text_x + tw
-    sw, _ = _draw_text(draw, sep_x, row1_center_y - sep_h / 2, t["separator"], sep_font,
-                        _rgba(t["separator_color"]))
-
-    artist_h = _measure(draw, artist_font, artist_text)[3]
-    _draw_text(draw, sep_x + sw, row1_center_y - artist_h / 2, artist_text, artist_font,
-               _rgba(t["artist_color"]))
+    sw = _draw_baseline(draw, sep_x, row1_baseline, t["separator"], artist_font, _rgba(t["separator_color"]))
+    _draw_baseline(draw, sep_x + sw, row1_baseline, artist_text, artist_font, _rgba(t["artist_color"]))
 
     # ── Row 2: stats as plain label + value groups (no dots, no sub-boxes) ─
     values = {
@@ -245,7 +292,7 @@ def build_overlay_image(style, *, rank, title, artist, peak, release_date, month
 
         if key == "views" and views_gained is not None:
             sign = "+" if views_gained >= 0 else ""
-            delta_text = f" {sign}{views_gained:,}"
+            delta_text = f" ({sign}{views_gained:,})"
             up = views_gained >= 0
             delta_color = st["delta_color_up"] if up else st["delta_color_down"]
             dh = _measure(draw, delta_font, delta_text)[3]

@@ -13,6 +13,7 @@ Three components: a discovery/data layer, a chart engine, and a render pipeline.
 - [Guide: adding a new genre](#guide-adding-a-new-genre)
 - [Guide: adding or customizing a chart](#guide-adding-or-customizing-a-chart)
 - [Guide: manual channel curation](#guide-manual-channel-curation)
+- [Guide: pinning individual videos](#guide-pinning-individual-videos)
 - [Guide: keeping song grouping accurate](#guide-keeping-song-grouping-accurate)
 - [API spend safeguards](#api-spend-safeguards)
 - [yt-dlp bot-check fallback](#yt-dlp-bot-check-fallback)
@@ -244,6 +245,22 @@ That matters because charts read videos joined to channels, so an excluded chann
 Only official artist, label, distributor or broadcaster channels belong in the manual file.
 Fan lyric-video channels and re-uploaders carry the right genre but the wrong uploads: their views are separate from the official release, so counting them splits a song's audience across copies instead of measuring it.
 
+## Guide: pinning individual videos
+
+Sometimes exactly one song lives on a channel that's mostly a *different* genre entirely - a movie studio's channel, a late-night talk show's channel - so adding it to `<genre>_manual.yaml` would also adopt everything else that channel has ever posted (trailers, unrelated interviews, other shows' clips). `data/channels/<genre>_manual_videos.yaml` pins the individual video ID(s) instead:
+
+```yaml
+- video_id: xxxxxxxxxxx
+  channel_id: UCxxxxxxxxxxxxxxxxxxxxxx
+  display_name: Free-text label, for readability only
+```
+
+`sync` still needs a `channels` row for the video's real channel (videos have a foreign key to it), so one is created automatically with `source: manual_video` - but that channel's upload history is never walked, and its pinned video(s) skip the MV title/duration filter entirely (a pinned video is already a deliberate, one-by-one choice, not something a heuristic should second-guess).
+
+Keep this to the same *kind* of channel `<genre>_manual.yaml` already allows - a label, distributor, or other channel acting as the release's own official source - not a talk show or awards show's performance clip of it. No song in the registry has its broadcaster performances tracked, since that content isn't reachable through any artist's own or label channel; pinning it for one song but not the rest would count that song by a looser standard than everything else on the chart. (If a pinned song's official upload and another pinned upload of the same song end up on two different channels regardless, `sync` does still share grouping context across every `manual_video` channel in a genre, so they merge into one entry rather than charting separately.)
+
+Real example, from `data/channels/kpop_manual_videos.yaml`: the *KPop Demon Hunters* soundtrack sits on Sony Pictures Animation's channel, which otherwise posts unrelated film content and would never be added there as a full manual channel.
+
 ## Guide: keeping song grouping accurate
 
 `sync`'s deterministic + AI grouping tiers (see [Architecture](#architecture)) handle the common case cheaply, but they are structurally limited, not just imperfectly tuned:
@@ -359,6 +376,7 @@ Errors that cannot succeed - a bad key, a malformed request - are not retried at
 | `data/registry.db` | SQLite: channels, videos, songs (same-song groupings), view_snapshots. Git-ignored. |
 | `data/channels/<genre>_manual.yaml` | Hand-curated channel additions per genre. Tracked in git. |
 | `data/channels/<genre>_exclude.yaml` | Hand-curated channel exclusions per genre. Tracked in git. |
+| `data/channels/<genre>_manual_videos.yaml` | Hand-curated individually pinned videos per genre. Tracked in git. |
 | `data/charts.yaml` | Named chart definitions. Tracked in git. |
 | `data/songs.csv` | Legacy manual/search workflow's working file and run-history. Tracked in git. |
 | `data/charts/<chart_name>.csv` | Per-chart working file and run-history, one per entry in `charts.yaml`. |
