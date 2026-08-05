@@ -8,8 +8,10 @@ only thing that actually states that.
 """
 
 import sqlite3
+import tempfile
 import unittest
 from datetime import date
+from pathlib import Path
 from unittest import mock
 
 from .context import make_db, add_channel, add_video, add_snapshot
@@ -143,8 +145,8 @@ class TakeSnapshotPendingTest(unittest.TestCase):
 
     def test_ungrouped_videos_are_never_fetched(self):
         """
-        song_id NULL means a blocked non-song upload (or one mid-regroup
-        after a decouple) - never a real song, so it must not cost a fetch.
+        song_id NULL means a real video awaiting (re-)grouping - not yet
+        chartable, so it must not cost a fetch until it's grouped.
         """
         add_video(self.conn, "blocked", "UC_a", song_id=None)
         self.conn.commit()
@@ -153,6 +155,223 @@ class TakeSnapshotPendingTest(unittest.TestCase):
         self.assertEqual(inserted, 3)
         requested = set(fetch.call_args[0][0])
         self.assertNotIn("https://www.youtube.com/watch?v=blocked", requested)
+
+
+class LocalBackupTest(unittest.TestCase):
+    """
+    Guards pull_to_local()'s pre-overwrite backup: a pull replaces the local
+    working copy wholesale with Turso's current state, so without a backup,
+    whatever not-yet-pushed local work it clobbers would be unrecoverable.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.data_dir = Path(self.tmpdir.name)
+        patcher = mock.patch.object(db, "LOCAL_WORKING_DB_PATH", self.data_dir / ".registry_working.db")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _backups(self):
+        return sorted(self.data_dir.glob("registry.*.pre-pull.db"))
+
+    def test_no_op_when_no_local_file_exists_yet(self):
+        db._backup_and_prune_local()
+        self.assertEqual(self._backups(), [])
+
+    def test_backs_up_the_existing_local_file(self):
+        db.LOCAL_WORKING_DB_PATH.write_text("working copy contents")
+        db._backup_and_prune_local()
+        backups = self._backups()
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), "working copy contents")
+
+    def test_keeps_only_the_3_most_recent_backups(self):
+        for ts in ("20260101-000000", "20260101-000001", "20260101-000002", "20260101-000003"):
+            (self.data_dir / f"registry.{ts}.pre-pull.db").write_text("old")
+        db.LOCAL_WORKING_DB_PATH.write_text("current")
+
+        db._backup_and_prune_local()
+
+        names = {p.name for p in self._backups()}
+        self.assertEqual(len(names), 3)
+        self.assertNotIn("registry.20260101-000000.pre-pull.db", names)
+        self.assertNotIn("registry.20260101-000001.pre-pull.db", names)
+        self.assertIn("registry.20260101-000003.pre-pull.db", names, "newest pre-seeded backup must survive")
+
+    def test_pull_to_local_backs_up_before_overwriting(self):
+        db.LOCAL_WORKING_DB_PATH.write_text("stale local work")
+        remote = make_db(keep_open=True)
+        self.addCleanup(remote.really_close)
+        add_channel(remote, "UC_a")
+        remote.commit()
+
+        with mock.patch.object(db, "get_remote_connection", return_value=remote):
+            db.pull_to_local()
+
+        backups = self._backups()
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), "stale local work")
+
+
+class MergeModeTest(unittest.TestCase):
+    """
+    Guards override=False on pull_to_local()/push_from_local() - the mode
+    `python run.py pull`/`push` default to (see run.py's --override flag).
+    Merge is an upsert by primary key: a row the destination is missing
+    gets added, a row it already has gets its columns overwritten with
+    the source's current values (so changes actually propagate, not just
+    new rows), and a row that only exists on the destination is never
+    deleted. Unlike override=True, pull-merge must also never touch the
+    local file wholesale.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        patcher = mock.patch.object(db, "LOCAL_WORKING_DB_PATH", Path(self.tmpdir.name) / ".registry_working.db")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _local_channel_names(self):
+        conn = db.get_connection()
+        try:
+            return {r["channel_id"]: r["display_name"] for r in conn.execute("SELECT channel_id, display_name FROM channels")}
+        finally:
+            conn.close()
+
+    def test_pull_merge_applies_remote_changes_and_adds_missing_rows(self):
+        local = db.get_connection()
+        add_channel(local, "UC_a", display_name="Local Stale Name")
+        local.commit()
+        local.close()
+
+        remote = make_db(keep_open=True)
+        self.addCleanup(remote.really_close)
+        add_channel(remote, "UC_a", display_name="Remote Updated Name")
+        add_channel(remote, "UC_b", display_name="Remote Only")
+        remote.commit()
+
+        with mock.patch.object(db, "get_remote_connection", return_value=remote):
+            db.pull_to_local(override=False)
+
+        names = self._local_channel_names()
+        self.assertEqual(names["UC_a"], "Remote Updated Name", "a merge pull must carry remote's changes to a row local already has")
+        self.assertEqual(names["UC_b"], "Remote Only", "a remote-only row must be added by a merge pull")
+
+    def test_pull_merge_never_wipes_or_backs_up_the_local_file(self):
+        local = db.get_connection()
+        add_channel(local, "UC_a")
+        local.commit()
+        local.close()
+
+        remote = make_db(keep_open=True)
+        self.addCleanup(remote.really_close)
+        add_channel(remote, "UC_b")
+        remote.commit()
+
+        with mock.patch.object(db, "get_remote_connection", return_value=remote):
+            db.pull_to_local(override=False)
+
+        backups = sorted(db.LOCAL_WORKING_DB_PATH.parent.glob("registry.*.pre-pull.db"))
+        self.assertEqual(backups, [], "a merge pull is non-destructive, so it shouldn't need a backup")
+
+    def test_push_merge_applies_local_changes_and_adds_missing_rows(self):
+        local = db.get_connection()
+        add_channel(local, "UC_a", display_name="Local Updated Name")
+        add_channel(local, "UC_b", display_name="Local Only")
+        local.commit()
+        local.close()
+
+        remote = make_db(keep_open=True, check_same_thread=False)
+        self.addCleanup(remote.really_close)
+        add_channel(remote, "UC_a", display_name="Remote Stale Name")
+        remote.commit()
+
+        with mock.patch.object(db, "get_remote_connection", return_value=remote):
+            db.push_from_local(override=False)
+
+        rows = {r["channel_id"]: r["display_name"] for r in remote.execute("SELECT channel_id, display_name FROM channels")}
+        self.assertEqual(rows["UC_a"], "Local Updated Name", "a merge push must carry local's changes to a row remote already has")
+        self.assertEqual(rows["UC_b"], "Local Only", "a local-only row must be added by a merge push")
+
+    def test_push_merge_does_not_delete_remote_only_rows(self):
+        local = db.get_connection()
+        add_channel(local, "UC_a")
+        local.commit()
+        local.close()
+
+        remote = make_db(keep_open=True, check_same_thread=False)
+        self.addCleanup(remote.really_close)
+        add_channel(remote, "UC_a")
+        add_channel(remote, "UC_remote_only")
+        remote.commit()
+
+        with mock.patch.object(db, "get_remote_connection", return_value=remote):
+            db.push_from_local(override=False)
+
+        channel_ids = {r["channel_id"] for r in remote.execute("SELECT channel_id FROM channels")}
+        self.assertIn("UC_remote_only", channel_ids, "merge must never delete a row that only exists on the destination")
+
+    def test_push_override_still_replaces_the_hosted_registry_wholesale(self):
+        local = db.get_connection()
+        add_channel(local, "UC_new")
+        local.commit()
+        local.close()
+
+        remote = make_db(keep_open=True, check_same_thread=False)
+        self.addCleanup(remote.really_close)
+        add_channel(remote, "UC_old")
+        remote.commit()
+
+        with mock.patch.object(db, "get_remote_connection", return_value=remote):
+            db.push_from_local(override=True)
+
+        channel_ids = {r["channel_id"] for r in remote.execute("SELECT channel_id FROM channels")}
+        self.assertEqual(channel_ids, {"UC_new"})
+
+    def test_pull_override_applies_remote_changes_and_deletes_local_only_rows(self):
+        local = db.get_connection()
+        add_channel(local, "UC_a", display_name="Local Stale Name")
+        add_channel(local, "UC_local_only")
+        local.commit()
+        local.close()
+
+        remote = make_db(keep_open=True)
+        self.addCleanup(remote.really_close)
+        add_channel(remote, "UC_a", display_name="Remote Updated Name")
+        add_channel(remote, "UC_b", display_name="Remote Only")
+        remote.commit()
+
+        with mock.patch.object(db, "get_remote_connection", return_value=remote):
+            db.pull_to_local(override=True)
+
+        names = self._local_channel_names()
+        self.assertEqual(names["UC_a"], "Remote Updated Name")
+        self.assertEqual(names["UC_b"], "Remote Only")
+        self.assertNotIn("UC_local_only", names,
+                          "override pull must discard not-yet-pushed local-only rows, same as the old wipe-and-rebuild")
+
+    def test_pull_recovers_from_a_corrupted_local_file(self):
+        """
+        The local file has been genuinely corrupted before in this project
+        (data/.registry_working.db.corrupted-backup-before-restore) - a
+        pull must still self-heal by discarding and rebuilding it rather
+        than raising, since a corrupted file has nothing an upsert could
+        preserve anyway.
+        """
+        db.LOCAL_WORKING_DB_PATH.write_text("not a valid sqlite file")
+
+        remote = make_db(keep_open=True)
+        self.addCleanup(remote.really_close)
+        add_channel(remote, "UC_a")
+        remote.commit()
+
+        with mock.patch.object(db, "get_remote_connection", return_value=remote):
+            db.pull_to_local(override=True)
+
+        names = self._local_channel_names()
+        self.assertEqual(set(names), {"UC_a"})
 
 
 if __name__ == "__main__":

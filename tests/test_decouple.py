@@ -14,6 +14,7 @@ than the total, which is dominated by costless singletons.
 """
 
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from .context import make_db, add_channel, add_video
@@ -43,9 +44,13 @@ class DecoupleTest(unittest.TestCase):
             p = mock.patch.object(db, target, return_value=self.conn)
             p.start()
             self.addCleanup(p.stop)
-        # Never write a real backup during tests.
-        p = mock.patch.object(decouple.shutil, "copy2")
-        self.copy2 = p.start()
+        # Never write a real backup (real file I/O against a live table
+        # dump) during tests.
+        p = mock.patch.object(
+            decouple, "_write_backup",
+            return_value=Path("data/registry.20260101-000000.pre-decouple.db"),
+        )
+        self.write_backup = p.start()
         self.addCleanup(p.stop)
 
     def _counts(self):
@@ -71,7 +76,7 @@ class DecoupleTest(unittest.TestCase):
         with mock.patch("builtins.input", return_value="no"):
             self.assertEqual(decouple.decouple(), -1)
         self.assertEqual(self._counts(), (4, 4, 3))
-        self.copy2.assert_not_called()
+        self.write_backup.assert_not_called()
 
     def test_a_bare_yes_does_not_confirm(self):
         """The prompt demands a typed word, not a reflexive y."""
@@ -92,8 +97,7 @@ class DecoupleTest(unittest.TestCase):
     def test_a_backup_is_taken_before_writing(self):
         with mock.patch("builtins.input", return_value="decouple"):
             decouple.decouple()
-        self.copy2.assert_called_once()
-        self.assertIn("pre-decouple", str(self.copy2.call_args[0][1]))
+        self.write_backup.assert_called_once_with()
 
     def test_genre_scope_leaves_other_genres_alone(self):
         decouple.decouple(genre="kpop", assume_yes=True)

@@ -14,6 +14,7 @@ from unittest import mock
 from .context import make_db, add_channel, add_video
 
 from registry import catalog, db, discovery, song_grouping
+from shared import api_budget
 
 
 class ManualVideosParsingTest(unittest.TestCase):
@@ -97,6 +98,14 @@ class SyncManualVideoChannelTest(unittest.TestCase):
         self.addCleanup(self.conn.really_close)
         add_channel(self.conn, "UC_studio", "kpop", "Some Movie Studio", "manual_video")
         self.conn.commit()
+
+        # Must not depend on real accumulated daily quota on disk (see
+        # api_budget.USAGE_FILE) - every other sync test avoids this by
+        # mocking out the caller that would touch it; this one calls
+        # _sync_manual_video_channel directly, which records real usage.
+        patcher = mock.patch.object(api_budget, "record_youtube_units")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _pinned(self, entries):
         return mock.patch.object(discovery, "manual_videos", return_value=entries)
@@ -189,12 +198,16 @@ class SyncVideosSkipsManualVideoChannelsTest(unittest.TestCase):
     def test_only_the_normal_channel_is_walked(self):
         walked = []
 
-        def _status(youtube, channel_id):
-            walked.append(channel_id)
-            return f"PL_{channel_id}", 0
+        # sync_videos excludes "manual_video" rows before it even asks
+        # _prefetch_channel_statuses for status (see catalog.py) - this
+        # stands in for that batch and records exactly what it was asked
+        # about, same as the old per-channel _channel_status stub did.
+        def _prefetch(youtube, channel_ids):
+            walked.extend(channel_ids)
+            return {cid: (f"PL_{cid}", 0) for cid in channel_ids}
 
         with mock.patch.object(catalog, "get_client", return_value=mock.Mock()), \
-             mock.patch.object(catalog, "_channel_status", side_effect=_status), \
+             mock.patch.object(catalog, "_prefetch_channel_statuses", side_effect=_prefetch), \
              mock.patch.object(discovery, "manual_videos", return_value=[]):
             catalog.sync_videos()
 

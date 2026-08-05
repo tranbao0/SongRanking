@@ -2,7 +2,12 @@
 Per-channel video discovery: pulls each tracked channel's uploads via the
 YouTube Data API, filters to official MVs with mv_filter, groups
 same-song duplicates via song_grouping, and upserts survivors into the
-`videos` table for snapshot.py to track going forward.
+`videos` table for snapshot.py to track going forward. Anything mv_filter
+rejects (title or duration) is recorded in `rejected_videos` instead -
+never in `videos` - so song_id NULL in `videos` unambiguously means "a
+real video decouple.py cleared, still needing (re-)grouping" rather than
+also meaning "not a song at all"; see rejected_videos' schema comment for
+why that distinction matters to regroup.py.
 
 Steady-state runs are budget-aware and resumable:
   - A channel's uploads-playlist ID and current video count are fetched
@@ -10,9 +15,10 @@ Steady-state runs are budget-aware and resumable:
     since last sync, that's the entire cost for this channel - no
     pagination at all.
   - When something *has* changed, pagination stops as soon as it reaches
-    a video already in the `videos` table - the uploads playlist is
-    newest-first, so anything after that point was already seen on a
-    prior sync and doesn't need re-fetching.
+    a video already in `videos` or `rejected_videos` - the uploads
+    playlist is newest-first, so anything after that point was already
+    seen (and, if rejected, already judged) on a prior sync and doesn't
+    need re-fetching.
   - Channels are processed oldest-synced-first and committed one at a
     time, so a run interrupted by QuotaExceededError (or split across a
     multi-day bootstrap by choice) picks up exactly where it left off
@@ -36,7 +42,7 @@ import re
 from datetime import date, datetime
 
 from registry import db, discovery, song_grouping
-from shared import api_budget
+from shared import api_budget, shutdown
 from shared.mv_filter import is_blocked_title, is_valid_mv
 from shared.youtube_api import batch_fetch_metadata, chunked_ids, get_client
 
@@ -74,6 +80,10 @@ def _channel_status(youtube, channel_id: str) -> tuple[str | None, int | None]:
     current public video count (1 unit total, instead of two separate
     1-unit calls) - used for the cheap unchanged-channel skip and, when
     something did change, to seed the paginated walk below.
+
+    Single-channel fallback for _prefetch_channel_statuses: normal sync
+    runs never call this directly (see sync_videos), only a channel whose
+    batched chunk hit a transient, non-quota error during that prefetch.
     """
     response = youtube.channels().list(part="contentDetails,statistics", id=channel_id).execute()
     api_budget.record_youtube_units(1)
@@ -83,6 +93,56 @@ def _channel_status(youtube, channel_id: str) -> tuple[str | None, int | None]:
     playlist_id = items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
     count = items[0]["statistics"].get("videoCount")
     return playlist_id, (int(count) if count is not None else None)
+
+
+def _prefetch_channel_statuses(youtube, channel_ids: list[str]) -> dict[str, tuple[str | None, int | None]]:
+    """
+    Uploads-playlist ID + current video count for every channel_id, via
+    channels().list's own id="a,b,c,...,50" batching - the same one unit
+    per call regardless of ID count that videos.list already gets used
+    for elsewhere (see youtube_api.py). A channel-by-channel loop calling
+    _channel_status once per row costs one full unit per channel; this
+    answers up to 50 at a time for that same one unit, so a run tracking
+    ~600 channels spends ~12 units on status checks instead of ~600.
+
+    Every ID gets an entry: (None, None) for one absent from a completed
+    chunk's response (deleted/private channel - same as _channel_status's
+    own empty-items case), or no entry at all for an ID whose chunk
+    itself failed with something other than a quota error (rare -
+    transient network blip). sync_videos falls back to _channel_status
+    per-channel for exactly those missing IDs, so a blip during the
+    prefetch never silently drops a channel for the whole run.
+
+    A quota-exceeded error is NOT caught here - it propagates to
+    sync_videos' caller, same as _channel_status raising one would have:
+    every remaining chunk (and every remaining channel) would fail the
+    same way, so the whole run stops there rather than limping through
+    chunks that can't succeed. Because this is ~50x cheaper in quota than
+    the per-channel version, hitting that wall during the prefetch itself
+    is now a much narrower case than it used to be - see this function's
+    caller for what "narrower" means for resumability.
+    """
+    statuses: dict[str, tuple[str | None, int | None]] = {}
+    for chunk in chunked_ids(channel_ids):
+        try:
+            response = youtube.channels().list(part="contentDetails,statistics", id=",".join(chunk)).execute()
+        except _HTTP_ERRORS as e:
+            if _is_quota_error(e):
+                raise
+            print(f"  [catalog] Batched status check failed for {len(chunk)} channel(s) "
+                  f"({e}) - will check them individually.")
+            continue
+        api_budget.record_youtube_units(1)
+        found = {item["id"]: item for item in response.get("items", [])}
+        for channel_id in chunk:
+            item = found.get(channel_id)
+            if item is None:
+                statuses[channel_id] = (None, None)
+            else:
+                playlist_id = item["contentDetails"]["relatedPlaylists"]["uploads"]
+                count = item["statistics"].get("videoCount")
+                statuses[channel_id] = (playlist_id, int(count) if count is not None else None)
+    return statuses
 
 
 def _list_new_uploads(youtube, playlist_id: str, known_video_ids: set[str]) -> list[dict]:
@@ -213,6 +273,20 @@ def _existing_videos(conn, channel_id: str) -> list:
     return conn.execute(_EXISTING_VIDEOS_SQL, {"channel_id": channel_id}).fetchall()
 
 
+def _rejected_video_ids(conn, channel_id: str) -> set[str]:
+    """
+    Video IDs already fetched and rejected on this channel (mv_filter
+    failed on title or duration). Never in `videos` - see the schema
+    comment on rejected_videos - so the pagination stop in sync_videos
+    has to union this in on top of _existing_videos to still recognize
+    them as already-seen and stop walking there.
+    """
+    return {
+        r["video_id"]
+        for r in conn.execute("SELECT video_id FROM rejected_videos WHERE channel_id = ?", (channel_id,))
+    }
+
+
 def _confirmed_artists(conn) -> tuple[dict[str, list[tuple[str, re.Pattern]]], dict[str, str]]:
     """
     One pass over the Wikidata-confirmed channels, returning both things
@@ -331,6 +405,21 @@ def sync_videos(channel_ids: list[str] | None = None, genres: list[str] | None =
     exhausted - channels completed so far are already committed and will
     be skipped on the next run via last_catalog_sync ordering.
 
+    Every non-manual-video channel's status (uploads playlist + video
+    count) is batch-fetched once up front via _prefetch_channel_statuses,
+    before any channel's own walk/grouping/commit work starts - see that
+    function's docstring for the quota math. This doesn't change the
+    resumability of the expensive per-channel work below: that's still
+    walked and committed one channel at a time, in the same order, so a
+    QuotaExceededError there still stops with exactly as many channels
+    already committed as today. What changes is only where the *status*
+    check's own quota risk sits: it's now one cheap batch instead of up to
+    `total` separate 1-unit calls interleaved through the loop, so hitting
+    the budget wall during it (rather than during the walk) becomes the
+    rare case, not the common one - and if it does happen, nothing has
+    been processed yet regardless, exactly like a QuotaExceededError on
+    this run's very first channel would have meant before.
+
     `channel_ids` and `genres` are independent, combinable scopes (both
     given narrows to their intersection) - same pattern as
     snapshot.take_snapshot's `genre`/`video_ids`. Neither given syncs
@@ -377,7 +466,27 @@ def sync_videos(channel_ids: list[str] | None = None, genres: list[str] | None =
             if row["source"] == "manual_video":
                 manual_video_siblings.setdefault(row["genre"], []).append(row["channel_id"])
 
+        status_channel_ids = [row["channel_id"] for row in rows if row["source"] != "manual_video"]
+        try:
+            channel_statuses = _prefetch_channel_statuses(youtube, status_channel_ids)
+        except api_budget.QuotaExceededError as e:
+            print(f"  [catalog] {e}")
+            print(f"  [catalog] Stopped before checking any channel - "
+                  f"already-synced channels will be skipped on the next `sync` run.")
+            return upserted
+        except _HTTP_ERRORS as e:
+            if _is_quota_error(e):
+                print(f"  [catalog] YouTube quota exhausted: {e}")
+                print(f"  [catalog] Stopped before checking any channel - "
+                      f"already-synced channels will be skipped on the next `sync` run.")
+                return upserted
+            raise
+
         for i, row in enumerate(rows, start=1):
+            if shutdown.requested():
+                print(f"  [catalog] Stopped after {processed}/{total} channel(s) - "
+                      f"already-synced channels will be skipped on the next `sync` run.")
+                break
             channel_id = row["channel_id"]
             progress = f"[catalog {i}/{total}]"
             try:
@@ -391,7 +500,14 @@ def sync_videos(channel_ids: list[str] | None = None, genres: list[str] | None =
                     print(f"  {progress} {channel_id}: pinned video(s) checked, {added} new upserted")
                     continue
 
-                playlist_id, video_count = _channel_status(youtube, channel_id)
+                if channel_id in channel_statuses:
+                    playlist_id, video_count = channel_statuses[channel_id]
+                else:
+                    # This channel's chunk hit a transient, non-quota error
+                    # during the upfront batch (see _prefetch_channel_statuses) -
+                    # fall back to asking about it alone rather than losing it
+                    # for the whole run.
+                    playlist_id, video_count = _channel_status(youtube, channel_id)
                 if playlist_id is None:
                     print(f"  {progress} {channel_id}: no uploads playlist (channel deleted/private?), skipping")
                     continue
@@ -421,7 +537,7 @@ def sync_videos(channel_ids: list[str] | None = None, genres: list[str] | None =
                       f"({row['last_known_video_count']} -> {video_count}), walking new uploads...")
 
                 existing = _existing_videos(conn, channel_id)
-                existing_ids = {r["video_id"] for r in existing}
+                known_ids = {r["video_id"] for r in existing} | _rejected_video_ids(conn, channel_id)
 
                 # Non-empty only for large multi-artist channels (see
                 # _SHARED_CHANNEL_VIDEO_THRESHOLD) - those are the only ones
@@ -435,9 +551,9 @@ def sync_videos(channel_ids: list[str] | None = None, genres: list[str] | None =
                     else no_artist_index
                 )
 
-                new_uploads = _list_new_uploads(youtube, playlist_id, existing_ids)
+                new_uploads = _list_new_uploads(youtube, playlist_id, known_ids)
                 new_mvs = []
-                blocked = []
+                rejected = []
                 if new_uploads:
                     # Every rejection that needs only the title runs before
                     # any duration is fetched. Durations cost a quota unit
@@ -451,16 +567,6 @@ def sync_videos(channel_ids: list[str] | None = None, genres: list[str] | None =
                     # A broadcast archive can carry tens of thousands of
                     # uploads of which only a small fraction name a
                     # confirmed artist at all, and that check is pure text.
-                    #
-                    # Titles rejected here (teasers, "making of", behind-the-
-                    # scenes, etc.) are still recorded below with song_id
-                    # NULL rather than dropped, for two reasons: the pagination
-                    # stop above only works against videos actually present in
-                    # `videos`, so a channel that regularly posts this kind of
-                    # content would otherwise have every sync re-walk past the
-                    # same already-rejected uploads indefinitely; and keeping
-                    # the row means a future retitling or a looser filter can
-                    # revisit it without re-fetching from YouTube.
                     blocked = [v for v in new_uploads if is_blocked_title(v["title"])]
                     candidates = [v for v in new_uploads if not is_blocked_title(v["title"])]
 
@@ -476,6 +582,20 @@ def sync_videos(channel_ids: list[str] | None = None, genres: list[str] | None =
                         v for v in candidates
                         if is_valid_mv(v["title"], durations.get(v["video_id"], 0))
                     ]
+                    new_mv_ids = {v["video_id"] for v in new_mvs}
+                    duration_rejected = [v for v in candidates if v["video_id"] not in new_mv_ids]
+
+                    # Never a song (title didn't name the song as the focal
+                    # point, or duration fell outside the MV window) - kept
+                    # out of `videos` entirely (see rejected_videos' schema
+                    # comment) so song_id NULL there means only one thing:
+                    # a video decouple.py cleared and regroup.py still needs
+                    # to (re-)group. Recorded here anyway, in rejected_videos
+                    # rather than dropped, so a channel that regularly posts
+                    # this kind of content doesn't have every future sync
+                    # re-walk past (and re-fetch duration for) the same
+                    # already-rejected uploads indefinitely.
+                    rejected = blocked + duration_rejected
 
                 new_video_dicts = [
                     {
@@ -488,20 +608,14 @@ def sync_videos(channel_ids: list[str] | None = None, genres: list[str] | None =
                     for v in new_mvs
                 ]
 
-                # Same shape as new_video_dicts, so both flow through the one
-                # upsert below - see the comment above `blocked` for why
-                # these are kept rather than dropped. They never reach
-                # song_grouping: there is nothing to group, since a blocked
-                # title never becomes a song.
-                blocked_video_dicts = [
+                rejected_video_dicts = [
                     {
-                        "video_id":      v["video_id"],
-                        "title":         v["title"],
-                        "url":           f"https://www.youtube.com/watch?v={v['video_id']}",
-                        "published_at":  v["published_at"],
-                        "discovered_at": date.today().isoformat(),
+                        "video_id":   v["video_id"],
+                        "channel_id": channel_id,
+                        "title":      v["title"],
+                        "checked_at": datetime.now().isoformat(),
                     }
-                    for v in blocked
+                    for v in rejected
                 ]
 
                 # On a shared channel, a new video's matched artist might
@@ -536,9 +650,6 @@ def sync_videos(channel_ids: list[str] | None = None, genres: list[str] | None =
                 rows_to_upsert = [
                     {**v, "channel_id": channel_id, "song_id": song_map.get(v["video_id"])}
                     for v in new_video_dicts
-                ] + [
-                    {**v, "channel_id": channel_id, "song_id": None}
-                    for v in blocked_video_dicts
                 ]
                 if rows_to_upsert:
                     conn.executemany(
@@ -549,6 +660,15 @@ def sync_videos(channel_ids: list[str] | None = None, genres: list[str] | None =
                         """,
                         rows_to_upsert,
                     )
+                if rejected_video_dicts:
+                    conn.executemany(
+                        """
+                        INSERT INTO rejected_videos (video_id, channel_id, title, checked_at)
+                        VALUES (:video_id, :channel_id, :title, :checked_at)
+                        ON CONFLICT(video_id) DO UPDATE SET title=excluded.title, checked_at=excluded.checked_at
+                        """,
+                        rejected_video_dicts,
+                    )
                 conn.execute(
                     "UPDATE channels SET last_catalog_sync = ?, last_known_video_count = ? WHERE channel_id = ?",
                     (datetime.now().isoformat(), video_count, channel_id),
@@ -556,8 +676,8 @@ def sync_videos(channel_ids: list[str] | None = None, genres: list[str] | None =
                 conn.commit()
                 upserted += len(new_mvs)
                 processed += 1
-                blocked_note = f", {len(blocked_video_dicts)} blocked (recorded, not a song)" if blocked_video_dicts else ""
-                print(f"    done - {len(new_mvs)} new video(s) upserted{blocked_note}")
+                rejected_note = f", {len(rejected_video_dicts)} rejected (not a song)" if rejected_video_dicts else ""
+                print(f"    done - {len(new_mvs)} new video(s) upserted{rejected_note}")
 
             except api_budget.QuotaExceededError as e:
                 print(f"  [catalog] {e}")

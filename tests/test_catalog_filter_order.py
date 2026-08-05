@@ -46,7 +46,8 @@ class FilterOrderTest(unittest.TestCase):
             return {vid: 200 for vid in video_ids}  # all inside the MV window
 
         with mock.patch.object(catalog, "get_client", return_value=mock.Mock()), \
-             mock.patch.object(catalog, "_channel_status", return_value=("PL_x", 9999)), \
+             mock.patch.object(catalog, "_prefetch_channel_statuses",
+                               return_value={"UC_broadcast": ("PL_x", 9999)}), \
              mock.patch.object(catalog, "_list_new_uploads", return_value=uploads), \
              mock.patch.object(catalog, "_fetch_durations", side_effect=_fake_durations), \
              mock.patch.object(song_grouping, "call_gemini", lambda p, model=None: None):
@@ -83,7 +84,8 @@ class FilterOrderTest(unittest.TestCase):
         """Pre-filtering must not let a too-short clip through."""
         uploads = [self._upload("short", "BTS - Dynamite Official MV")]
         with mock.patch.object(catalog, "get_client", return_value=mock.Mock()), \
-             mock.patch.object(catalog, "_channel_status", return_value=("PL_x", 9999)), \
+             mock.patch.object(catalog, "_prefetch_channel_statuses",
+                               return_value={"UC_broadcast": ("PL_x", 9999)}), \
              mock.patch.object(catalog, "_list_new_uploads", return_value=uploads), \
              mock.patch.object(catalog, "_fetch_durations", return_value={"short": 5}), \
              mock.patch.object(song_grouping, "call_gemini", lambda p, model=None: None):
@@ -91,13 +93,14 @@ class FilterOrderTest(unittest.TestCase):
 
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0], 0)
 
-    def test_blocklisted_titles_are_recorded_with_no_song(self):
+    def test_blocklisted_titles_are_recorded_as_rejected_not_a_video(self):
         """
-        A blocked title (teaser, making-of, behind-the-scenes, ...) is kept
-        as a video row with song_id NULL rather than dropped - so it never
-        counts as its own chart entry, but its video_id still lands in
-        `videos` and stops a later sync's pagination from walking past it
-        again (see the comment on `blocked` in sync_videos).
+        A blocked title (teaser, making-of, behind-the-scenes, ...) never
+        becomes a `videos` row at all - it's recorded in rejected_videos
+        instead, so it can never count as its own chart entry and can never
+        be picked up by regroup.py's "song_id IS NULL" query, while its
+        video_id still stops a later sync's pagination from walking past it
+        again (see the comment on `blocked`/`rejected` in sync_videos).
         """
         uploads = [
             self._upload("keep", "BTS - Dynamite Official MV"),
@@ -105,16 +108,14 @@ class FilterOrderTest(unittest.TestCase):
             self._upload("making", "BTS Dynamite MV Making Video"),
         ]
         self._run_sync(uploads)
-        rows = {
-            r["video_id"]: r["song_id"]
-            for r in self.conn.execute("SELECT video_id, song_id FROM videos").fetchall()
+
+        video_ids = {r["video_id"] for r in self.conn.execute("SELECT video_id FROM videos").fetchall()}
+        self.assertEqual(video_ids, {"keep"})
+
+        rejected_ids = {
+            r["video_id"] for r in self.conn.execute("SELECT video_id FROM rejected_videos").fetchall()
         }
-        self.assertIn("keep", rows)
-        self.assertIsNotNone(rows["keep"])
-        self.assertIn("teaser", rows)
-        self.assertIsNone(rows["teaser"])
-        self.assertIn("making", rows)
-        self.assertIsNone(rows["making"])
+        self.assertEqual(rejected_ids, {"teaser", "making"})
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM songs").fetchone()[0], 1)
 
     def test_the_kept_video_is_actually_stored(self):

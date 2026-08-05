@@ -13,10 +13,10 @@ highest-individual-views one) supplies the url/title used for rendering.
 
 Videos with song_id NULL are excluded entirely, not charted as their own
 singleton: song_grouping always assigns a real MV a song_id, matching an
-existing song or minting a new one, so NULL here only ever means a
-blocked non-song upload (teaser, "making of", etc.) kept for catalog
-dedup, or a video mid-regroup after a decouple - neither belongs in a
-chart.
+existing song or minting a new one, so NULL here only ever means a real
+video decouple.py cleared that regroup.py hasn't re-grouped yet (blocked
+non-song uploads never enter `videos` at all; see catalog.py's module
+docstring) - it doesn't belong in a chart until it's grouped.
 """
 
 from datetime import date, datetime, timedelta
@@ -240,7 +240,12 @@ def compute_chart(name: str, limit: int | None = None) -> list[dict]:
     limit       = limit if limit is not None else definition["limit"]
     window_days = definition.get("window_days")
 
-    conn = db.get_connection()
+    # A direct remote read, not the local-working-copy pull/push cycle
+    # sync/decouple/regroup use - charts.py doesn't mutate the registry,
+    # and this is a handful of aggregate queries, not the thousands of
+    # small per-video/per-channel writes that made a local copy worth it
+    # for sync (see db.py's module docstring).
+    conn = db.get_remote_connection()
     try:
         # Charts read view_snapshots, but nothing else in the chart path
         # takes one - only `sync` did, so a chart run following a sync

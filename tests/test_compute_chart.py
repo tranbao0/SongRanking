@@ -24,7 +24,7 @@ class ComputeChartTest(unittest.TestCase):
         self.addCleanup(self.conn.really_close)
         self.today = date.today()
 
-        patcher = mock.patch.object(db, "get_connection", return_value=self.conn)
+        patcher = mock.patch.object(db, "get_remote_connection", return_value=self.conn)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -133,9 +133,8 @@ class ComputeChartTest(unittest.TestCase):
 
     def test_ungrouped_videos_never_chart(self):
         """
-        song_id NULL means a blocked non-song upload (teaser, "making of",
-        etc.) or one mid-regroup after a decouple - never treated as its
-        own singleton chart entry.
+        song_id NULL means a real video awaiting (re-)grouping - never
+        treated as its own singleton chart entry.
         """
         add_video(self.conn, "teaser", "UC_a", title="Teaser")
         self._snapshot("teaser", 0, 999999)

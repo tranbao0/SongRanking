@@ -18,13 +18,28 @@ the part that is expensive:
     calls, and re-deriving them costs those calls again.
 
 A timestamped backup is taken before anything is written, so an
-accidental run is recoverable without re-spending any quota.
+accidental run is recoverable without re-spending any quota. `db.get_connection()`
+is the local working copy `sync`/`decouple` already pulled from the hosted
+registry (see db.py's module docstring) - a plain local SQLite file, so
+the backup is just a file copy of it, taken before this run's own changes
+land. Restoring it means putting it back in place (as
+db.LOCAL_WORKING_DB_PATH) before this command's own push_from_local()
+step runs - or, if that's already happened, pushing the backup file up
+via a one-off pull_to_local()-shaped script.
 """
 
 import shutil
 from datetime import datetime
+from pathlib import Path
 
 from registry import db
+
+
+def _write_backup() -> Path:
+    """Copy the local working copy as-is, before this run's own changes."""
+    backup = db.LOCAL_WORKING_DB_PATH.parent / f"registry.{datetime.now().strftime('%Y%m%d-%H%M%S')}.pre-decouple.db"
+    shutil.copy2(db.LOCAL_WORKING_DB_PATH, backup)
+    return backup
 
 
 def summarise(conn, genre: str | None = None) -> dict:
@@ -114,10 +129,7 @@ def decouple(genre: str | None = None, assume_yes: bool = False) -> int:
                 print("  [decouple] Cancelled - nothing was changed.")
                 return -1
 
-        backup = db.DB_PATH.with_suffix(
-            f".{datetime.now().strftime('%Y%m%d-%H%M%S')}.pre-decouple.db"
-        )
-        shutil.copy2(db.DB_PATH, backup)
+        backup = _write_backup()
         print(f"  [decouple] Backup written to {backup.name}")
 
         scope = "" if genre is None else (

@@ -28,12 +28,15 @@ class SyncVideosGenreScopeTest(unittest.TestCase):
     def _sync(self, **kwargs):
         walked = []
 
-        def _status(youtube, channel_id):
-            walked.append(channel_id)
-            return f"PL_{channel_id}", 0
+        # sync_videos looks channel status up in _prefetch_channel_statuses'
+        # returned dict now (see catalog.py), not via a per-channel
+        # _channel_status call - this stands in for that batch.
+        def _prefetch(youtube, channel_ids):
+            walked.extend(channel_ids)
+            return {cid: (f"PL_{cid}", 0) for cid in channel_ids}
 
         with mock.patch.object(catalog, "get_client", return_value=mock.Mock()), \
-             mock.patch.object(catalog, "_channel_status", side_effect=_status):
+             mock.patch.object(catalog, "_prefetch_channel_statuses", side_effect=_prefetch):
             catalog.sync_videos(**kwargs)
         return walked
 

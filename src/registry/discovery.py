@@ -148,7 +148,7 @@ def _purge_excluded(conn, genre: str) -> int:
 
 def sync_channels(genres: list[str]) -> dict[str, int]:
     """
-    Run discovery for each genre and upsert results into data/registry.db.
+    Run discovery for each genre and upsert results into the hosted registry.
     Committed per genre rather than once at the end, and one genre's
     Wikidata failure doesn't take the rest down with it - discover_channels
     already retries a transient error itself (see wikidata.py), so a genre

@@ -29,12 +29,14 @@ Shard sizes are uneven (a distributor's catalogue dwarfs a single artist's), whi
 
 ## Before starting any instance
 
+The registry is a hosted Turso database, not a local file (see README's "Hosted registry database (Turso)" section) - back it up with a real dump rather than copying a file:
+
 ```bash
-cp data/registry.db data/registry.db.bak
+echo ".dump" | bash scripts/turso_shell.sh > "data/registry-backup-$(date +%Y%m%d-%H%M%S).sql"
 ```
 
-Run instances **one at a time** unless you've confirmed the DB isn't locked.
-SQLite allows one writer; concurrent writes fail with `database is locked` rather than corrupting anything, but a failed apply mid-shard is annoying to unpick.
+Run instances **one at a time** unless you've confirmed applying concurrently is safe.
+Turso handles concurrent connections properly (no single-writer file lock the way a local SQLite file has), but a failed apply mid-shard is still annoying to unpick if two instances' edits interleave unexpectedly.
 Safest pattern: let every instance produce its plan, then apply them in sequence.
 
 ---
@@ -44,7 +46,28 @@ Safest pattern: let every instance produce its plan, then apply them in sequence
 Paste this into each instance, replacing `SHARD` and `SHARD_COUNT`.
 
 ````
-You are grouping songs in a local SQLite music registry at data/registry.db.
+You are grouping songs in the local working-copy SQLite file at
+data/.registry_working.db (see src/registry/db.py's module docstring).
+This is NOT data/registry.db - that path is a pre-Turso-migration
+artifact and is stale; writing to it silently loses your work, since
+nothing reads it back into the hosted registry. Before you start,
+confirm the working copy is current - either it was populated very
+recently by a command that calls db.pull_to_local() (sync/decouple/
+regroup all do), or pull it yourself:
+
+    python -c "from registry import db; db.pull_to_local()"
+
+When your session's approved batches are applied, push them back so
+the hosted registry (the actual source of truth every machine reads)
+sees them:
+
+    python -c "from registry import db; db.push_from_local()"
+
+Do this at the end of each session, not just once at the very end of
+the whole multi-session pass - an interrupted session (crash, closed
+terminal) between pull and push leaves real merge work sitting only in
+the local file, invisible to any other instance or machine.
+
 You are instance SHARD of SHARD_COUNT. Work ONLY on your shard.
 
 ## Your shard
@@ -562,8 +585,14 @@ deliberately left alone because you were not confident.
 
 ```bash
 python -m unittest discover -s tests -t .
-python -c "import sqlite3; print(sqlite3.connect('data/registry.db').execute('pragma integrity_check').fetchone()[0])"
+python -c "import sqlite3; print(sqlite3.connect('data/.registry_working.db').execute('pragma integrity_check').fetchone()[0])"
+python -c "from registry import db; db.push_from_local()"
 ```
+
+Confirm every shard has pushed (or push once here after collecting all shards'
+local working copies) before treating the pass as done - the hosted Turso
+registry, not any local file, is what the next sync/chart run and every other
+machine actually reads.
 
 Cross-shard merges are not attempted by design.
 A song split across two anchors is rare and is a symptom of the anchor being wrong, which is worth fixing at the source rather than by hand here.

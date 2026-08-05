@@ -19,6 +19,21 @@ Usage:
 
   python run.py regroup                   # re-derive groupings for videos decouple left ungrouped
   python run.py regroup --genre kpop      # one genre only
+
+  python run.py audit                     # force a grouping-quality audit on the local working DB (no pull/push)
+
+  python run.py pull                      # merge Turso's current state into the local working copy
+  python run.py pull --override           # overwrite the local working copy with Turso's current state
+  python run.py push                      # merge the local working copy's current state into Turso
+  python run.py push --override           # overwrite Turso with the local working copy's current state
+
+To stop a run, press Ctrl+C once and let it wrap up the current step
+(finishes any in-flight Turso push/pull so the hosted registry is never
+left half-written). Press Ctrl+C again to force an immediate exit -
+this can leave orphaned yt-dlp/ffmpeg subprocesses behind, so prefer a
+single press when you can. Don't kill python.exe from Task Manager or
+`taskkill` while a `sync`/`push`/`pull` is running - that skips this
+entirely.
 """
 
 import json
@@ -30,6 +45,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 from render.pipeline import run_pipeline
+from shared import shutdown
 
 _YT_DLP_CHECK_CACHE = Path("data/.yt_dlp_update_check.json")
 _YT_DLP_CHECK_INTERVAL = 24 * 60 * 60  # re-check at most once/day
@@ -73,7 +89,7 @@ def main():
     )
     parser.add_argument(
         "command",
-        choices=["csv", "search", "clean", "sync", "chart", "decouple", "regroup"],
+        choices=["csv", "search", "clean", "sync", "chart", "decouple", "regroup", "audit", "pull", "push"],
         help="Command to run",
     )
     parser.add_argument("--yes", action="store_true",
@@ -92,13 +108,31 @@ def main():
                         help="Concurrent yt-dlp downloads (default: 6)")
     parser.add_argument("--encode-workers", type=int, default=3,
                         help="Concurrent ffmpeg overlay encodes (default: 3)")
+    parser.add_argument("--override", action="store_true",
+                        help="Replace the destination outright instead of merging "
+                             "(pull/push mode only; merge is the default)")
     args = parser.parse_args()
 
     if args.command == "sync":
-        from registry import discovery, catalog, snapshot, grouping_audit
+        from registry import db, discovery, catalog, snapshot, grouping_audit
+        from shared import gemini_client
 
         genres = args.genre or discovery.KNOWN_GENRES
         print(f"Syncing channels for: {', '.join(genres)}")
+        # A long-running sync only ever reads GEMINI_API_KEY once, at
+        # process start - editing .env mid-run has no effect until the
+        # process is restarted. Printed once here, up front, so that's
+        # never something to infer from behavior later in the run.
+        if gemini_client.is_available():
+            print("  AI grouping (Gemini): enabled")
+
+        # Steps 1 and 3 are the only network calls to the hosted registry
+        # in this whole command - see db.py's module docstring. Everything
+        # between them (discovery, catalog, snapshot, the audit agent)
+        # reads/writes the local working copy pull_to_local() just seeded,
+        # at local-disk speed.
+        print("Fetching current registry from Turso...")
+        db.pull_to_local()
 
         audit_snapshot = grouping_audit.snapshot_before_sync()
 
@@ -115,24 +149,60 @@ def main():
         print(f"  {snapshot_count} snapshot row(s) inserted")
 
         grouping_audit.audit_after_sync(audit_snapshot)
+
+        print("Pushing updated registry to Turso...")
+        db.push_from_local()
         return
 
     if args.command == "decouple":
-        from registry import decouple as decouple_mod
+        from registry import db, decouple as decouple_mod
 
         genres = args.genre or [None]
         if len(genres) > 1:
             parser.error("decouple takes at most one --genre")
-        decouple_mod.decouple(genre=genres[0], assume_yes=args.yes)
+        print("Fetching current registry from Turso...")
+        db.pull_to_local()
+        result = decouple_mod.decouple(genre=genres[0], assume_yes=args.yes)
+        if result > 0:
+            print("Pushing updated registry to Turso...")
+            db.push_from_local()
         return
 
     if args.command == "regroup":
-        from registry import regroup as regroup_mod
+        from registry import db, regroup as regroup_mod
 
         genres = args.genre or [None]
         if len(genres) > 1:
             parser.error("regroup takes at most one --genre")
+        print("Fetching current registry from Turso...")
+        db.pull_to_local()
         regroup_mod.regroup_all(genre=genres[0])
+        print("Pushing updated registry to Turso...")
+        db.push_from_local()
+        return
+
+    if args.command == "audit":
+        from registry import grouping_audit
+
+        grouping_audit.run_manual_audit()
+        return
+
+    if args.command == "pull":
+        from registry import db
+
+        mode = "overwriting" if args.override else "merging into"
+        print(f"Fetching current registry from Turso ({mode} the local working copy)...")
+        db.pull_to_local(override=args.override)
+        print(f"  Local working copy updated at {db.LOCAL_WORKING_DB_PATH}")
+        return
+
+    if args.command == "push":
+        from registry import db
+
+        mode = "overwriting" if args.override else "merging into"
+        print(f"Pushing local working copy to Turso ({mode} the hosted registry)...")
+        db.push_from_local(override=args.override)
+        print("  Done.")
         return
 
     ensure_yt_dlp_up_to_date()
@@ -168,4 +238,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    shutdown.install()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Stopped.")
+        sys.exit(130)

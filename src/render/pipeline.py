@@ -25,6 +25,7 @@ from render.chart_state import (
     DATA_FILE, load_history, songs_from_search, pre_fetch_all,
     determine_badges, save_run_state, load_songs, clean_csv_titles,
 )
+from shared import shutdown
 
 _DEFAULT_START = "00:01:00"
 _DEFAULT_END   = "00:01:15"
@@ -183,6 +184,8 @@ def run_pipeline(search=None, limit=None, no_filter=False,
     fps = style.get("canvas", {}).get("fps", 30)
 
     def _download(song):
+        if shutdown.requested():
+            raise RuntimeError("stopped by user (Ctrl+C)")
         t0 = time.monotonic()
         start = song.get("start") or _DEFAULT_START
         end   = song.get("end")   or _DEFAULT_END
@@ -208,6 +211,8 @@ def run_pipeline(search=None, limit=None, no_filter=False,
         return raw_clip
 
     def _encode(song, raw_clip, head_trim, tail_trim):
+        if shutdown.requested():
+            raise RuntimeError("stopped by user (Ctrl+C)")
         meta       = song["_meta"]
         entry_type = song["_entry_type"]
         peak       = song.get("peak", song["rank"])
@@ -290,6 +295,8 @@ def run_pipeline(search=None, limit=None, no_filter=False,
     ]
 
     def _build_transition(rank_a, rank_b):
+        if shutdown.requested():
+            raise RuntimeError("stopped by user (Ctrl+C)")
         out_path = f"{clips_dir}/trans_rank{rank_a}_rank{rank_b}.mp4"
         t0 = time.monotonic()
         result = encode_transition(

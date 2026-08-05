@@ -5,6 +5,7 @@ the orchestration logic (main run flow) isn't tangled with subprocess/ffmpeg
 plumbing.
 """
 
+import concurrent.futures
 import subprocess
 import os
 import re
@@ -49,6 +50,19 @@ _HW_ENCODE_ARGS = {
     "h264_amf":   ["-c:v", "h264_amf", "-quality", "speed", "-rc", "cqp", "-qp_i", "22", "-qp_p", "22", "-bf", "0"],
 }
 _CPU_ENCODE_ARGS = ["-c:v", "libx264", "-preset", "fast", "-crf", "22", "-bf", "0"]
+
+# Bounds how many of one song's phase encodes (see encode_song) run at
+# once. Deliberately small and separate from encode_workers: this pool
+# nests inside it (each already-concurrent song spawns its own), and a
+# consumer GPU's hardware encoder (NVENC in particular) can cap how many
+# simultaneous sessions it accepts. Going over that cap doesn't corrupt or
+# degrade anything - CRF/CQ-based encoding targets the same quality
+# regardless of timing - it just makes the excess phase fail outright,
+# which _run_ffmpeg already retries on libx264 (see its GPU->CPU fallback,
+# and concatenate_clips' note on why phases are always fully re-encoded
+# rather than stream-copied together, which already tolerates a mix of
+# GPU- and CPU-encoded phases in one song).
+_PHASE_WORKERS = 3
 
 
 def detect_hw_encoder():
@@ -426,39 +440,51 @@ def encode_song(style, raw_clip, rank, title, artist, peak, entry_type,
             f"to fit a {overlay_duration}s overlay transition on each side."
         )
 
-    phases = []
+    # Every phase reads its own independent window of the same immutable
+    # raw_clip/overlay_png and writes to its own path, so none of them
+    # depends on another's output - only the splice below (concatenate_clips)
+    # has a real dependency, on all of them being done. Built as a plan
+    # first, in final playback order, rather than run immediately: that
+    # order has to survive the phases running concurrently and finishing in
+    # whatever order they happen to (see the concatenate_clips call below).
+    phase_specs: list[tuple[str, object, tuple]] = []
+    if lead_bare:
+        p = f"{clips_dir}/phase_{slug}_rank{rank}_lead.mp4"
+        phase_specs.append((p, _build_bare_cmd, (raw_clip, cw, ch, fps, window_start, lead_bare, p)))
+
+    p = f"{clips_dir}/phase_{slug}_rank{rank}_in.mp4"
+    phase_specs.append((p, _build_overlay_phase_cmd,
+                         (raw_clip, overlay_png, cw, ch, fps, window_start + lead_bare, overlay_duration,
+                          overlay_enter, False, p)))
+
+    p = f"{clips_dir}/phase_{slug}_rank{rank}_static.mp4"
+    phase_specs.append((p, _build_encode_cmd,
+                         (raw_clip, overlay_png, cw, ch, p, fps, static_start, static_end - static_start)))
+
+    p = f"{clips_dir}/phase_{slug}_rank{rank}_out.mp4"
+    phase_specs.append((p, _build_overlay_phase_cmd,
+                         (raw_clip, overlay_png, cw, ch, fps, static_end, overlay_duration, overlay_exit, True, p)))
+
+    if trail_bare:
+        p = f"{clips_dir}/phase_{slug}_rank{rank}_trail.mp4"
+        phase_specs.append((p, _build_bare_cmd,
+                             (raw_clip, cw, ch, fps, window_end - trail_bare, trail_bare, p)))
+
+    phases = [spec[0] for spec in phase_specs]
     try:
-        if lead_bare:
-            p = f"{clips_dir}/phase_{slug}_rank{rank}_lead.mp4"
-            _run_ffmpeg(_build_bare_cmd, codec, (raw_clip, cw, ch, fps, window_start, lead_bare, p),
-                        f"OVERLAY[rank {rank}]")
-            phases.append(p)
-
-        p = f"{clips_dir}/phase_{slug}_rank{rank}_in.mp4"
-        _run_ffmpeg(_build_overlay_phase_cmd, codec,
-                    (raw_clip, overlay_png, cw, ch, fps, window_start + lead_bare, overlay_duration,
-                     overlay_enter, False, p),
-                    f"OVERLAY[rank {rank}]")
-        phases.append(p)
-
-        p = f"{clips_dir}/phase_{slug}_rank{rank}_static.mp4"
-        _run_ffmpeg(_build_encode_cmd, codec,
-                    (raw_clip, overlay_png, cw, ch, p, fps, static_start, static_end - static_start),
-                    f"OVERLAY[rank {rank}]")
-        phases.append(p)
-
-        p = f"{clips_dir}/phase_{slug}_rank{rank}_out.mp4"
-        _run_ffmpeg(_build_overlay_phase_cmd, codec,
-                    (raw_clip, overlay_png, cw, ch, fps, static_end, overlay_duration, overlay_exit, True, p),
-                    f"OVERLAY[rank {rank}]")
-        phases.append(p)
-
-        if trail_bare:
-            p = f"{clips_dir}/phase_{slug}_rank{rank}_trail.mp4"
-            _run_ffmpeg(_build_bare_cmd, codec,
-                        (raw_clip, cw, ch, fps, window_end - trail_bare, trail_bare, p),
-                        f"OVERLAY[rank {rank}]")
-            phases.append(p)
+        # ThreadPoolExecutor's own __exit__ blocks until every submitted
+        # phase has finished (success or failure) before this `with` block
+        # can be left, even when a future.result() below raises and unwinds
+        # through it - so by the time that exception reaches the `finally`
+        # below, no phase encode is still running in the background to
+        # race the cleanup there.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(_PHASE_WORKERS, len(phase_specs))) as pool:
+            futures = [
+                pool.submit(_run_ffmpeg, build_cmd, codec, args, f"OVERLAY[rank {rank}]")
+                for _, build_cmd, args in phase_specs
+            ]
+            for future in futures:
+                future.result()
 
         # Full re-encode (not stream copy) here: these phases were each
         # encoded by independent ffmpeg processes and, unlike the top-level

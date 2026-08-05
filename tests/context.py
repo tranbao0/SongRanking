@@ -33,16 +33,28 @@ class KeepOpenConnection(sqlite3.Connection):
         super().close()
 
 
-def make_db(keep_open: bool = False) -> sqlite3.Connection:
+def make_db(keep_open: bool = False, check_same_thread: bool = True) -> sqlite3.Connection:
     """
     An in-memory registry with the same schema get_connection() produces,
     including the migrated columns. Built by replaying db.py's own schema
     statements rather than by copying them, so a schema change there is
     picked up here automatically.
+
+    check_same_thread=False is for tests standing this in as a mocked
+    get_remote_connection() against db.push_from_local(): that function's
+    _run_chunked dispatches each chunk to its own worker thread (see
+    db.py), so a test remote connection needs to tolerate being used from
+    a thread other than the one that created it - safe here because
+    SQLite's own default build is thread-safe ("serialized" mode), which
+    is exactly what this flag exists to let a caller opt into.
     """
     from registry import db
 
-    conn = sqlite3.connect(":memory:", factory=KeepOpenConnection if keep_open else sqlite3.Connection)
+    conn = sqlite3.connect(
+        ":memory:",
+        check_same_thread=check_same_thread,
+        factory=KeepOpenConnection if keep_open else sqlite3.Connection,
+    )
     conn.row_factory = sqlite3.Row
     conn.executescript(db._SCHEMA)
     for migration in db._MIGRATIONS:

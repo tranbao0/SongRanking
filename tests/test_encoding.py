@@ -127,8 +127,83 @@ class RawClipCacheTest(unittest.TestCase):
 
     def test_cached_clip_returns_the_path_once_downloaded(self):
         url = "https://www.youtube.com/watch?v=aaaaaaaaaaa"
-        with mock.patch.object(encoding.os.path, "exists", return_value=True):
+        with mock.patch.object(encoding.os.path, "exists", return_value=True), \
+             mock.patch.object(encoding, "_cached_duration", return_value=15.0):
             self.assertEqual(encoding.cached_clip(url), encoding.cached_clip_path(url))
+
+    def test_cached_clip_is_none_when_the_file_is_corrupt(self):
+        """A stale/corrupt cache entry (e.g. an interrupted prior run) must
+        not be trusted just because it exists - see cached_clip's docstring."""
+        url = "https://www.youtube.com/watch?v=aaaaaaaaaaa"
+        with mock.patch.object(encoding.os.path, "exists", return_value=True), \
+             mock.patch.object(encoding, "_cached_duration", return_value=None):
+            self.assertIsNone(encoding.cached_clip(url))
+
+
+class EncodeSongPhaseTest(unittest.TestCase):
+    """
+    Guards encode_song's phase-level concurrency (see _PHASE_WORKERS): the
+    lead/in/static/out/trail phases run in a small thread pool since none
+    depends on another's output, but concatenate_clips still has to
+    receive them in fixed playback order regardless of which phase
+    finishes first, and a failing phase must still surface (not be
+    silently swallowed) with every phase file cleaned up.
+    """
+
+    def setUp(self):
+        self.style = {
+            "canvas": {"width": 1920, "height": 1080, "fps": 30},
+            "transition": {
+                "overlay_type": "wiperight", "overlay_exit_type": "wipeleft",
+                "overlay_duration": 0.5, "duration": 1.0,
+            },
+        }
+        p1 = mock.patch.object(encoding, "build_overlay_image", return_value=mock.Mock(save=mock.Mock()))
+        p1.start(); self.addCleanup(p1.stop)
+        p2 = mock.patch.object(encoding, "_cached_duration", return_value=20.0)
+        p2.start(); self.addCleanup(p2.stop)
+        p3 = mock.patch.object(encoding.os.path, "exists", return_value=True)
+        p3.start(); self.addCleanup(p3.stop)
+        p4 = mock.patch.object(encoding.os, "remove")
+        self.remove_mock = p4.start()
+        self.addCleanup(p4.stop)
+
+    def _encode(self, **overrides):
+        kwargs = dict(
+            style=self.style, raw_clip="raw.mp4", rank=1, title="Song", artist="Artist",
+            peak=1, entry_type="", views=100, release_date="2026.01.01",
+            months_on_chart=1, head_trim=0.0, tail_trim=0.0, clips_dir="clips",
+        )
+        kwargs.update(overrides)
+        return encoding.encode_song(**kwargs)
+
+    def test_phases_are_spliced_in_fixed_order_regardless_of_completion_order(self):
+        with mock.patch.object(encoding, "_run_ffmpeg") as run_ffmpeg, \
+             mock.patch.object(encoding, "concatenate_clips") as concat:
+            self._encode()
+
+        self.assertEqual(run_ffmpeg.call_count, 5)  # lead, in, static, out, trail
+        phases_arg = concat.call_args.args[0]
+        self.assertEqual(
+            [p.rsplit("_", 1)[-1] for p in phases_arg],
+            ["lead.mp4", "in.mp4", "static.mp4", "out.mp4", "trail.mp4"],
+        )
+
+    def test_a_failing_phase_still_cleans_up_every_phase_file_and_raises(self):
+        def _fake_run_ffmpeg(build_cmd, codec, args, error_label):
+            if build_cmd is encoding._build_encode_cmd:  # the static phase
+                raise RuntimeError(f"{error_label} failed (ffmpeg exit 1): boom")
+
+        with mock.patch.object(encoding, "_run_ffmpeg", side_effect=_fake_run_ffmpeg), \
+             mock.patch.object(encoding, "concatenate_clips") as concat:
+            with self.assertRaises(RuntimeError):
+                self._encode()
+
+        concat.assert_not_called()
+        # Every phase gets a cleanup attempt, not just the ones declared
+        # before the failing one - concurrent phases can finish (and leave
+        # a file on disk) in any order relative to each other's failure.
+        self.assertEqual(self.remove_mock.call_count, 5)
 
 
 class SafeFilenameTest(unittest.TestCase):

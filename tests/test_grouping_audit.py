@@ -1,7 +1,7 @@
 """
 Guards the three audit triggers and the state machine around them - not
 the agent's own judgment, which is out of reach of a unit test. No test
-here ever actually launches a subprocess; subprocess.run is mocked
+here ever actually launches a subprocess; subprocess.Popen is mocked
 throughout.
 """
 
@@ -12,6 +12,33 @@ from unittest import mock
 from .context import make_db, add_channel, add_video
 
 from registry import db, grouping_audit
+
+
+class _FakeLineStream:
+    """Stands in for a Popen.stdout that yields `lines` then closes -
+    _stream_stdout's reader thread iterates this exactly like a real
+    pipe and sees a clean EOF afterward."""
+
+    def __init__(self, lines):
+        self._lines = iter(lines)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._lines)
+
+
+class _BlockingStdout:
+    """Stands in for a Popen.stdout that never produces output - used to
+    exercise _invoke_agent's timeout path without an hour-long sleep."""
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        import queue as _queue
+        return _queue.Queue().get()  # blocks forever
 
 
 class GroupingAuditTest(unittest.TestCase):
@@ -27,6 +54,13 @@ class GroupingAuditTest(unittest.TestCase):
         """Route STATE_FILE to a throwaway path so a test's persistence
         never touches the real data/.grouping_audit_state.json."""
         patcher = mock.patch.object(grouping_audit, "STATE_FILE", tmp_path / "state.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _use_tmp_log(self, tmp_path):
+        """Route LOG_FILE to a throwaway path so a test's transcript
+        never touches the real data/.grouping_audit_log.jsonl."""
+        patcher = mock.patch.object(grouping_audit, "LOG_FILE", tmp_path / "log.jsonl")
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -170,26 +204,50 @@ class GroupingAuditTest(unittest.TestCase):
             self.assertEqual(grouping_audit._load_state()["syncs_since_audit"], 5)
 
     def test_invoke_agent_handles_missing_cli_without_raising(self):
-        with mock.patch("registry.grouping_audit.subprocess.run", side_effect=FileNotFoundError):
+        with mock.patch("registry.grouping_audit.subprocess.Popen", side_effect=FileNotFoundError):
             self.assertFalse(grouping_audit._invoke_agent("some prompt"))
 
     def test_invoke_agent_handles_timeout_without_raising(self):
-        import subprocess
-        with mock.patch("registry.grouping_audit.subprocess.run",
-                         side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=1)):
-            self.assertFalse(grouping_audit._invoke_agent("some prompt"))
+        import tempfile
+        from pathlib import Path
+
+        fake_process = mock.Mock()
+        fake_process.stdout = _BlockingStdout()
+
+        with tempfile.TemporaryDirectory() as d:
+            self._use_tmp_log(Path(d))
+            with mock.patch("registry.grouping_audit.subprocess.Popen", return_value=fake_process), \
+                 mock.patch.object(grouping_audit, "AGENT_TIMEOUT_SECONDS", 0.05):
+                self.assertFalse(grouping_audit._invoke_agent("some prompt"))
+            fake_process.kill.assert_called_once()
 
     def test_invoke_agent_reports_failure_on_nonzero_exit(self):
-        completed = mock.Mock(returncode=1, stdout="", stderr="boom")
-        with mock.patch("registry.grouping_audit.subprocess.run", return_value=completed):
-            self.assertFalse(grouping_audit._invoke_agent("some prompt"))
+        import tempfile
+        from pathlib import Path
+
+        fake_process = mock.Mock()
+        fake_process.stdout = _FakeLineStream(['{"type": "result", "num_turns": 1}\n'])
+        fake_process.wait.return_value = 1
+
+        with tempfile.TemporaryDirectory() as d:
+            self._use_tmp_log(Path(d))
+            with mock.patch("registry.grouping_audit.subprocess.Popen", return_value=fake_process):
+                self.assertFalse(grouping_audit._invoke_agent("some prompt"))
 
     def test_invoke_agent_succeeds_on_zero_exit(self):
-        completed = mock.Mock(returncode=0, stdout="done", stderr="")
-        with mock.patch("registry.grouping_audit.subprocess.run", return_value=completed) as mock_run:
-            self.assertTrue(grouping_audit._invoke_agent("some prompt"))
-            _, kwargs = mock_run.call_args
-            self.assertEqual(kwargs["input"], "some prompt")
+        import tempfile
+        from pathlib import Path
+
+        fake_process = mock.Mock()
+        fake_process.stdout = _FakeLineStream(['{"type": "result", "num_turns": 1}\n'])
+        fake_process.wait.return_value = 0
+
+        with tempfile.TemporaryDirectory() as d:
+            self._use_tmp_log(Path(d))
+            with mock.patch("registry.grouping_audit.subprocess.Popen", return_value=fake_process):
+                self.assertTrue(grouping_audit._invoke_agent("some prompt"))
+            fake_process.stdin.write.assert_called_once_with("some prompt")
+            fake_process.stdin.close.assert_called_once()
 
     def test_new_channels_prompt_names_the_channel(self):
         prompt = grouping_audit._build_prompt(

@@ -9,6 +9,7 @@ Three components: a discovery/data layer, a chart engine, and a render pipeline.
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
 - [Setup](#setup)
+- [Hosted registry database (Turso)](#hosted-registry-database-turso)
 - [Commands](#commands)
 - [Guide: adding a new genre](#guide-adding-a-new-genre)
 - [Guide: adding or customizing a chart](#guide-adding-or-customizing-a-chart)
@@ -39,7 +40,7 @@ If you only do the [Setup](#setup) steps below and nothing else, `sync` will run
 
 ### 1. Discovery & data layer
 
-Tracks genre-tagged artists and their view-count history. Everything it produces lives in `data/registry.db` (SQLite).
+Tracks genre-tagged artists and their view-count history. Everything it produces lives in a hosted Turso (libSQL) database - see [Hosted registry database (Turso)](#hosted-registry-database-turso) - shared across every machine that runs `sync`/`chart`.
 
 Channel discovery, per genre:
 
@@ -105,18 +106,59 @@ exclude   ─┘                                    │
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp)
 - [FFmpeg](https://ffmpeg.org/)
 - Python 3.10+
+- [Turso CLI](https://docs.turso.tech/cli/installation) - only needed for the one-time database setup below (and wherever `sync`'s [automated grouping audit](#automated-grouping-audits) runs). **On Windows this requires WSL** - the install script is bash-only; run it from a WSL shell.
 
 ## Setup
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/SongRanking.git
 cd SongRanking
-cp .env.example .env   # add your GEMINI_API_KEY and YOUTUBE_API_KEY
+cp .env.example .env   # add your GEMINI_API_KEY, YOUTUBE_API_KEY, and TURSO_DATABASE_URL/TURSO_AUTH_TOKEN
 pip install -r requirements.txt   # install all Python dependencies
 ```
 
 `YOUTUBE_API_KEY`: required for `sync`/`chart`; also improves `csv`/`search` results.
 `GEMINI_API_KEY`: optional, used for AI title cleanup and song grouping; both fall back to non-AI behavior if unset.
+`TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN`: required for `sync`/`chart`/`decouple`/`regroup` - see below.
+
+## Hosted registry database (Turso)
+
+The registry (`channels`, `videos`, `songs`, `view_snapshots`) lives in a private [Turso](https://turso.tech/) (hosted libSQL) database rather than a local SQLite file.
+This exists because the registry used to be `data/registry.db`, a local file inside this repo's OneDrive-synced folder - and OneDrive gives no real multi-writer safety for a single binary file: a delete on one machine silently propagates to every synced machine, with no real history beyond whatever survives in a Recycle Bin.
+That cost a real data-loss incident.
+
+`sync`/`decouple`/`regroup` don't read/write the hosted database statement-by-statement, though - each opens with exactly one network round trip (pull the current hosted state into a local working copy, `data/.registry_working.db`) and closes with exactly one more (push that copy's final state back), same as this project's own backup-and-import discipline. Everything in between - the actual API-driven catalog work, `grouping_audit.py`'s headless agent - runs against that local file at local-disk speed, with zero network calls to Turso in the middle. See `src/registry/db.py`'s module docstring for the full reasoning; a statement-per-round-trip design was tried first and was too slow at this project's scale.
+
+**One-time setup** (once per registry, not per machine):
+
+```bash
+turso auth login                          # or: turso auth signup
+turso db import path/to/your/registry.db  # seed a new hosted db from an existing local file
+                                           # (names the database after the file, e.g. "registry")
+turso db show registry --url              # -> TURSO_DATABASE_URL
+turso db tokens create registry           # -> TURSO_AUTH_TOKEN
+```
+
+Add both to `.env`:
+
+```bash
+TURSO_DATABASE_URL=libsql://registry-your-org.turso.io
+TURSO_AUTH_TOKEN=your_token_here
+```
+
+**Every other machine** just needs the same two `.env` values - no shared local file, no per-machine setup beyond that; each machine's own `sync` pulls a fresh working copy for itself.
+
+`decouple`'s backup (see [Redoing grouping](#redoing-grouping)) is a plain copy of that local working copy, taken before decouple's own changes land - restoring it means putting it back at `data/.registry_working.db` before `push_from_local()` runs (or importing it into a fresh Turso database directly with `turso db import <backup-file>` if the bad state already got pushed).
+
+`sync`/`decouple`/`regroup` each pull then push automatically, but the two halves are also available on their own:
+
+```bash
+python run.py pull    # overwrite the local working copy with Turso's current state
+python run.py push    # overwrite Turso with the local working copy's current state
+```
+
+`pull` writes a timestamped backup of whatever the local working copy held (`data/registry.<timestamp>.pre-pull.db`) before overwriting it, and keeps only the 3 most recent such backups - restoring one means putting it back at `data/.registry_working.db` before `push` runs.
+`push` has no equivalent backup on the Turso side, since Turso itself is the durable copy - export one first with the `turso` CLI (`turso db shell registry .dump`, or see [scripts/turso_shell.sh](scripts/turso_shell.sh)) if you want a point-in-time snapshot of what's currently live before overwriting it.
 
 ## Commands
 
@@ -154,6 +196,15 @@ python run.py regroup                   # re-derive groupings decouple cleared
 python run.py regroup --genre kpop      # one genre only
 ```
 
+### Manual registry pull/push
+
+`sync`/`decouple`/`regroup` each pull then push automatically around their own work - these expose the two halves on their own, for inspecting or restoring the registry without running a full command:
+
+```bash
+python run.py pull                      # overwrite the local working copy with Turso's current state
+python run.py push                      # overwrite Turso with the local working copy's current state
+```
+
 Grouping is additive: a video's `song_id` is set once and never re-derived, which is what keeps a daily `sync` cheap.
 The consequence is that a registry grouped under settings you have since changed - or grouped without the AI tier because a budget ran out mid-run - cannot be improved by syncing again, because a sync only looks at videos it has never seen.
 `decouple` is the escape hatch: it clears the assignments so grouping can be made afresh.
@@ -166,13 +217,13 @@ It never deletes videos. Only the grouping goes.
 - A song holding several videos is a real decision, and any made by the AI tier cost API calls to make again.
 
 The prompt reports both counts, and requires you to type `decouple` rather than accept a `y`.
-A timestamped backup is written before anything changes, so an accidental run costs no quota to undo - restore the `.pre-decouple.db` file.
+A timestamped local backup (`data/registry.<timestamp>.pre-decouple.db`) is written before anything changes, so an accidental run costs no quota to undo (see [Hosted registry database (Turso)](#hosted-registry-database-turso) for how to restore it).
 
 `regroup` is the other half: it runs the videos `decouple` left with a NULL `song_id` back through the same grouping tiers, channel by channel.
 It makes no YouTube API call - every candidate was already fetched and MV-filtered on a prior sync, so only the grouping is redone, not the catalogue.
 It costs nothing beyond whatever the AI tier spends (subject to the same daily Gemini budget as `sync`), and is safe to interrupt and re-run: a channel with nothing left ungrouped is skipped.
 
-- `sync` only updates `data/registry.db` - no download/render.
+- `sync` only updates the hosted registry - no download/render.
 - `chart` only reads what `sync` last recorded - no fresh YouTube fetch.
 - A channel's first `sync` walks its full upload history; later syncs only check for new uploads (see [API spend safeguards](#api-spend-safeguards)).
 
@@ -332,7 +383,7 @@ Never commit that file - it carries a live YouTube session. If `YTDLP_COOKIES_FI
 
 `src/registry/grouping_audit.py` hands the registry to a subscription-based coding-agent CLI (Claude Code by default) for the judgment-heavy review described in [keeping song grouping accurate](#guide-keeping-song-grouping-accurate), automatically, as part of `sync`.
 
-**This needs its own one-time setup and does nothing out of the box.** It shells out to a CLI (`claude -p` by default) that must already be installed *and authenticated* on the machine running `sync` - there is no API key for this in `.env`, the subprocess inherits whatever login state that CLI already has. If it isn't installed, `sync` logs a one-line warning and moves on; the audit is skipped, the sync itself is not affected.
+**This needs its own one-time setup and does nothing out of the box.** It shells out to a CLI (`claude -p` by default) that must already be installed *and authenticated* on the machine running `sync` - there is no API key for this in `.env`, the subprocess inherits whatever login state that CLI already has. The agent reaches the registry through the same local working copy `sync` already pulled (see [Hosted registry database (Turso)](#hosted-registry-database-turso)) - a plain local SQLite file, no turso CLI needed for this routine path. If the agent CLI isn't available, `sync` logs a one-line warning and moves on; the audit is skipped, the sync itself is not affected.
 
 Three independent triggers, checked after every `sync`, any one of which is enough:
 
@@ -351,7 +402,7 @@ GROUPING_AUDIT_VOLUME_THRESHOLD=50    # new uploads on one channel in one sync t
 GROUPING_AGENT_TIMEOUT=3600           # seconds to wait before giving up on the agent
 ```
 
-The agent runs headless (its prompt piped over stdin, one shot, no back-and-forth), reads `docs/manual-grouping-prompt.md` for the full methodology, and is told to apply fixes directly rather than propose a diff - safe here because this is a lone unattended pass with nothing else writing to `data/registry.db` at the same time. It's also told to fold anything it learns that isn't already in that doc's precedents section back into it, so the next audit (human or agent) inherits the judgment call instead of re-deriving it.
+The agent runs headless (its prompt piped over stdin, one shot, no back-and-forth), reads `docs/manual-grouping-prompt.md` for the full methodology, and is told to apply fixes directly to the local working copy rather than propose a diff - safe here because this is a lone unattended pass with nothing else writing to it at the same time, and its edits become part of what `sync` pushes back to Turso once it finishes. It's also told to fold anything it learns that isn't already in that doc's precedents section back into it, so the next audit (human or agent) inherits the judgment call instead of re-deriving it.
 
 It's safe to run alongside routine syncs, and safe to skip a cycle if the agent CLI isn't available: a missed correction just sits as a minor chart inaccuracy until the next audit catches it. `view_snapshots` keys on `video_id`, not `song_id`, and a chart re-aggregates through `videos.song_id` at render time - so a late grouping fix never loses or corrupts anything already collected.
 
@@ -373,7 +424,10 @@ Errors that cannot succeed - a bad key, a malformed request - are not retried at
 
 | Path | What it is |
 |---|---|
-| `data/registry.db` | SQLite: channels, videos, songs (same-song groupings), view_snapshots. Git-ignored. |
+| Hosted Turso database | channels, videos, songs (same-song groupings), view_snapshots - the durable source of truth. See [Hosted registry database (Turso)](#hosted-registry-database-turso). |
+| `data/.registry_working.db` | Local working copy `sync`/`decouple`/`regroup`/`pull`/`push` pull from Turso, do their own work against, and push back. Ephemeral - safe to delete. Git-ignored. |
+| `data/registry.<timestamp>.pre-decouple.db` | Local backup written before a `decouple`. Git-ignored. |
+| `data/registry.<timestamp>.pre-pull.db` | Local backup of the working copy written before a `pull` overwrites it. Only the 3 most recent are kept. Git-ignored. |
 | `data/channels/<genre>_manual.yaml` | Hand-curated channel additions per genre. Tracked in git. |
 | `data/channels/<genre>_exclude.yaml` | Hand-curated channel exclusions per genre. Tracked in git. |
 | `data/channels/<genre>_manual_videos.yaml` | Hand-curated individually pinned videos per genre. Tracked in git. |

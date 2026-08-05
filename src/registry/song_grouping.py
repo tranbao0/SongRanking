@@ -516,9 +516,10 @@ def group_channel_videos(
     # AI tier to do, and building prompts only to discard them would cost a
     # pass over every remaining title plus a log line per chunk.
     chunks = chunked(singles) if gemini_client.is_available() else []
-    if len(chunks) > 2:
-        # A large channel can mean dozens of chunked Gemini calls - without
-        # this, that stretch looks identical to a hang.
+    if chunks:
+        # Even a single chunk is a real network call that can retry with
+        # growing backoff on a rate limit - printing only for >2 chunks
+        # made that stretch look identical to a silent hang.
         print(f"    {len(singles)} title(s) need AI grouping ({len(chunks)} chunk(s))...")
 
     resolved: list[tuple[int | None, list[dict]]] = [(None, members) for members in confident]

@@ -25,11 +25,12 @@ def take_snapshot(genre: str | None = None, video_ids: list[str] | None = None) 
     today are skipped, so re-running the same day is a no-op. Returns the
     number of snapshot rows inserted.
 
-    Videos with song_id NULL are skipped entirely - a blocked non-song
-    upload (teaser, "making of", etc.; see catalog.py's is_blocked_title)
-    kept in `videos` only so catalog sync doesn't re-walk past it, or a
-    video mid-regroup after a decouple. Neither belongs in a chart, so
-    spending a fetch on it is pure waste.
+    Videos with song_id NULL are skipped entirely - per catalog.py's
+    module docstring, that state unambiguously means a real video
+    decouple.py cleared and regroup.py hasn't re-grouped yet (blocked
+    non-song uploads never enter `videos` at all; they go to
+    rejected_videos instead). It doesn't belong in a chart yet, so
+    spending a fetch on it before it's grouped is premature.
 
     Scope narrows in two independent, combinable ways:
       - `genre`: just the videos on that genre's channels (used by `sync`,
