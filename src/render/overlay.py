@@ -1,4 +1,5 @@
 import json
+import os
 import unicodedata
 from functools import lru_cache
 
@@ -10,9 +11,50 @@ def load_style(path="assets/templates/style.json"):
         return json.load(f)
 
 
+# style.json pins Windows Malgun Gothic paths (the machine this project is
+# authored on). Those paths don't exist on Linux/macOS, so on any other OS
+# the configured font is transparently swapped for the first installed
+# Hangul-capable font found below - the overlay draws Korean titles with
+# Pillow precisely because it needs a Hangul font, so a Latin-only default
+# would render tofu boxes. The configured path always wins when it opens,
+# leaving the authoring machine's behavior unchanged.
+_FALLBACK_FONTS = (
+    # (bold, regular) pairs, in preference order. First existing pair wins.
+    ("/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
+     "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"),
+    ("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    # macOS ships a Korean font at a stable path.
+    ("/System/Library/Fonts/AppleSDGothicNeo.ttc",
+     "/System/Library/Fonts/AppleSDGothicNeo.ttc"),
+)
+
+
+def _looks_bold(path):
+    base = os.path.basename(path).lower()
+    return "bold" in base or "bd" in base
+
+
+@lru_cache(maxsize=None)
+def _resolve_font_path(path):
+    """
+    Return `path` when it can actually be opened as a font; otherwise fall
+    back to an installed Hangul-capable font (bold or regular, matched to
+    the requested face). Cached so the fallback probe runs once per path.
+    """
+    if os.path.exists(path):
+        return path
+    bold = _looks_bold(path)
+    for bold_path, regular_path in _FALLBACK_FONTS:
+        candidate = bold_path if bold else regular_path
+        if os.path.exists(candidate):
+            return candidate
+    return path  # nothing better available - let the original error surface
+
+
 @lru_cache(maxsize=None)
 def _font(path, size):
-    return ImageFont.truetype(path, size)
+    return ImageFont.truetype(_resolve_font_path(path), size)
 
 
 def _rgb(c):
