@@ -150,22 +150,83 @@ class ArtistIndexTest(unittest.TestCase):
 class GroupPromptTest(unittest.TestCase):
     """
     Pins two grouping rules that are decisions rather than mechanics, so
-    they can't be edited out of the prompt unnoticed. Measured behaviour
-    was sensitive to both: before the re-arrangement rule was explicit,
-    60-title chunks mis-merged 35 of 127 pairs by folding remixes into
-    the original.
+    they can't be edited out of the prompt unnoticed.
     """
 
-    def test_rearranged_versions_are_declared_different_songs(self):
+    def test_rearranged_versions_are_declared_the_same_song(self):
+        """
+        2026-08-10 rule reversal: a remix/acoustic/instrumental/language
+        version now merges with the original instead of staying split -
+        see song_grouping's module docstring. The general "different
+        song" rule (native-script mismatch, a numbered sequel) must still
+        be present, just no longer tied to these terms.
+        """
         prompt = song_grouping._GROUP_PROMPT.lower()
         for term in ("remix", "acoustic", "instrumental"):
             self.assertIn(term, prompt)
-        self.assertIn("different song", prompt)
+        self.assertIn("same song", prompt)
+        self.assertIn("different song", prompt)  # still true for the general case
 
     def test_behind_the_scenes_content_is_excluded(self):
         prompt = song_grouping._GROUP_PROMPT.lower()
         self.assertIn("behind-the-scenes", prompt)
         self.assertIn("singleton", prompt)
+
+    def test_tags_are_declared_a_hint_not_authoritative(self):
+        """
+        Tags must never be allowed to override what the title (especially
+        native-script text) says - see song_grouping's module docstring on
+        why only the AI tier, never a deterministic tier, reads them at all.
+        """
+        prompt = song_grouping._GROUP_PROMPT.lower()
+        self.assertIn("tags", prompt)
+        self.assertIn("hint", prompt)
+
+
+class VideoTagsLabelTest(unittest.TestCase):
+    """
+    _video_tags_label formats a video's tags for the AI prompt only - see
+    song_grouping's module docstring for why this stays out of every
+    deterministic tier's matching key.
+    """
+
+    def test_json_encoded_tags_are_parsed_and_joined(self):
+        v = {"title": "x", "tags": '["Dynamite", "BTS", "Official"]'}
+        self.assertEqual(song_grouping._video_tags_label(v), "Dynamite, BTS, Official")
+
+    def test_a_list_is_accepted_directly(self):
+        """A video dict built fresh this sync run (not yet round-tripped
+        through the database's JSON-encoded column) has a plain list."""
+        v = {"title": "x", "tags": ["Dynamite", "BTS"]}
+        self.assertEqual(song_grouping._video_tags_label(v), "Dynamite, BTS")
+
+    def test_missing_tags_column_yields_empty_string(self):
+        """A video dict with no 'tags' key at all - e.g. from before this
+        column existed, or a caller that never populated it."""
+        self.assertEqual(song_grouping._video_tags_label({"title": "x"}), "")
+
+    def test_null_and_empty_tags_yield_empty_string(self):
+        for tags in (None, "", "[]", []):
+            with self.subTest(tags=tags):
+                self.assertEqual(song_grouping._video_tags_label({"title": "x", "tags": tags}), "")
+
+    def test_unparseable_tags_yield_empty_string_not_a_crash(self):
+        v = {"title": "x", "tags": "not valid json"}
+        self.assertEqual(song_grouping._video_tags_label(v), "")
+
+    def test_a_non_list_json_value_yields_empty_string(self):
+        v = {"title": "x", "tags": '"just a string"'}
+        self.assertEqual(song_grouping._video_tags_label(v), "")
+
+    def test_long_tag_lists_are_capped(self):
+        v = {"title": "x", "tags": [f"tag{i}" for i in range(50)]}
+        label = song_grouping._video_tags_label(v)
+        self.assertEqual(label.count(","), song_grouping._MAX_TAGS_IN_PROMPT - 1)
+
+    def test_a_very_long_individual_tag_is_truncated(self):
+        v = {"title": "x", "tags": ["x" * 500]}
+        label = song_grouping._video_tags_label(v)
+        self.assertEqual(len(label), song_grouping._MAX_TAG_LEN)
 
 
 class NormalizeTitleTest(unittest.TestCase):
@@ -237,6 +298,118 @@ class NormalizeTitleTest(unittest.TestCase):
             "ROSÉ & Bruno Mars - APT. (live from 2024 MAMA AWARDS)",
         ))
 
+    def test_camera_angle_qualifiers_on_dance_practice_match_the_mv(self):
+        """
+        A pure camera/take qualifier - "(Moving Cam ver.)", "(Fix ver.)" -
+        names which camera recorded the same dance practice, not a
+        different arrangement. Found missing a match entirely (title
+        survived normalization with "dance practice video moving cam ver"
+        still attached) in a 2026-08-05 whole-registry audit of VIXX's
+        "향 (Scentist)" - neither the bracket-keyword check nor the
+        trailing-marker regex recognized bare "moving"/"cam"/"fix" words.
+        """
+        self.assertTrue(self._same(
+            "빅스(VIXX) - '향 (Scentist)' Official M/V",
+            "빅스(VIXX) - 향 (Scentist) Dance Practice Video (Moving Cam ver.)",
+        ))
+        self.assertTrue(self._same(
+            "ATEEZ(에이티즈) - 'BAD' Official MV",
+            "ATEEZ(에이티즈) - 'BAD' Dance Practice (FIX Ver.)",
+        ))
+
+    def test_any_ver_tag_on_a_dance_or_performance_video_matches_the_mv(self):
+        """
+        On a Dance Practice / Performance Video / Choreography Video, a
+        named Ver. tag is a costume theme or occasion, never a producer
+        alias or a rearrangement (there's no separate audio mix to credit
+        on a dance recording) - so it always merges, unlike the same-
+        looking tag on a Lyric Video or Visualizer (see the do-not-merge
+        counterexample below).
+        """
+        self.assertTrue(self._same(
+            "OH MY GIRL(오마이걸) - BLACK MIRROR M/V",
+            "OH MY GIRL(오마이걸) - BLACK MIRROR Dance Practice (Halloween ver.)",
+        ))
+        self.assertTrue(self._same(
+            "에이스(A.C.E) 'My Girl' M/V",
+            "에이스(A.C.E) 'My Girl' Performance Video (Moving ver.)",
+        ))
+
+    def test_language_ver_tag_merges_regardless_of_video_type(self):
+        """
+        2026-08-10 rule reversal: a different-language re-recording now
+        merges with the original - see song_grouping's module docstring.
+        RIIZE ("Love 119 (Japanese Ver.)" Dance Practice / plain
+        Performance Video) and ZHOUMI (Chinese-Ver/Korean-Ver "Uncontact
+        LIVE Performance Video" pair) previously stayed split here.
+        """
+        self.assertTrue(self._same(
+            "RIIZE 라이즈 'Love 119' Performance Video",
+            "RIIZE 라이즈 'Love 119 (Japanese Ver.)' Dance Practice",
+        ))
+        self.assertTrue(self._same(
+            "ZHOUMI 'Starry Night' (Chinese Ver.) Uncontact LIVE Performance Video",
+            "ZHOUMI 'Starry Night' (Korean Ver.) Uncontact LIVE Performance Video",
+        ))
+
+    def test_named_ver_tag_off_a_dance_or_performance_video_now_merges(self):
+        """
+        2026-08-10 rule reversal: a producer/DJ-alias Ver. tag (a remix
+        credit) and a language Ver. tag on a Lyric Video/Official MV now
+        both merge with the plain upload, same as any other rearrangement
+        or language version - see song_grouping's module docstring.
+        """
+        self.assertTrue(self._same(
+            "ATEEZ(에이티즈) - 'BAD' Official MV",
+            "ATEEZ(에이티즈) - 'BAD (Steve Aoki Ver.)' Lyric Video",
+        ))
+        self.assertTrue(self._same(
+            "ATEEZ(에이티즈) - 'BAD' Official MV",
+            "ATEEZ(에이티즈) - 'BAD (Japanese Ver.)' Official MV",
+        ))
+
+    def test_bare_numbered_ver_tag_matches_regardless_of_video_type(self):
+        """"Decided: merge bare (Ver.) tags too" - a number/letter alone is
+        never a producer alias, so this holds even off a dance/performance
+        video (contrast with the named-tag test above)."""
+        self.assertTrue(self._same("OH MY GIRL 'LIAR LIAR'", "OH MY GIRL 'LIAR LIAR (ver.2)'"))
+
+    def test_remix_and_named_producer_remix_merge_with_the_original(self):
+        """2026-08-10 rule reversal: a remix - bare or named after its
+        producer/DJ - is now the same song as the original."""
+        self.assertTrue(self._same("Dynamite", "Dynamite (Remix)"))
+        self.assertTrue(self._same("LEMONADE", "LEMONADE (2Spade Remix)"))
+        self.assertTrue(self._same("LEMONADE", "LEMONADE (Sara Landry Remix)"))
+
+    def test_arrangement_variants_merge_with_the_original(self):
+        """2026-08-10 rule reversal: acoustic/instrumental/vocal/karaoke/
+        a cappella/sped-up/slowed versions are now the same song."""
+        for other in [
+            "Dynamite (Acoustic Ver.)", "Dynamite (Instrumental)", "Dynamite (Inst.)",
+            "Dynamite (Vocal Ver.)", "Dynamite (Karaoke Ver.)", "Dynamite (A Cappella)",
+            "Dynamite (Acapella)", "Dynamite (Sped Up Ver.)", "Dynamite (Slowed)",
+        ]:
+            with self.subTest(other=other):
+                self.assertTrue(self._same("Dynamite", other), f"{other!r} should match 'Dynamite'")
+
+    def test_bare_language_bracket_merges_with_the_original(self):
+        """A bracketed language name alone, with no "Ver." tag, also merges -
+        the language check doesn't depend on _VER_TAG_RE firing too."""
+        self.assertTrue(self._same("Dynamite", "Dynamite (Japanese)"))
+
+    def test_nfd_titles_match_their_nfc_counterpart(self):
+        """
+        Some titles arrive with Hangul stored as NFD (decomposed Jamo)
+        rather than NFC (precomposed syllables) - visually identical, a
+        different code point sequence. A 2026-08-05 whole-registry audit
+        found 138 existing video titles stored this way.
+        """
+        import unicodedata
+        nfc_title = "장나라 Jang nara - 아마도 사랑이겠죠 M/V"
+        nfd_title = unicodedata.normalize("NFD", nfc_title)
+        self.assertNotEqual(nfc_title, nfd_title, "test fixture should actually differ byte-for-byte")
+        self.assertTrue(self._same(nfc_title, nfd_title))
+
 
 class MatchKeyTest(unittest.TestCase):
     def test_key_is_bare_title_without_artists(self):
@@ -280,9 +453,9 @@ class GroupChannelVideosTest(unittest.TestCase):
         """Runs grouping with Gemini stubbed out, returning (map, call_count)."""
         calls = []
 
-        def _fake_call_gemini(prompt, model=None):
+        def _fake_call_gemini(prompt, model=None, **kwargs):
             calls.append(prompt)
-            return None  # forces the documented ungrouped-singleton fallback
+            return None  # forces song_id NULL (recoverable via regroup)
 
         with mock.patch.object(song_grouping, "call_gemini", _fake_call_gemini):
             result = song_grouping.group_channel_videos(self.conn, "UC_a", existing, new, **kwargs)
@@ -312,6 +485,27 @@ class GroupChannelVideosTest(unittest.TestCase):
         self.assertEqual(calls, 0)
         self.assertEqual(result["a"], result["b"])
 
+    def test_ai_prompt_includes_tags_for_a_video_that_has_them(self):
+        """Tags reach the AI tier's prompt (as a hint, not a matching key -
+        see GroupPromptTest) but only for videos that actually carry them."""
+        calls = []
+
+        def _fake_call_gemini(prompt, model=None, **kwargs):
+            calls.append(prompt)
+            return None
+
+        new = [
+            {"video_id": "a", "title": "Distinct Song A", "tags": '["Dynamite", "BTS"]'},
+            {"video_id": "b", "title": "Distinct Song B"},
+        ]
+        with mock.patch.object(song_grouping, "call_gemini", _fake_call_gemini):
+            song_grouping.group_channel_videos(self.conn, "UC_a", [], new)
+
+        prompt = calls[0]
+        self.assertIn("Distinct Song A [tags: Dynamite, BTS]", prompt)
+        self.assertIn("Distinct Song B", prompt)
+        self.assertNotIn("Distinct Song B [tags:", prompt)
+
     def test_gemini_call_count_is_one_per_chunk_of_unresolved_titles(self):
         """
         The budget-relevant invariant: requests scale with the number of
@@ -336,7 +530,7 @@ class GroupChannelVideosTest(unittest.TestCase):
 
         new = [{"video_id": f"v{i}", "title": f"Distinct Song {i}"} for i in range(CHUNK_SIZE * 3)]
 
-        def _fake(prompt, model=None):
+        def _fake(prompt, model=None, **kwargs):
             return None
 
         with mock.patch.object(song_grouping, "call_gemini", _fake):
@@ -364,7 +558,7 @@ class GroupChannelVideosTest(unittest.TestCase):
         new = [{"video_id": f"v{i}", "title": f"Distinct Song {i}"} for i in range(CHUNK_SIZE * 2)]
         seen = []
 
-        def _fake(prompt, model=None):
+        def _fake(prompt, model=None, **kwargs):
             seen.append(prompt.split("New titles to classify")[0])
             return None
 
@@ -378,34 +572,34 @@ class GroupChannelVideosTest(unittest.TestCase):
         """Runs grouping with call_gemini returning `responses` in order."""
         calls = []
 
-        def _fake_call_gemini(prompt, model=None):
-            calls.append(prompt)
+        def _fake_call_gemini(prompt, model=None, **kwargs):
+            calls.append({"prompt": prompt, **kwargs})
             return responses[min(len(calls) - 1, len(responses) - 1)]
 
         with mock.patch.object(song_grouping, "call_gemini", _fake_call_gemini):
             result = song_grouping.group_channel_videos(self.conn, "UC_a", [], new)
-        return result, len(calls)
+        return result, len(calls), calls
 
-    def test_unreadable_response_is_re_asked(self):
+    def test_ai_calls_pass_structured_response_schema(self):
+        """API-enforced JSON shape is what lets the prompt drop format instructions."""
+        new = [{"video_id": "a", "title": "Song One"}]
+        good = '[{"existing_id": null, "members": [1]}]'
+        _, calls, recorded = self._group_with_responses(new, [good])
+        self.assertEqual(calls, 1)
+        self.assertEqual(recorded[0]["response_schema"], song_grouping._GROUP_RESPONSE_SCHEMA)
+        self.assertEqual(recorded[0]["thinking_level"], "low")
+
+    def test_unreadable_response_leaves_videos_unassigned(self):
         """
-        A malformed response is worth another request: sampling is
-        stochastic so a re-ask usually parses, and giving up strands the
-        whole chunk as singletons permanently.
+        Structured outputs make a second parse attempt almost never worth
+        the billed request - leave song_id NULL so regroup can finish.
         """
         new = [{"video_id": "a", "title": "Song One"}, {"video_id": "b", "title": "Song One Alt"}]
-        good = '[{"existing_id": null, "members": [1, 2]}]'
 
-        result, calls = self._group_with_responses(new, ["not json at all", good])
-        self.assertEqual(calls, 2)
-        self.assertEqual(result["a"], result["b"])  # the retry's grouping was used
-
-    def test_repeatedly_unreadable_response_falls_back_to_singletons(self):
-        new = [{"video_id": "a", "title": "Song One"}, {"video_id": "b", "title": "Song One Alt"}]
-
-        result, calls = self._group_with_responses(new, ["still not json"])
+        result, calls, _ = self._group_with_responses(new, ["not json at all", '[{"existing_id": null, "members": [1, 2]}]'])
         self.assertEqual(calls, song_grouping._MAX_PARSE_ATTEMPTS)
-        self.assertEqual(set(result), {"a", "b"})
-        self.assertNotEqual(result["a"], result["b"])  # nothing dropped, just ungrouped
+        self.assertEqual(calls, 1)
+        self.assertEqual(result, {})
 
     def test_transport_failure_is_not_re_asked(self):
         """
@@ -413,14 +607,15 @@ class GroupChannelVideosTest(unittest.TestCase):
         asking again here just bills the same failure a second time.
         """
         new = [{"video_id": "a", "title": "Song One"}]
-        _, calls = self._group_with_responses(new, [None])
+        result, calls, _ = self._group_with_responses(new, [None])
         self.assertEqual(calls, 1)
+        self.assertEqual(result, {})
 
     def test_valid_response_costs_exactly_one_request(self):
         new = [{"video_id": "a", "title": "Song One"}, {"video_id": "b", "title": "Song Two"}]
         good = '[{"existing_id": null, "members": [1]}, {"existing_id": null, "members": [2]}]'
 
-        result, calls = self._group_with_responses(new, [good])
+        result, calls, _ = self._group_with_responses(new, [good])
         self.assertEqual(calls, 1)
         self.assertNotEqual(result["a"], result["b"])
 
@@ -433,17 +628,32 @@ class GroupChannelVideosTest(unittest.TestCase):
         new = [{"video_id": "a", "title": "Song One"}, {"video_id": "b", "title": "Song Two"}]
         odd = '[{"existing_id": 999, "members": [1, 47]}]'  # bad id, out-of-range member, b unmentioned
 
-        result, calls = self._group_with_responses(new, [odd])
+        result, calls, _ = self._group_with_responses(new, [odd])
         self.assertEqual(calls, 1)
         self.assertEqual(set(result), {"a", "b"})
 
-    def test_failed_gemini_call_leaves_videos_as_singletons(self):
-        """A failure must never drop a video, per the module docstring."""
+    def test_failed_gemini_call_leaves_videos_unassigned(self):
+        """Failure must not mint locked singletons - NULL stays regroupable."""
         new = [{"video_id": f"v{i}", "title": f"Distinct Song {i}"} for i in range(3)]
         result, _ = self._group([], new)
 
-        self.assertEqual(set(result), {"v0", "v1", "v2"})
-        self.assertEqual(len(set(result.values())), 3)
+        self.assertEqual(result, {})
+
+    def test_use_ai_false_skips_gemini_but_still_assigns(self):
+        """Regroup mode: no Gemini; leftovers still become provisional songs."""
+        new = [
+            {"video_id": "a", "title": "Song A (Official MV)"},
+            {"video_id": "b", "title": "Song A (Dance Practice)"},
+            {"video_id": "c", "title": "Unrelated Song"},
+        ]
+        with mock.patch.object(song_grouping, "call_gemini") as call_gemini:
+            result = song_grouping.group_channel_videos(
+                self.conn, "UC_a", [], new, use_ai=False,
+            )
+        call_gemini.assert_not_called()
+        self.assertEqual(result["a"], result["b"])
+        self.assertIn("c", result)
+        self.assertNotEqual(result["a"], result["c"])
 
     def test_existing_videos_are_never_regrouped(self):
         """Additive-only: settled song_ids must survive untouched."""
@@ -459,11 +669,14 @@ class GroupChannelVideosTest(unittest.TestCase):
         add_channel(self.conn, "UC_home", display_name="TWICE")
         self.conn.commit()
         index = song_grouping.build_artist_index(_compile(["TWICE"]))
+        new = [{"video_id": "v1", "title": "TWICE - Brand New Song"}]
+        good = '[{"existing_id": null, "members": [1]}]'
 
-        result, _ = self._group(
-            [], [{"video_id": "v1", "title": "TWICE - Brand New Song"}],
-            artist_patterns=index, artist_home_channels={"TWICE": "UC_home"},
-        )
+        with mock.patch.object(song_grouping, "call_gemini", lambda p, model=None, **kwargs: good):
+            result = song_grouping.group_channel_videos(
+                self.conn, "UC_a", [], new,
+                artist_patterns=index, artist_home_channels={"TWICE": "UC_home"},
+            )
         anchored = self.conn.execute(
             "SELECT channel_id FROM songs WHERE song_id = ?", (result["v1"],)
         ).fetchone()
@@ -474,8 +687,13 @@ class GroupChannelVideosTest(unittest.TestCase):
         patterns = _compile(["TWICE"])
         new = [{"video_id": "v1", "title": "TWICE - Some Song"}]
 
-        from_list, _ = self._group([], new, artist_patterns=patterns)
-        from_index, _ = self._group([], new, artist_patterns=song_grouping.build_artist_index(patterns))
+        from_list = song_grouping.group_channel_videos(
+            self.conn, "UC_a", [], list(new), artist_patterns=patterns, use_ai=False,
+        )
+        from_index = song_grouping.group_channel_videos(
+            self.conn, "UC_a", [], list(new),
+            artist_patterns=song_grouping.build_artist_index(patterns), use_ai=False,
+        )
         self.assertEqual(set(from_list), set(from_index))
 
 

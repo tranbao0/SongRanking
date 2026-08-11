@@ -22,6 +22,16 @@ from shared.gemini_client import call_gemini, chunked
 # open a burst wide enough to trip a rate limit.
 _CHUNK_WORKERS = 4
 
+# Title cleanup has no candidate-song catalogue - only short title/artist
+# pairs - so each call's fixed preamble/thinking cost is amortized better
+# with larger chunks than song_grouping's CHUNK_SIZE (sized for catalogue
+# blast radius, not for this task).
+_CHUNK_SIZE = 120
+
+# Extraction, not multi-step reasoning. minimal is Google's recommended
+# floor for this class of work on Flash models.
+_THINKING_LEVEL = "minimal"
+
 _PROMPT_TEMPLATE = """\
 You clean up YouTube video metadata for a K-pop song ranking overlay.
 Rules:
@@ -34,9 +44,21 @@ like "HYBE LABELS", "HYBE LABELS and", "JYP Entertainment", "SM Entertainment", 
 - Keep Korean characters exactly as-is.
 - If you cannot determine a clean title, return the original unchanged.
 - Be particularly careful with upload channel name versus artist name; if the artist is fictional, KEEP THE ARTIST NAME
-Return ONLY a JSON array - no markdown, no explanation. Each element: {{"title": "...", "artist": "..."}}.
+Return one object per input row, in the same order, with cleaned title and artist.
 
 {entries}"""
+
+_CLEAN_RESPONSE_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "artist": {"type": "string"},
+        },
+        "required": ["title", "artist"],
+    },
+}
 
 
 def _clean_chunk(songs: list[dict]) -> None:
@@ -46,7 +68,11 @@ def _clean_chunk(songs: list[dict]) -> None:
         for i, s in enumerate(songs)
     )
 
-    text = call_gemini(_PROMPT_TEMPLATE.format(entries=entries))
+    text = call_gemini(
+        _PROMPT_TEMPLATE.format(entries=entries),
+        response_schema=_CLEAN_RESPONSE_SCHEMA,
+        thinking_level=_THINKING_LEVEL,
+    )
     if text is None:
         return
 
@@ -78,7 +104,7 @@ def clean_titles(songs: list[dict]) -> list[dict]:
     if not gemini_client.is_available():
         return songs
 
-    chunks = chunked(songs)
+    chunks = chunked(songs, size=_CHUNK_SIZE)
     if len(chunks) <= 1:
         for chunk in chunks:
             _clean_chunk(chunk)

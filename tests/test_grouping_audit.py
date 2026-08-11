@@ -52,14 +52,14 @@ class GroupingAuditTest(unittest.TestCase):
 
     def _use_tmp_state(self, tmp_path):
         """Route STATE_FILE to a throwaway path so a test's persistence
-        never touches the real data/.grouping_audit_state.json."""
+        never touches the real data/.grouping-audit/state.json."""
         patcher = mock.patch.object(grouping_audit, "STATE_FILE", tmp_path / "state.json")
         patcher.start()
         self.addCleanup(patcher.stop)
 
     def _use_tmp_log(self, tmp_path):
         """Route LOG_FILE to a throwaway path so a test's transcript
-        never touches the real data/.grouping_audit_log.jsonl."""
+        never touches the real data/.grouping-audit/log.jsonl."""
         patcher = mock.patch.object(grouping_audit, "LOG_FILE", tmp_path / "log.jsonl")
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -111,7 +111,10 @@ class GroupingAuditTest(unittest.TestCase):
         add_video(self.conn, "v1", "UC_a")
         self.conn.commit()
 
-        reason, _ = grouping_audit._decide_trigger(before)
+        with mock.patch.object(grouping_audit, "AUDIT_EVERY_N_SYNCS", 7), \
+             mock.patch.object(grouping_audit, "_load_state",
+                               return_value={"syncs_since_audit": 0}):
+            reason, _ = grouping_audit._decide_trigger(before)
 
         self.assertIsNone(reason)
 
@@ -128,8 +131,9 @@ class GroupingAuditTest(unittest.TestCase):
         self.assertEqual(reason, "periodic")
 
     def test_periodic_trigger_does_not_fire_early(self):
-        with mock.patch.object(grouping_audit, "_load_state",
-                                return_value={"syncs_since_audit": 0}):
+        with mock.patch.object(grouping_audit, "AUDIT_EVERY_N_SYNCS", 7), \
+             mock.patch.object(grouping_audit, "_load_state",
+                               return_value={"syncs_since_audit": 0}):
             add_channel(self.conn, "UC_a")
             self.conn.commit()
             before = grouping_audit.snapshot_before_sync()
@@ -150,7 +154,8 @@ class GroupingAuditTest(unittest.TestCase):
             self.conn.commit()
             before = grouping_audit.snapshot_before_sync()
 
-            with mock.patch.object(grouping_audit, "_invoke_agent") as mock_invoke:
+            with mock.patch.object(grouping_audit, "AUDIT_EVERY_N_SYNCS", 7), \
+                 mock.patch.object(grouping_audit, "_invoke_agent") as mock_invoke:
                 grouping_audit.audit_after_sync(before)
                 mock_invoke.assert_not_called()
 

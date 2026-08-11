@@ -25,10 +25,13 @@ import random
 
 import yt_dlp
 
-from shared.ytdlp_throttle import throttle, COOKIES_BROWSER, COOKIES_FILE
+from shared.ytdlp_throttle import (
+    download_fallback_clients, throttle, COOKIES_BROWSER, COOKIES_FILE,
+    POT_PROVIDER_BASE_URL,
+)
 
 CLIP_DURATION  = 20.0
-HEAT_THRESHOLD = 0.7
+HEAT_THRESHOLD = 0.8
 DEFAULT_START  = 60.0  # matches the old fixed 00:01:00
 
 # A heat marker in these opening seconds is usually the logo/intro bump or
@@ -41,9 +44,23 @@ MIN_SECTION_START = 3.0
 
 
 def _extract_info(url, player_client=None, use_cookies=False):
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        # Same EJS enablement as ytdlp_cmd(): web-family clients need the
+        # challenge solver after a PO Token unlocks format URLs.
+        "remote_components": ["ejs:github"],
+    }
+    extractor_args = {}
     if player_client:
-        opts["extractor_args"] = {"youtube": {"player_client": [player_client]}}
+        extractor_args.setdefault("youtube", {})["player_client"] = [player_client]
+    # Non-default POT server URL (see ytdlp_throttle.POT_PROVIDER_BASE_URL).
+    if POT_PROVIDER_BASE_URL.rstrip("/") != "http://127.0.0.1:4416":
+        extractor_args["youtubepot-bgutilhttp"] = {"base_url": [POT_PROVIDER_BASE_URL]}
+    if extractor_args:
+        opts["extractor_args"] = extractor_args
     if use_cookies:
         # A cookies.txt file (see ytdlp_throttle.COOKIES_FILE) is preferred
         # over reading the browser's own cookie store directly - same
@@ -66,15 +83,20 @@ def _fetch_heatmap(url):
     try:
         info = _extract_info(url)
     except yt_dlp.utils.DownloadError:
-        # Mirrors encoding.download_song's client fallback: some
-        # videos/sessions get bucketed into a restricted experiment that
-        # the default client can't extract at all.
-        try:
-            info = _extract_info(url, player_client="android")
-        except yt_dlp.utils.DownloadError:
+        # Mirrors encoding.download_song's client fallback chain: default
+        # failed, walk the quality-preserving clients (and android last)
+        # before cookies. See download_fallback_clients().
+        info = None
+        for client in download_fallback_clients():
+            try:
+                info = _extract_info(url, player_client=client)
+                break
+            except yt_dlp.utils.DownloadError:
+                continue
+        if info is None:
             # Last resort when the wall is an IP/session flag rather than
             # a client-experiment bucket - see encoding.download_song's
-            # matching third tier.
+            # matching cookies tier.
             info = _extract_info(url, use_cookies=True)
     return info.get("heatmap"), info.get("duration")
 

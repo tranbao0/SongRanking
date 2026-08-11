@@ -42,13 +42,21 @@ Three tiers, cheapest first:
   3. Chunked AI pass (Gemini, via gemini_client) for whatever's left -
      stylized titles, alternate romanizations, etc. Given each existing
      song's canonical title as a candidate, so a new upload can link to
-     an existing song instead of spawning a duplicate. Falls back to
-     leaving videos ungrouped (singletons) on any failure, so a video is
-     never silently dropped.
+     an existing song instead of spawning a duplicate. On transport or
+     parse failure the chunk's videos are left with song_id NULL (omitted
+     from the return map) so `regroup` can finish them later - minting
+     singletons here would lock them permanently, since grouping is
+     additive and never revisits an assigned song_id.
 
-A re-arranged version of a song - remix, acoustic, instrumental,
-sped-up - counts as a different song here, not another upload of the
-original, and charts as its own entry.
+A re-arranged version of a song - remix, acoustic, instrumental, vocal,
+karaoke, a cappella, sped-up/slowed - counts as the SAME song here, not
+a different one: it merges into the original's entry, same as an
+official MV and its dance practice would. A different-language
+re-recording ("(Japanese Ver.)", "(English Ver.)", ...) merges the same
+way. (Operator-directed reversal, 2026-08-10, of the opposite rule this
+project ran under through the 2026-08-06 - 2026-08-10 whole-registry
+audit - see docs/manual-grouping-prompt.md's Precedents section for that
+history.)
 
 Chunks in tier 3 are independent of one another: each is given the same
 snapshot of existing songs, and no song row is written until all of them
@@ -62,6 +70,7 @@ kept small (see gemini_client).
 import concurrent.futures
 import json
 import re
+import unicodedata
 from datetime import datetime
 
 from shared import gemini_client
@@ -69,14 +78,75 @@ from shared.gemini_client import call_gemini, chunked
 
 # Chunks are independent (see group_channel_videos), so these overlap
 # purely to hide each other's latency - a grouping call is ~10s of mostly
-# waiting. Kept modest so a channel with dozens of chunks doesn't open a
-# burst wide enough to trip a rate limit; gemini_client retries a 429, but
-# not tripping one is cheaper than recovering from it.
-_AI_CHUNK_WORKERS = 4
+# waiting. Kept at 2 so a free-tier Flash RPM (often ~5-15/min) is less
+# likely to trip; gemini_client retries a 429, but not tripping one is
+# cheaper than recovering from it. Raise toward 4 on a paid tier with
+# headroom if a first sync feels hung on AI waits.
+_AI_CHUNK_WORKERS = 2
 
 _VIDEO_TYPE_KEYWORDS = (
     "official", "mv", "m/v", "lyric", "performance", "practice",
     "choreography", "video", "audio", "visualizer", "live",
+)
+
+# Camera-angle/take qualifiers on a Dance Practice or Performance Video -
+# "(Moving Cam ver.)", "(Fix ver.)", "(Close-up ver.)" - name which camera
+# recorded the same performance, not a different arrangement or a producer/
+# occasion credit, so per the doc's decided rules these always merge with
+# the plain upload. None of these words double as a producer name, remix
+# credit, or language/occasion tag in this project's data (unlike a bare
+# "ver"/"version", which does - e.g. "(Steve Aoki Ver.)", "(Japanese Ver.)"
+# - so this list is intentionally narrower than _VIDEO_TYPE_KEYWORDS and
+# matched with \b rather than substring-in-content, to avoid "cam" matching
+# inside an unrelated word (a producer surname, say). Checked separately
+# from _VIDEO_TYPE_KEYWORDS because a bracket containing only one of these
+# words and no other video-type keyword - "(Moving Cam ver.)" contains
+# neither "video" nor "performance" - previously survived normalization
+# untouched and silently blocked tier 1/2 from linking a Dance Practice
+# upload to its own song (VIXX's "향 (Scentist)" Dance Practice Video
+# (Moving Cam ver.)" never matched its own Official M/V, found in a
+# 2026-08-05 whole-registry audit).
+_CAMERA_ANGLE_RE = re.compile(
+    r"\b(moving|fix(?:ed)?|cam|close-?up|onetake|one-take|front-?cam|vertical|horizontal)\b",
+    re.IGNORECASE,
+)
+
+# A "(...Ver.)" tag always merges with the plain upload, regardless of
+# what the tag says or what kind of video it's attached to - a costume
+# theme ("Halloween ver."), a camera angle, an occasion, a producer/remix
+# alias ("Steve Aoki Ver."), or a language ("Japanese Ver.") are all
+# presentational from this project's perspective as of the 2026-08-10
+# rule reversal (see the module docstring): a remix or a different-
+# language re-recording is another version of the SAME song now, not a
+# different one, so there's no longer a category of Ver. tag that should
+# block a merge. (Previously this was gated to a Dance/Performance/
+# Choreography video and excluded language names - see git history if
+# that narrower rule is ever needed again.)
+_VER_TAG_RE = re.compile(r"\bver(?:sion)?\.?\b", re.IGNORECASE)
+
+# A rearrangement/mix marker - "(Remix)", a named producer/DJ remix
+# ("(Sara Landry Remix)", matched via the word "remix"), "(Acoustic
+# Ver.)", "(Instrumental)"/"(Inst.)", "(Vocal Ver.)", "(Karaoke Ver.)",
+# "(A Cappella)"/"(Acapella)", "(Sped Up Ver.)", "(Slowed)" - merges with
+# the plain upload (2026-08-10 rule reversal: these used to be the
+# single most common DO-NOT-merge case in this data; now they're the
+# same song, presented as a different mix). Matched with \b, not
+# substring-in-content like _VIDEO_TYPE_KEYWORDS, so "inst" doesn't
+# false-positive inside an unrelated word.
+_ARRANGEMENT_RE = re.compile(
+    r"\b(remix|acoustic|instrumental|inst\.?|vocal|karaoke|a\s*cappella|acapella|"
+    r"sped[\s-]?up|slowed)\b",
+    re.IGNORECASE,
+)
+
+# A language name, bracketed with or without a "Ver." tag - "(Japanese
+# Ver.)", "(Japanese)", "(Chinese Ver.)" - merges with the plain upload.
+# A different-language re-recording is a different vocal take of the
+# same song, but per the 2026-08-10 rule reversal that now counts as
+# another version of the SAME song, same as a remix or an acoustic take.
+_LANGUAGE_RE = re.compile(
+    r"\b(korean|japanese|chinese|english|mandarin|cantonese|thai|spanish|french|german)\b",
+    re.IGNORECASE,
 )
 
 _BRACKET_RE = re.compile(r"[\(\[\{][^\)\]\}]*[\)\]\}]")
@@ -100,8 +170,11 @@ _UPLOAD_TYPE_MARKERS = [
     "official dance practice", "special performance video", "dance performance video",
     "choreography version", "choreography video", "performance version", "official video",
     "official audio", "official mv", "music video", "lyric video", "lyrics video",
+    "dance practice video", "choreography practice video", "choreography practice",
     "dance practice", "dance version", "performance video", "practice video",
     "band version", "visualizer", "official", "audio", "instrumental",
+    "remix", "acoustic", "vocal", "karaoke", "acapella", "a cappella",
+    "sped up", "slowed",
 ]
 _TRAILING_MARKER_RE = re.compile(
     r"(?:\s+(?:" + "|".join(sorted((re.escape(m) for m in _UPLOAD_TYPE_MARKERS), key=len, reverse=True)) + r"))+$"
@@ -116,35 +189,65 @@ songs. If a title includes Hangul (or other native-script) text, treat that text
 reliable signal of song identity: compare it precisely, character by character, and if two \
 titles' native-script text differs at all - including a small added qualifier like a number \
 or hanja - they are DIFFERENT songs, never the same song under a different title style. \
+EXCEPTION to that rule: a title explicitly marked as a different-language version of the same \
+song - a "(Japanese Ver.)", "(English Ver.)", "(Chinese Ver.)"-style tag, or an explicit \
+translation of the same song name - is the SAME song as the original-language version and \
+should be grouped with it, even though its native-script text is a different script entirely, \
+not just a differing character. Recognize a language-version pair from the explicit tag or \
+translation, never by comparing native-script text - that comparison is only for deciding \
+whether two same-language titles are the same or different songs. \
 Do NOT group promotional/behind-the-scenes content with the song itself, even from the same \
 release - album trailers, "making of"/"making video"/메이킹 videos, "MV Behind"/"Stage Behind"/\
 "Shooting Sketch"/비하인드/촬영 비하인드 footage, and similar are NOT the song and must stay in \
 their own singleton group, never merged into the real song's group even when the surrounding \
-title is otherwise identical. A re-arranged version of \
-a song is also a DIFFERENT song, not another upload of the original: remixes, acoustic \
-versions, instrumental versions, sped-up/slowed versions and similar re-workings each stay in \
-their own group, even when the title is otherwise identical to the original. Only group \
-videos that are the same recording of the same song presented differently (MV, lyric video, \
-dance practice, performance video, plain audio upload). Some titles are labeled "[artist: X]" - this channel \
+title is otherwise identical. A re-arranged version of a song - a remix (including a named \
+producer/DJ remix like "(Sara Landry Remix)"), an acoustic, instrumental, vocal, karaoke, or a \
+cappella version, or a sped-up/slowed version - is the SAME song and should be grouped with \
+the original, the same way an MV and its dance practice would be, even when the title carries \
+a "(Remix)", "(Acoustic Ver.)", "(Sped Up Ver.)" or similar tag naming the rearrangement. Group \
+videos that are the same song, whether presented as the same recording in a different format \
+(MV, lyric video, dance practice, performance video, plain audio upload) or as a different \
+arrangement/mix of the same song (remix, acoustic, instrumental, sped-up/slowed) or a \
+different-language recording of the same song. Some titles are labeled "[artist: X]" - this channel \
 hosts multiple artists, so treat titles with DIFFERENT labeled artists as always different \
 songs, even if the song title text is identical or near-identical. Unlabeled titles have no \
-known artist and should be judged on title text alone.
+known artist and should be judged on title text alone. Some titles are also labeled \
+"[tags: ...]" with the uploader's own YouTube tags - use these only as a supporting hint (e.g. \
+a tag naming the song in a different script or romanization than the title uses), never to \
+override what the title itself says: two titles whose native-script text differs are still \
+different songs even if their tags overlap (unless the language-version exception above \
+applies), and shared generic tags (the artist's name, "kpop", "official") mean nothing on \
+their own.
 
 Songs already tracked for this channel (each has a stable ID). If a new title below is the \
 SAME song as one of these, just under a different title style or romanization, use that \
 song's ID instead of forming a new group:
 {existing}
 
-New titles to classify (numbered):
+New titles to classify (numbered 1 to {n}):
 {entries}
 
-Return ONLY a JSON array - no markdown, no explanation. Each element is an object:
-  {{"existing_id": <ID from the tracked list above, or null>, "members": [<numbers>]}}
-Use an existing ID only when the group is the same song as one of the tracked songs above; \
-use null for a song not in that list. Every number from 1 to {n} must appear in exactly one \
-element's members list. A song with only one upload is still its own element. Example:
-[{{"existing_id": 12, "members": [1, 3]}}, {{"existing_id": null, "members": [2]}}, \
-{{"existing_id": null, "members": [4, 5, 6]}}]"""
+For each group set existing_id to a tracked song ID when the group is that same song, or \
+null when it is a song not in the tracked list. Put every number from 1 to {n} in exactly \
+one group's members list. A song with only one upload is still its own group."""
+
+# Enforced by the Interactions API via response_format (see call_gemini), so
+# the prompt no longer spends tokens teaching JSON shape / banning markdown.
+# existing_id is integer|null; members are 1-based indexes into the chunk.
+_GROUP_RESPONSE_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "existing_id": {"type": ["integer", "null"]},
+            "members": {
+                "type": "array",
+                "items": {"type": "integer"},
+            },
+        },
+        "required": ["existing_id", "members"],
+    },
+}
 
 
 def normalize_title(title: str) -> str:
@@ -160,12 +263,28 @@ def normalize_title(title: str) -> str:
     A title consisting of nothing but markers keeps its normalized form
     rather than collapsing to empty, so a song genuinely called e.g.
     "Audio" still gets a usable key instead of being treated as untitled.
+
+    NFC-normalized first: YouTube metadata occasionally arrives with Hangul
+    stored as NFD (decomposed Jamo) rather than NFC (precomposed syllables) -
+    visually identical, but a different code point sequence, so two uploads
+    of the same song in different normalization forms would otherwise never
+    match here even though every other character in the title is identical.
+    A 2026-08-05 whole-registry audit found 138 existing video titles stored
+    as NFD.
     """
     def _strip_bracket(match):
         content = match.group(0).lower()
-        return "" if any(kw in content for kw in _VIDEO_TYPE_KEYWORDS) else match.group(0)
+        is_marker = (
+            any(kw in content for kw in _VIDEO_TYPE_KEYWORDS)
+            or _CAMERA_ANGLE_RE.search(content)
+            or _VER_TAG_RE.search(content)
+            or _ARRANGEMENT_RE.search(content)
+            or _LANGUAGE_RE.search(content)
+        )
+        return "" if is_marker else match.group(0)
 
-    text = _BRACKET_RE.sub(_strip_bracket, title)
+    text = unicodedata.normalize("NFC", title)
+    text = _BRACKET_RE.sub(_strip_bracket, text)
     text = _MV_TOKEN_RE.sub(" ", text)
     text = _PUNCT_RE.sub(" ", text)
     text = _WHITESPACE_RE.sub(" ", text).strip().lower()
@@ -299,11 +418,11 @@ _MALFORMED_RESPONSE_ERRORS = (
 # call_gemini already retries the transport itself, so a None from it is
 # a failure that has exhausted its own retries and won't improve here.
 #
-# Worth one extra request because the cost is asymmetric: sampling is
-# stochastic so a re-ask usually parses, whereas giving up strands a whole
-# chunk of videos as singletons permanently - grouping is additive and
-# never revisits them.
-_MAX_PARSE_ATTEMPTS = 2
+# Kept at 1 now that response_format enforces JSON shape at the API: a
+# parse failure under structured outputs is rare and almost never fixed by
+# re-asking, and each re-ask is a full billed request against a permanent-
+# singleton failure mode we no longer need to insure this way.
+_MAX_PARSE_ATTEMPTS = 1
 
 
 def _row_get(row, key, default=None):
@@ -312,6 +431,41 @@ def _row_get(row, key, default=None):
         return row[key]
     except (IndexError, KeyError):
         return default
+
+
+# Caps on what reaches the AI prompt, not on what's stored - catalog.py
+# persists the uploader's full tag list. A handful of channels tag videos
+# with dozens of keywords; capped here so one chunky video doesn't blow up
+# a chunk's prompt size, since tags are only ever a supporting hint (see
+# _GROUP_PROMPT) and diminishing tags past the first few rarely add signal.
+_MAX_TAGS_IN_PROMPT = 8
+_MAX_TAG_LEN = 40
+
+
+def _video_tags_label(v) -> str:
+    """
+    Comma-joined tags for one video, ready to drop into an AI-tier prompt
+    label - "" (meaning: omit the "[tags: ...]" suffix entirely) for a
+    video with no tags, an unparseable tags column, or one catalogued
+    before this column existed. `videos.tags` is stored as a JSON-encoded
+    list (see catalog.py); tolerant of it already being a list (a video
+    dict built fresh in this sync run, not yet round-tripped through the
+    database) so callers don't need to care which shape they have.
+    """
+    raw = _row_get(v, "tags")
+    if not raw:
+        return ""
+    if isinstance(raw, str):
+        try:
+            tags = json.loads(raw)
+        except json.JSONDecodeError:
+            return ""
+    else:
+        tags = raw
+    if not isinstance(tags, list):
+        return ""
+    trimmed = [str(t)[:_MAX_TAG_LEN] for t in tags[:_MAX_TAGS_IN_PROMPT] if t]
+    return ", ".join(trimmed)
 
 
 def _scoped_candidates(chunk, existing_songs, song_anchors, artist_index, artist_home_channels, channel_id):
@@ -392,28 +546,54 @@ def _parse_group_response(
 
 def _ai_group_chunk(
     videos: list[dict], existing_songs: dict[int, str], artist_index: _ArtistIndex,
-) -> list[tuple[int | None, list[dict]]]:
+    label_existing_artists: bool = True,
+) -> list[tuple[int | None, list[dict]]] | None:
     """
     Cluster one small chunk via Gemini, matching against `existing_songs`
     ({song_id: canonical_title}) so a stylized/alternate-romanization title
     can link to an already-tracked song instead of spawning a duplicate.
-    When `artist_index` is non-empty (shared/multi-artist channels), every
-    title - new and existing - is labeled with its matched confirmed
-    artist so the model won't merge two different artists' identically
-    titled songs. Returns (existing_song_id_or_None, members) tuples -
-    None means a new song not seen before. Falls back to all-new-
-    singletons once retries are spent, so a video is never dropped.
-    """
-    def _label(title):
-        artist = artist_index.match(title)
-        return f"{title} [artist: {artist}]" if artist else title
+    When `artist_index` is non-empty (shared/multi-artist channels), new
+    titles are labeled with their matched confirmed artist so the model
+    won't merge two different artists' identically titled songs.
 
-    existing_list = "\n".join(f"{sid}: {_label(title)}" for sid, title in existing_songs.items()) or "(none tracked yet)"
-    entries = "\n".join(f"{i + 1}. {_label(v['title'])}" for i, v in enumerate(videos))
+    `label_existing_artists` adds the same tag on candidate songs. After
+    `_scoped_candidates` has already narrowed to one artist's catalogue,
+    those tags are redundant and only inflate the repeated prompt prefix -
+    pass False in that case. New titles still get artist labels whenever
+    `artist_index` is non-empty.
+
+    Candidate songs are emitted in song_id order so parallel chunks that
+    share the same scoped catalogue send an identical prefix (better
+    implicit-cache hit rate).
+
+    Returns (existing_song_id_or_None, members) tuples - None as
+    existing_id means a new song not seen before. Returns None on
+    transport/parse failure after retries are spent. The caller must leave
+    those videos unassigned (song_id NULL) rather than minting singletons.
+    """
+    def _label(title, tags="", *, with_artist: bool):
+        artist = artist_index.match(title) if with_artist and artist_index else None
+        label = f"{title} [artist: {artist}]" if artist else title
+        return f"{label} [tags: {tags}]" if tags else label
+
+    # Sorted for a stable cacheable prefix across chunks of the same artist.
+    existing_list = "\n".join(
+        f"{sid}: {_label(title, with_artist=label_existing_artists)}"
+        for sid, title in sorted(existing_songs.items())
+    ) or "(none tracked yet)"
+    entries = "\n".join(
+        f"{i + 1}. {_label(v['title'], _video_tags_label(v), with_artist=True)}"
+        for i, v in enumerate(videos)
+    )
     prompt = _GROUP_PROMPT.format(existing=existing_list, entries=entries, n=len(videos))
 
+    text = None
     for attempt in range(_MAX_PARSE_ATTEMPTS):
-        text = call_gemini(prompt)
+        text = call_gemini(
+            prompt,
+            response_schema=_GROUP_RESPONSE_SCHEMA,
+            thinking_level="low",
+        )
         if text is None:
             break  # transport failure, already retried inside call_gemini
         try:
@@ -424,14 +604,19 @@ def _ai_group_chunk(
                 print(f"  [song_grouping] Unreadable AI response ({e}) - re-asking "
                       f"({remaining} attempt(s) left).")
             else:
-                print(f"  [song_grouping] AI grouping failed ({e}) - leaving this chunk ungrouped.")
+                print(f"  [song_grouping] AI grouping failed ({e}) - leaving "
+                      f"{len(videos)} video(s) with song_id NULL for regroup.")
+                return None
 
-    return [(None, [v]) for v in videos]
+    print(f"  [song_grouping] AI call failed - leaving {len(videos)} video(s) "
+          f"with song_id NULL for regroup.")
+    return None
 
 
 def group_channel_videos(
     conn, channel_id: str, existing_videos: list, new_videos: list[dict],
     artist_patterns=(), artist_home_channels: dict[str, str] | None = None,
+    use_ai: bool = True,
 ) -> dict[str, int]:
     """
     Assign each of `new_videos` a song_id, additively - `existing_videos`'
@@ -447,7 +632,15 @@ def group_channel_videos(
     `artist_home_channels` (artist name -> channel_id) anchors a newly
     created song to that artist's own channel instead of `channel_id` when
     resolvable, so a later upload on yet another channel can still find
-    it. Returns {video_id: song_id} for new_videos only.
+    it.
+
+    `use_ai` (default True) runs the Gemini tier for titles free tiers
+    could not resolve. When False - regroup's mode - only tiers 1 and 2
+    run, then leftover singles are still minted as provisional songs
+    (so same-run cross-channel tier-1 matching still works) without any
+    Gemini call. The caller is expected to hand those provisionals to the
+    CLI agent for merge review. Returns {video_id: song_id} for the
+    videos this call assigned.
     """
     if not new_videos:
         return {}
@@ -515,7 +708,9 @@ def group_channel_videos(
     # Checked before any chunking work: with no key there is nothing for the
     # AI tier to do, and building prompts only to discard them would cost a
     # pass over every remaining title plus a log line per chunk.
-    chunks = chunked(singles) if gemini_client.is_available() else []
+    chunks = (
+        chunked(singles) if use_ai and gemini_client.is_available() else []
+    )
     if chunks:
         # Even a single chunk is a real network call that can retry with
         # growing backoff on a rate limit - printing only for >2 chunks
@@ -524,9 +719,20 @@ def group_channel_videos(
 
     resolved: list[tuple[int | None, list[dict]]] = [(None, members) for members in confident]
     if singles and not chunks:
-        # AI unavailable: every unresolved title becomes its own song,
-        # exactly as it would if each call had failed.
-        resolved.extend((None, [v]) for v in singles)
+        if use_ai:
+            # Gemini unavailable on a sync path: same outcome as a failed
+            # call - leave song_id NULL so regroup (free tiers + CLI agent)
+            # can finish without a decouple.
+            print(f"    {len(singles)} title(s) left with song_id NULL "
+                  f"(AI unavailable; run regroup to finish)")
+        else:
+            # Free-tiers-only (regroup): still mint singletons so later
+            # channels in the same run can tier-1 against them (wikidata-
+            # first ordering). Gemini is skipped; the CLI agent merges
+            # any false splits afterward.
+            print(f"    {len(singles)} title(s) minted as provisional songs "
+                  f"(free tiers only; CLI agent will review)")
+            resolved.extend((None, [v]) for v in singles)
 
     # Chunks are independent by construction: every one is handed the same
     # existing_songs snapshot, built above and never updated between calls,
@@ -536,22 +742,39 @@ def group_channel_videos(
     # last. Results are consumed in submission order (map, not
     # as_completed) so the song_id each new group is assigned below stays
     # identical to what the sequential version produced.
+    # A None result means the chunk failed: those videos stay out of
+    # video_song_map (song_id NULL for regroup).
     def _classify(chunk):
         candidates = _scoped_candidates(
             chunk, existing_songs, song_anchors, artist_index, artist_home_channels, channel_id,
         )
-        return _ai_group_chunk(chunk, candidates, artist_index)
+        # After artist scoping, every candidate usually shares one home
+        # channel - repeating [artist: X] on each line only burns tokens
+        # and diversifies the prefix. Keep labels when more than one
+        # anchor is still in play (or anchors are unknown).
+        anchors_in_play = {song_anchors.get(sid) for sid in candidates}
+        anchors_in_play.discard(None)
+        label_existing = len(anchors_in_play) != 1
+        return _ai_group_chunk(
+            chunk, candidates, artist_index,
+            label_existing_artists=label_existing,
+        )
+
+    def _consume(chunk_groups):
+        if chunk_groups is None:
+            return
+        resolved.extend(chunk_groups)
 
     if len(chunks) <= 1:
         for chunk in chunks:
-            resolved.extend(_classify(chunk))
+            _consume(_classify(chunk))
     else:
         done = 0
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(_AI_CHUNK_WORKERS, len(chunks))
         ) as pool:
             for chunk_groups in pool.map(_classify, chunks):
-                resolved.extend(chunk_groups)
+                _consume(chunk_groups)
                 done += 1
                 if len(chunks) > 2 and done % 5 == 0:
                     print(f"      ...chunk {done}/{len(chunks)}")

@@ -18,12 +18,13 @@ except ImportError:
 from render.overlay import load_style
 from render.encoding import (
     detect_hw_encoder, download_song, encode_song, encode_transition, concatenate_clips, _log,
-    cached_clip,
+    cached_clip, ensure_raw_quality, read_raw_window, probe_height, MIN_RAW_HEIGHT,
 )
 from render.heatmap import pick_clip
 from render.chart_state import (
     DATA_FILE, load_history, songs_from_search, pre_fetch_all,
     determine_badges, save_run_state, load_songs, clean_csv_titles,
+    songs_from_csv,
 )
 from shared import shutdown
 
@@ -61,9 +62,24 @@ def _avg(times):
     return sum(times) / len(times) if times else 0.0
 
 
+def _load_offline(csv_path, limit, label):
+    """
+    Read `csv_path` and use its own last-saved columns as this run's
+    metadata - see songs_from_csv for why. Shared by csv mode's --offline
+    flag and chart mode's automatic fallback so there's exactly one
+    offline-render code path instead of two that could drift apart.
+    """
+    songs = songs_from_csv(csv_path)
+    if limit:
+        songs.sort(key=lambda s: int(s.get("rank") or 9999))
+        songs = songs[:limit]
+        print(f"  Using top {limit} {label} from {csv_path}.\n")
+    return songs
+
+
 def run_pipeline(search=None, limit=None, no_filter=False,
                   download_workers=6, encode_workers=3, clean_titles=False,
-                  chart_name=None):
+                  chart_name=None, csv_file=None, offline=False):
     """
     K-pop song ranking video generator. Programmatic entry point - the CLI
     (run.py) parses args and calls this directly.
@@ -73,43 +89,64 @@ def run_pipeline(search=None, limit=None, no_filter=False,
         return
 
     style = load_style(STYLE_FILE)
+    # How long the CSV retains a fixed views baseline for the overlay
+    # "views gained" delta. Set per chart in data/charts.yaml
+    # (views_delta_days); None means rewrite the baseline every run.
+    views_delta_days = None
 
     if chart_name:
-        from charts import compute_chart
+        from charts import compute_chart, load_definition
         from shared.title_cleaner import clean_titles as clean_titles_fn
         csv_path = os.path.join("data", "charts", f"{chart_name}.csv")
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        views_delta_days = load_definition(chart_name).get("views_delta_days")
         print(f'Computing chart "{chart_name}"...\n')
-        results = compute_chart(chart_name, limit=limit)
-        if not results:
-            print("Chart produced no results (registry empty for this genre - run `sync` first?). Exiting.")
-            return
-        history = load_history(csv_path)
-        songs   = songs_from_search(results, history)
-
-        # A song already on this chart's CSV keeps its previously-cleaned
-        # title/artist rather than being re-sent to Gemini from its raw
-        # source title every run - compute_chart always returns the full
-        # chart (unlike search's small fresh-results set), so without this
-        # every run would re-clean the same ~200 songs it cleaned last time.
-        cleaned = {
-            row["url"]: (row["title"], row["artist"])
-            for row in load_songs(csv_path)
-        } if os.path.exists(csv_path) else {}
-
-        new_songs = []
-        for song in songs:
-            cached = cleaned.get(song["url"])
-            if cached:
-                song["title"], song["artist"] = cached
-            else:
-                new_songs.append(song)
-
-        if new_songs:
-            print(f"Cleaning up titles via AI for {len(new_songs)} new song(s)...")
-            clean_titles_fn(new_songs)
+        try:
+            results = compute_chart(chart_name, limit=limit)
+        except Exception as e:
+            # compute_chart's registry/view-refresh step is the one thing
+            # in this branch that depends on the outside world (YouTube
+            # API quota/key, network) - anything else going wrong here is
+            # a real bug that should still surface. Falling back to the
+            # last-saved csv_path rather than aborting means a dead API
+            # key doesn't block re-rendering a chart whose data hasn't
+            # changed since the last successful run.
+            if not os.path.exists(csv_path):
+                print(f"Chart computation failed ({e}) and no cached {csv_path} exists to fall back to. Exiting.")
+                return
+            print(f"Chart computation failed ({e})")
+            print(f"  Falling back to the last-saved {csv_path} instead of aborting.\n")
+            songs = _load_offline(csv_path, limit, "songs")
         else:
-            print("No new songs on this chart - reusing already-cleaned titles.\n")
+            if not results:
+                print("Chart produced no results (registry empty for this genre - run `sync` first?). Exiting.")
+                return
+            history = load_history(csv_path)
+            songs   = songs_from_search(results, history)
+
+            # A song already on this chart's CSV keeps its previously-cleaned
+            # title/artist rather than being re-sent to Gemini from its raw
+            # source title every run - compute_chart always returns the full
+            # chart (unlike search's small fresh-results set), so without this
+            # every run would re-clean the same ~200 songs it cleaned last time.
+            cleaned = {
+                row["url"]: (row["title"], row["artist"])
+                for row in load_songs(csv_path)
+            } if os.path.exists(csv_path) else {}
+
+            new_songs = []
+            for song in songs:
+                cached = cleaned.get(song["url"])
+                if cached:
+                    song["title"], song["artist"] = cached
+                else:
+                    new_songs.append(song)
+
+            if new_songs:
+                print(f"Cleaning up titles via AI for {len(new_songs)} new song(s)...")
+                clean_titles_fn(new_songs)
+            else:
+                print("No new songs on this chart - reusing already-cleaned titles.\n")
     elif search:
         csv_path = DATA_FILE
         from shared.title_cleaner import clean_titles as clean_titles_fn
@@ -133,12 +170,15 @@ def run_pipeline(search=None, limit=None, no_filter=False,
                 print(f"  Merging {len(extra)} existing CSV song(s) into ranking.\n")
                 songs = songs + extra
     else:
-        csv_path = DATA_FILE
-        songs = load_songs(csv_path)
-        if limit:
-            songs.sort(key=lambda s: int(s.get("rank") or 9999))
-            songs = songs[:limit]
-            print(f"  Using top {limit} songs from CSV.\n")
+        csv_path = csv_file or DATA_FILE
+        if offline:
+            songs = _load_offline(csv_path, limit, "songs")
+        else:
+            songs = load_songs(csv_path)
+            if limit:
+                songs.sort(key=lambda s: int(s.get("rank") or 9999))
+                songs = songs[:limit]
+                print(f"  Using top {limit} songs from {csv_path}.\n")
 
     # Segments, transitions, and the final compilation for this run all land
     # in their own subfolder, named after the CSV they're tied to (a chart's
@@ -151,7 +191,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
     clips_dir = os.path.join(CLIPS_DIR, run_slug)
     os.makedirs(clips_dir, exist_ok=True)
 
-    ranked = pre_fetch_all(songs, batch_fetch_metadata)
+    ranked = pre_fetch_all(songs, batch_fetch_metadata, views_delta_days=views_delta_days)
     determine_badges(ranked)
 
     print("Rankings by view count:")
@@ -182,6 +222,9 @@ def run_pipeline(search=None, limit=None, no_filter=False,
     cw  = style.get("canvas", {}).get("width", 1920)
     ch  = style.get("canvas", {}).get("height", 1080)
     fps = style.get("canvas", {}).get("fps", 30)
+    # Floor for raw-clip upgrades: at least MIN_RAW_HEIGHT, and never below
+    # the canvas so a 1440p style doesn't upscale a 1080p (or 360p) source.
+    min_raw_height = max(MIN_RAW_HEIGHT, ch)
 
     def _download(song):
         if shutdown.requested():
@@ -189,24 +232,65 @@ def run_pipeline(search=None, limit=None, no_filter=False,
         t0 = time.monotonic()
         start = song.get("start") or _DEFAULT_START
         end   = song.get("end")   or _DEFAULT_END
-        # No explicit override on this song (start/end still at the
-        # placeholder defaults): the clip is whatever the cache already
-        # has for this video, or - on the first run for it - a fresh
-        # heatmap pick. Skipping pick_clip on a cache hit isn't just an
-        # optimization: pick_clip rolls a random hot section on every
-        # call, so re-running it each time would silently pick a
-        # different window run to run instead of reusing the one already
-        # rendered before.
+        # Auto window (CSV still at the placeholder defaults): reuse the
+        # raw-cache file if one exists, else heatmap-pick a hot section.
+        # Skipping pick_clip on a cache hit isn't just an optimization:
+        # pick_clip rolls a random hot section on every call, so re-running
+        # it each time would silently pick a different window run to run.
+        # Once we pick, write start/end back onto the song dict so
+        # save_run_state persists them to the CSV - next run then loads
+        # those times as the sticky window instead of re-rolling.
         if start == _DEFAULT_START and end == _DEFAULT_END:
             cached = cached_clip(song["url"])
             if cached:
-                _log(f"  [rank {song['rank']}] Using cached clip")
+                window = read_raw_window(cached)
+                if window:
+                    start, end = window
+                    song["start"] = start
+                    song["end"] = end
+                    _log(f"  [rank {song['rank']}] Using cached clip ({start}-{end})")
+                    raw_clip = ensure_raw_quality(
+                        song["rank"], song["url"], start, end, cached,
+                        min_height=min_raw_height,
+                    )
+                else:
+                    height = probe_height(cached)
+                    if height is not None and height < min_raw_height:
+                        _log(
+                            f"  [rank {song['rank']}] Using cached clip "
+                            f"({height}p < {min_raw_height}p, no saved window - "
+                            "delete raw to re-pick / upgrade)"
+                        )
+                    else:
+                        _log(f"  [rank {song['rank']}] Using cached clip")
+                    raw_clip = cached
                 dl_times[song["rank"]] = time.monotonic() - t0
-                return cached
+                return raw_clip
             picked_start, picked_end = pick_clip(song["url"])
-            start, end = f"{picked_start:.2f}", f"{picked_end:.2f}"
+            start = f"{picked_start:.2f}"
+            end = f"{picked_end:.2f}"
+            song["start"] = start
+            song["end"] = end
             _log(f"  [rank {song['rank']}] Heatmap picked clip at {picked_start:.1f}s-{picked_end:.1f}s")
-        raw_clip = download_song(song["rank"], song["url"], start=start, end=end)
+        else:
+            # Persisted heatmap window (or a manual CSV override). Reuse the
+            # cache when present so re-running a chart doesn't re-hit YouTube
+            # for the same section. To force a new download of a different
+            # window, change start/end in the CSV *and* delete the raw clip
+            # under assets/clips/raw/<video_id>_<height>p.mp4.
+            cached = cached_clip(song["url"])
+            if cached:
+                _log(f"  [rank {song['rank']}] Using cached clip ({start}-{end})")
+                raw_clip = ensure_raw_quality(
+                    song["rank"], song["url"], start, end, cached,
+                    min_height=min_raw_height,
+                )
+                dl_times[song["rank"]] = time.monotonic() - t0
+                return raw_clip
+        raw_clip = download_song(
+            song["rank"], song["url"], start=start, end=end,
+            min_height=min_raw_height,
+        )
         dl_times[song["rank"]] = time.monotonic() - t0
         return raw_clip
 
@@ -353,7 +437,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
         concat_time = time.monotonic() - t0
         print(f"Compilation saved -> {compilation_path}\n")
 
-    save_run_state(ranked, csv_path)
+    save_run_state(ranked, csv_path, views_delta_days=views_delta_days)
     print(f"Updated {csv_path} for next run.\n")
 
     total_time = time.monotonic() - t_pipeline_start

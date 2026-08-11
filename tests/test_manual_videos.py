@@ -11,7 +11,7 @@ No test reaches the network.
 import unittest
 from unittest import mock
 
-from .context import make_db, add_channel, add_video
+from .context import make_db, add_channel, add_video, fake_gemini_assign_singles
 
 from registry import catalog, db, discovery, song_grouping
 from shared import api_budget
@@ -173,7 +173,7 @@ class SyncManualVideoChannelTest(unittest.TestCase):
             return real_group(conn, channel_id, existing_videos, new_videos, **kwargs)
 
         with self._pinned(pinned), \
-             mock.patch.object(song_grouping, "call_gemini", lambda p, model=None: None), \
+             mock.patch.object(song_grouping, "call_gemini", fake_gemini_assign_singles), \
              mock.patch.object(catalog.song_grouping, "group_channel_videos", side_effect=_spy):
             catalog._sync_manual_video_channel(
                 self.conn, youtube, "UC_talkshow", "kpop", ["UC_studio", "UC_talkshow"],

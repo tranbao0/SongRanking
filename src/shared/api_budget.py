@@ -28,11 +28,14 @@ YOUTUBE_DAILY_QUOTA = int(os.environ.get("YOUTUBE_DAILY_QUOTA", 10000))
 # cap is a blunt circuit-breaker that bounds a runaway loop, and on a
 # small prepaid balance that is the failure worth insuring against.
 #
-# Deliberately low. The free grouping tiers do the bulk of the work, and
-# the residue the AI tier judges on this data is dominated by pairs that
-# should stay separate anyway, so a sync that stops early loses very
-# little. Raise it if a bootstrap is stopping before you want it to.
-GEMINI_DAILY_LIMIT = int(os.environ.get("GEMINI_DAILY_LIMIT", 500))
+# Sized to sit under a typical Gemini API free-tier RPD for Flash models
+# (~100-250 depending on project; check AI Studio). Set GEMINI_DAILY_LIMIT
+# in .env (see .env.example) - that is the intended knob. The 100 below is
+# only a fallback when the env var is unset. Regroup hands leftovers to the
+# CLI agent instead of Gemini, so a sync that stops early loses little.
+# Raise the env var if your AI Studio RPD is higher and incremental syncs
+# are stopping before you want them to.
+GEMINI_DAILY_LIMIT = int(os.environ.get("GEMINI_DAILY_LIMIT", 100))
 
 WARN_THRESHOLD = 0.8
 STOP_THRESHOLD = 0.95

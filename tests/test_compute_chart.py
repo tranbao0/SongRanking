@@ -24,7 +24,7 @@ class ComputeChartTest(unittest.TestCase):
         self.addCleanup(self.conn.really_close)
         self.today = date.today()
 
-        patcher = mock.patch.object(db, "get_remote_connection", return_value=self.conn)
+        patcher = mock.patch.object(db, "get_connection", return_value=self.conn)
         patcher.start()
         self.addCleanup(patcher.stop)
 

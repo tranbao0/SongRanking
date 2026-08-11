@@ -61,10 +61,15 @@ from pathlib import Path
 from registry import db
 
 _ROOT = Path(__file__).parent.parent.parent
-STATE_FILE = _ROOT / "data" / ".grouping_audit_state.json"
-LOG_FILE = _ROOT / "data" / ".grouping_audit_log.jsonl"
+# All grouping-audit sidecars live under data/.grouping-audit/ (gitignored
+# as a unit) - progress/state/log plus session scratch. Layout is fixed
+# so manual and headless agents don't scatter files under data/; see
+# docs/manual-grouping-prompt.md's "Session file layout" section.
+_AUDIT_DIR = _ROOT / "data" / ".grouping-audit"
+STATE_FILE = _AUDIT_DIR / "state.json"
+LOG_FILE = _AUDIT_DIR / "log.jsonl"
 METHODOLOGY_DOC = "docs/manual-grouping-prompt.md"
-PROGRESS_FILE = "data/.manual-grouping-progress.json"
+PROGRESS_FILE = "data/.grouping-audit/progress.json"
 
 # The agent CLI to invoke, as argv tokens - not hardcoded to one vendor.
 # Point this at whatever subscription-based coding-agent CLI is
@@ -100,7 +105,7 @@ VOLUME_THRESHOLD = int(os.environ.get("GROUPING_AUDIT_VOLUME_THRESHOLD", 50))
 # Generous on purpose: an audit reads and judges titles rather than
 # calling an API, and a large trigger (a new label channel with a
 # thousand-video back-catalogue) can legitimately take a while.
-AGENT_TIMEOUT_SECONDS = int(os.environ.get("GROUPING_AGENT_TIMEOUT", 3600))
+AGENT_TIMEOUT_SECONDS = int(os.environ.get("GROUPING_AGENT_TIMEOUT", 3600*5))
 
 
 def _load_state() -> dict:
@@ -180,7 +185,7 @@ def _decide_trigger(before: dict) -> tuple[str, dict] | tuple[None, None]:
         conn.close()
 
 
-def _build_prompt(reason: str, details: dict) -> str:
+def _build_prompt(reason: str, details: dict, extra_instructions: str | None = None) -> str:
     if reason == "new_channels":
         listing = "\n".join(f"- {cid} ({name})" for cid, name in details["channels"])
         scope = (
@@ -208,6 +213,8 @@ def _build_prompt(reason: str, details: dict) -> str:
             "duplicates that should merge into an existing song, and for Making/Behind/Reaction/"
             "Commentary content that should be excised instead of grouped."
         )
+    elif reason == "regroup_handoff":
+        scope = details["scope"]
     else:
         scope = (
             f"This is the periodic backstop audit (runs every {AUDIT_EVERY_N_SYNCS} syncs "
@@ -219,10 +226,17 @@ def _build_prompt(reason: str, details: dict) -> str:
             "genuine merges; when unsure, leave split per the doc's default."
         )
 
+    extra_section = (
+        f"\nAdditional instructions from the operator for this specific run - follow these,\n"
+        f"but they don't override the DO-NOT-merge list or the data-repo restriction above:\n"
+        f"{extra_instructions}\n"
+        if extra_instructions else ""
+    )
+
     return f"""You are doing an unattended song-grouping quality audit on the K-pop registry
 at {db.LOCAL_WORKING_DB_PATH}, in the SongRanking project rooted at the current working
-directory. This is a local SQLite file, not the hosted database directly - it's a working
-copy this sync run pulled from the hosted registry and will push back once everything
+directory. This is a local SQLite file, not the data repo directly - it's a working
+copy this sync run pulled from the data repo and will push back once everything
 (including this audit) is done, so editing it directly is exactly the right thing to do,
 not a workaround. This is a one-shot, non-interactive run - there is no human to ask a
 clarifying question, so make the conservative call (per the doc's "when unsure, don't
@@ -236,19 +250,18 @@ those rather than re-deriving them.
 That doc is written primarily for a *separate*, human-run workflow (several manual
 Claude Code instances each grouping one shard of the registry) - its "Before starting
 any instance", "The prompt" (the literal SHARD/SHARD_COUNT template), and "After all
-shards finish" sections each contain their own Turso backup/pull/push steps
-(`scripts/turso_shell.sh`, `db.pull_to_local()`, `db.push_from_local()`) for that
-workflow. None of that applies to you: do not run those commands, do not touch Turso in
-any way, and do not pull or push the registry yourself. You are one unattended pass
-over the local working copy only, exactly as it exists on disk right now - whether it
-gets pulled before this run or pushed back after is entirely up to the process that
-invoked you (a sync, or an operator running `python run.py audit`), never something you
-do yourself. Skip those three sections; follow only the rules, precedents, and apply/
-excise procedures.
+shards finish" sections each contain their own backup/pull/push steps
+(`db.pull_to_local()`, `db.push_from_local()`) for that workflow. None of that applies
+to you: do not run those commands, do not touch the data repo in any way, and do not
+pull or push the registry yourself. You are one unattended pass over the local working
+copy only, exactly as it exists on disk right now - whether it gets pulled before this
+run or pushed back after is entirely up to the process that invoked you (a sync, or an
+operator running `python run.py audit`), never something you do yourself. Skip those
+three sections; follow only the rules, precedents, and apply/excise procedures.
 
 Trigger and scope for this run:
 {scope}
-
+{extra_section}
 You have direct read/write access to {db.LOCAL_WORKING_DB_PATH} - apply merges and
 excisions directly as you find them (see the doc's "How to apply a merge" / "How to
 excise" sections), you don't need to produce a diff for a human to review since this is a
@@ -421,7 +434,7 @@ def _invoke_agent(prompt: str) -> bool:
     return True
 
 
-def run_manual_audit() -> None:
+def run_manual_audit(extra_instructions: str | None = None) -> None:
     """
     Force an audit at the operator's request (`python run.py audit`),
     outside of any sync and regardless of whether audit_after_sync's
@@ -429,13 +442,61 @@ def run_manual_audit() -> None:
     prompt (the whole-registry duplicate scan) since that trigger's scope
     isn't tied to what a particular sync changed, unlike new_channels/
     volume_spike - it's the right one for "just audit everything now".
+
+    extra_instructions, if given (`python run.py audit --prompt "..."`),
+    is appended to the built prompt verbatim so the operator can narrow
+    or redirect this specific run (e.g. "only look at channel X") without
+    that instruction persisting anywhere beyond this one invocation.
     """
     print("  [grouping_audit] Triggering audit: manual run")
-    prompt = _build_prompt("periodic", {})
+    prompt = _build_prompt("periodic", {}, extra_instructions=extra_instructions)
     ran = _invoke_agent(prompt)
     if ran:
         _save_state({"syncs_since_audit": 0, "last_audit_date": date.today().isoformat(),
                      "last_audit_reason": "manual"})
+
+
+def run_regroup_handoff(genre: str | None = None, new_song_count: int | None = None) -> bool:
+    """
+    After regroup's free tiers finish, hand newly minted provisional songs
+    to the CLI agent for merge review. No Gemini: this is the subscription-
+    agent path that replaces the AI tier for regroup. Returns whether the
+    agent ran to completion.
+    """
+    count = new_song_count
+    if count is None:
+        return False
+    if count <= 0:
+        return False
+
+    scope_bits = [
+        f"regroup just created {count} new song row(s) using only free tiers 1/2 "
+        f"(exact normalized-title match and same-batch local clustering)."
+    ]
+    if genre:
+        scope_bits.append(f"Scope: genre {genre!r} only.")
+    scope_bits.append(
+        "Gemini was not used. Titles the free tiers could not confidently link were "
+        "minted as provisional singleton songs so later channels in the same run could "
+        "still tier-1 against them."
+    )
+    scope = " ".join(scope_bits) + "\n\n" + (
+        "Your job for this run is to review those provisional songs (and any clear "
+        "duplicates they should join) the way the AI tier would have during a sync: "
+        "merge when two songs are the same underlying track under a different title "
+        "style/romanization/presentation format; excise Making/Behind/Reaction/"
+        "Commentary content that should not be a song. Prefer the doc's merge SQL "
+        "(lowest song_id survives). Do not call or suggest the Gemini API - you are "
+        "the replacement for regroup's AI tier. When unsure, leave split."
+    )
+
+    print(f"  [grouping_audit] Triggering audit: regroup handoff ({count} new song(s))")
+    prompt = _build_prompt("regroup_handoff", {"scope": scope})
+    ran = _invoke_agent(prompt)
+    if ran:
+        _save_state({"syncs_since_audit": 0, "last_audit_date": date.today().isoformat(),
+                     "last_audit_reason": "regroup_handoff"})
+    return ran
 
 
 def audit_after_sync(before: dict) -> None:

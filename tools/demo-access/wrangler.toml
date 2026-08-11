@@ -1,0 +1,10 @@
+name = "songranking-demo-access"
+main = "src/index.js"
+compatibility_date = "2026-08-05"
+
+# Non-secret - which repo a completed sign-in grants pull access to.
+# Secrets (GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, GITHUB_INVITE_PAT) are
+# never set here - see README.md, they're set with `wrangler secret put`.
+[vars]
+DATA_REPO_OWNER = "tranbao0"
+DATA_REPO_NAME = "DB-SongRanking-K-pop"

@@ -13,10 +13,16 @@ alternate romanization or native-script rendering), which is exactly what
 tier 3 exists to resolve, so a text filter would defeat the tier it is
 meant to make affordable.
 
+Also guards prompt-shape choices that keep that catalogue cheap: song_id
+order for a stable implicit-cache prefix, and skipping redundant
+`[artist: ...]` labels once scoping has narrowed to one home channel.
+
 No test here reaches the network.
 """
 
+import re
 import unittest
+from unittest import mock
 
 from .context import make_db, add_channel
 
@@ -123,6 +129,93 @@ class GroupingStillWorksTest(unittest.TestCase):
             artist_patterns=index, artist_home_channels={"BTS": "UC_bts"},
         )
         self.assertEqual(result["new"], 1)
+
+
+class PromptShapeTest(unittest.TestCase):
+    """
+    Cache-friendly prompt shape after artist scoping: sorted candidates and
+    no repeated artist tags when only one home channel is in play.
+    """
+
+    def setUp(self):
+        self.conn = make_db()
+        self.addCleanup(self.conn.close)
+        add_channel(self.conn, "UC_bts", "kpop", "BTS", "wikidata")
+        add_channel(self.conn, "UC_twice", "kpop", "TWICE", "wikidata")
+        add_channel(self.conn, "UC_shared", "kpop", "Broadcast", "manual")
+        self.conn.commit()
+        self.index = song_grouping.build_artist_index(
+            [(n, song_grouping.artist_pattern(n)) for n in ["BTS", "TWICE"]]
+        )
+        self.homes = {"BTS": "UC_bts", "TWICE": "UC_twice"}
+
+    def _prompt_for(self, existing, new):
+        prompts = []
+
+        def _fake(prompt, model=None, **kwargs):
+            prompts.append(prompt)
+            n = len(new)
+            members = ", ".join(str(i) for i in range(1, n + 1))
+            return f'[{{"existing_id": null, "members": [{members}]}}]'
+
+        with mock.patch.object(song_grouping, "call_gemini", _fake):
+            song_grouping.group_channel_videos(
+                self.conn, "UC_shared", existing, new,
+                artist_patterns=self.index, artist_home_channels=self.homes,
+            )
+        self.assertEqual(len(prompts), 1)
+        return prompts[0]
+
+    @staticmethod
+    def _existing_block(prompt):
+        return prompt.split("New titles to classify", 1)[0]
+
+    @staticmethod
+    def _catalogue_lines(prompt):
+        """Just the numbered song list - not the instructions that mention [artist: X]."""
+        existing_block = prompt.split("New titles to classify", 1)[0]
+        return existing_block.rsplit("Songs already tracked", 1)[1]
+
+    @staticmethod
+    def _new_block(prompt):
+        return prompt.split("New titles to classify", 1)[1]
+
+    def test_candidate_lines_are_sorted_by_song_id(self):
+        existing = [
+            _row("z", "BTS - Zebra Song Official MV", song_id=10, song_channel_id="UC_bts"),
+            _row("a", "BTS - Apple Song Official MV", song_id=3, song_channel_id="UC_bts"),
+        ]
+        new = [{"video_id": "n", "title": "BTS - Completely New Title For AI"}]
+        catalogue = self._catalogue_lines(self._prompt_for(existing, new))
+        ids = [int(m.group(1)) for m in re.finditer(r"(?m)^(\d+):", catalogue)]
+        self.assertEqual(ids, [3, 10])
+
+    def test_skips_artist_labels_on_candidates_when_one_anchor_is_in_play(self):
+        existing = [
+            _row("old", "BTS - Dynamite Official MV", song_id=1, song_channel_id="UC_bts"),
+            _row("old2", "BTS - Butter Official MV", song_id=2, song_channel_id="UC_bts"),
+        ]
+        new = [{"video_id": "n", "title": "BTS - Brand New AI Only Title"}]
+        prompt = self._prompt_for(existing, new)
+        catalogue = self._catalogue_lines(prompt)
+        new_block = self._new_block(prompt)
+        self.assertNotIn("[artist:", catalogue)
+        # New titles still carry the label - shared-channel disambiguation
+        # for the upload itself, not for the already-scoped catalogue.
+        self.assertIn("[artist: BTS]", new_block)
+
+    def test_keeps_artist_labels_when_multiple_anchors_are_in_play(self):
+        existing = [
+            _row("b", "BTS - Dynamite Official MV", song_id=1, song_channel_id="UC_bts"),
+            _row("t", "TWICE - Fancy Official MV", song_id=2, song_channel_id="UC_twice"),
+        ]
+        new = [
+            {"video_id": "n1", "title": "BTS - Brand New AI Only Title"},
+            {"video_id": "n2", "title": "TWICE - Another Brand New AI Title"},
+        ]
+        catalogue = self._catalogue_lines(self._prompt_for(existing, new))
+        self.assertIn("[artist: BTS]", catalogue)
+        self.assertIn("[artist: TWICE]", catalogue)
 
 
 if __name__ == "__main__":

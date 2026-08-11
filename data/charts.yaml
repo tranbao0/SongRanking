@@ -1,10 +1,15 @@
 # Named chart definitions consumed by charts.compute_chart().
 # metric: cumulative (all-time views) | gained (views gained over window_days) | newest (latest release)
 # window_days: only used by "gained"; null for cumulative/newest.
+# views_delta_days: how long the CSV keeps a fixed views baseline for the
+#   overlay "views gained" delta. null = rewrite the baseline every chart run
+#   (default). 30 = monthly: gained accumulates against the same baseline
+#   until 30 days after that baseline was set, then the baseline resets.
 - name: kpop_alltime
   genre: kpop
   metric: cumulative
   window_days: null
+  views_delta_days: 30
   limit: 200
 
 - name: kpop_weekly_gainers

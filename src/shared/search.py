@@ -19,6 +19,7 @@ from datetime import date
 
 from shared.dates import months_since
 from shared.mv_filter import is_valid_mv
+from shared.ytdlp_throttle import ytdlp_cmd
 
 
 PRINT_TEMPLATE = (
@@ -41,13 +42,12 @@ def search_kpop(query: str, limit: int = 50, filter_mv: bool = True) -> list[dic
     fetch_n = min(limit * 3, 200) if filter_mv else limit
 
     result = subprocess.run(
-        [
-            "yt-dlp",
+        ytdlp_cmd(
             f"ytsearch{fetch_n}:{query}",
             "--flat-playlist",
             "--no-warnings",
             "--print", PRINT_TEMPLATE,
-        ],
+        ),
         capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
     )
 

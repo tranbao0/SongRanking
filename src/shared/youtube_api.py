@@ -105,6 +105,14 @@ def _meta_from_item(item: dict) -> dict:
     an item fetched without contentDetails in its `part` - present so
     catalog.py's MV-duration check can share this fetch (and its yt-dlp
     quota fallback) instead of running its own separate videos().list call.
+
+    `tags` (the uploader's own creator-supplied keywords, empty if none)
+    rides along on the same snippet already being requested here - no
+    extra quota cost - so catalog.py can persist them for song_grouping's
+    AI tier to use as extra context. Never used to decide a match itself:
+    tags are unstructured and inconsistent across channels, so only the
+    tier that applies judgment (not the free deterministic tiers) reads
+    them - see song_grouping's module docstring.
     """
     release_date = _published_date(item)
     return {
@@ -114,6 +122,7 @@ def _meta_from_item(item: dict) -> dict:
         "release_date":    release_date.strftime("%Y.%m.%d"),
         "years_on_chart":  max(1, date.today().year - release_date.year + 1),
         "months_on_chart": months_since(release_date),
+        "tags":            item.get("snippet", {}).get("tags", []),
     }
 
 

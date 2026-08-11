@@ -5,7 +5,7 @@ import json
 from datetime import date
 
 from shared.dates import months_since
-from shared.ytdlp_throttle import throttle as _throttle
+from shared.ytdlp_throttle import throttle as _throttle, ytdlp_cmd
 
 # yt-dlp's fatal line looks like "ERROR: [youtube] <video_id>: <reason>" -
 # the ID makes every video's message unique text, which would otherwise
@@ -30,7 +30,7 @@ def fetch_metadata(url):
     """Return view count, duration, release date/year, and months-on-chart from a YouTube URL."""
     _throttle()
     result = subprocess.run(
-        ["yt-dlp", "--dump-json", "--no-playlist", url],
+        ytdlp_cmd("--dump-json", "--no-playlist", url),
         capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
     )
     data = json.loads(result.stdout)
@@ -55,6 +55,10 @@ def fetch_metadata(url):
         "release_date": release_date.strftime("%Y.%m.%d"),
         "years_on_chart": years_on_chart,
         "months_on_chart": months_on_chart,
+        # Same shape as the API backend's _meta_from_item - see its
+        # docstring for why this rides along rather than costing a
+        # separate fetch, and why it's never used to decide a match itself.
+        "tags": data.get("tags") or [],
     }
 
 

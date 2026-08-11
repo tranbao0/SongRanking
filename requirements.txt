@@ -1,8 +1,8 @@
 yt-dlp
+bgutil-ytdlp-pot-provider
 google-genai
 google-api-python-client
 python-dotenv
 Pillow
 requests
 PyYAML
-turso_serverless

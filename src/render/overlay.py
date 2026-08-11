@@ -334,68 +334,118 @@ def build_overlay_image(style, *, rank, title, artist, peak, release_date, month
     return img
 
 
-def build_filter_complex(cw, ch):
+def build_song_filter_complex(cw, ch, fps, overlay_enter, overlay_exit, overlay_duration,
+                              lead_bare, trail_bare, total_duration):
     """
-    ffmpeg filter_complex compositing the raw clip (input 0) scaled/padded to
-    the canvas with the pre-rendered overlay PNG (input 1) laid on top.
+    One-pass video graph for a full song segment. Scale/pad/fps once, build a
+    bare copy and an overlaid copy from that same stream, trim the timeline
+    pieces from those copies, wipe overlay on/off with xfade, then concat.
+
+    Keeping this in one graph (instead of separate per-phase encodes) means
+    the 24->30 retiming never restarts at an overlay wipe - those phase
+    seams were where audio glitched even with a continuous audio mux.
+
+    Inputs: 0 = raw clip already trimmed to this segment's window, 1 = the
+    overlay PNG looped for `total_duration`. Video only - audio is muxed
+    afterward as one continuous track (see encode_song).
+
+    Relative timeline inside the trimmed input:
+        [0, lead_bare)                          bare (edge clips only)
+        [lead_bare, lead_bare+od)               wipe bare -> overlay
+        [lead_bare+od, total-trail-od)          static overlay
+        [total-trail-od, total-trail)           wipe overlay -> bare
+        [total-trail, total)                    bare (edge clips only)
     """
-    return (
-        f"[0:v]scale={cw}:{ch}:force_original_aspect_ratio=decrease,"
-        f"pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2:color=black[bg];"
-        f"[bg][1:v]overlay=0:0:format=auto[vout]"
+    od = overlay_duration
+    in_start = lead_bare
+    in_end = lead_bare + od
+    out_start = total_duration - trail_bare - od
+    out_end = out_start + od
+
+    # How many consumers each master stream needs (always the wipe/static
+    # pieces; lead/trail only when this is an edge clip).
+    bare_n = 2 + (1 if lead_bare else 0) + (1 if trail_bare else 0)
+    ov_n = 3
+
+    parts = [
+        (
+            f"[0:v]scale={cw}:{ch}:force_original_aspect_ratio=decrease,"
+            f"pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"fps={fps},setsar=1,split=2[bare0][base]"
+        ),
+        # -loop'd image inputs default to 25fps - force match so xfade and
+        # concat see identical frame pacing on every branch.
+        f"[1:v]fps={fps}[ovsrc]",
+        f"[base][ovsrc]overlay=0:0:format=auto[ov0]",
+        f"[bare0]split={bare_n}" + "".join(f"[b{i}]" for i in range(bare_n)),
+        f"[ov0]split={ov_n}" + "".join(f"[o{i}]" for i in range(ov_n)),
+    ]
+
+    bi = oi = 0  # next unused split pad on bare / overlay
+    segments = []
+
+    def _take_bare():
+        nonlocal bi
+        tag = f"b{bi}"
+        bi += 1
+        return tag
+
+    def _take_ov():
+        nonlocal oi
+        tag = f"o{oi}"
+        oi += 1
+        return tag
+
+    def _trim(src, start, end, dst):
+        parts.append(f"[{src}]trim=start={start}:end={end},setpts=PTS-STARTPTS[{dst}]")
+
+    if lead_bare:
+        src = _take_bare()
+        _trim(src, 0, lead_bare, "vlead")
+        segments.append("[vlead]")
+
+    bare_in = _take_bare()
+    ov_in = _take_ov()
+    _trim(bare_in, in_start, in_end, "bare_in")
+    _trim(ov_in, in_start, in_end, "ov_in")
+    # Cap xfade output to `od` - same reason as build_transition_filter_
+    # complex: xfade can emit a few extra frames past duration=.
+    parts.append(
+        f"[bare_in][ov_in]xfade=transition={overlay_enter}:duration={od}:offset=0,"
+        f"trim=duration={od},setpts=PTS-STARTPTS[vin]"
     )
+    segments.append("[vin]")
 
+    ov_static = _take_ov()
+    _trim(ov_static, in_end, out_start, "vstatic")
+    segments.append("[vstatic]")
 
-def build_bare_filter_complex(cw, ch):
-    """
-    Plain scale/pad with no overlay composited. Used for the brief bare
-    windows at the very start of the first song and the very end of the
-    last song - every other clip's bare edges are instead produced by
-    build_transition_filter_complex (interior boundary) or build_overlay_
-    phase_filter_complex (that clip's own wipe-in/fade-out window).
-    """
-    return (
-        f"[0:v]scale={cw}:{ch}:force_original_aspect_ratio=decrease,"
-        f"pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2:color=black[vout]"
+    ov_out = _take_ov()
+    bare_out = _take_bare()
+    _trim(ov_out, out_start, out_end, "ov_out")
+    _trim(bare_out, out_start, out_end, "bare_out")
+    parts.append(
+        f"[ov_out][bare_out]xfade=transition={overlay_exit}:duration={od}:offset=0,"
+        f"trim=duration={od},setpts=PTS-STARTPTS[vwipeout]"
     )
+    segments.append("[vwipeout]")
 
+    if trail_bare:
+        src = _take_bare()
+        _trim(src, out_end, total_duration, "vtrail")
+        segments.append("[vtrail]")
 
-def build_overlay_phase_filter_complex(cw, ch, transition, duration, fps, reverse=False):
-    """
-    Wipes a clip's own overlay on (reverse=False) or off (reverse=True)
-    entirely within that clip's own footage - no neighboring clip involved.
-    Splits the scaled/padded video into a bare copy and an overlaid copy,
-    then xfades bare->overlaid (entry) or overlaid->bare (exit) across the
-    whole `duration`-second window (offset=0).
-
-    Inputs: 0 = clip video+audio (already trimmed to this window), 1 = the
-    clip's overlay PNG (looped for `duration`s). Audio is passed straight
-    through unfiltered - the overlay's visibility never affects the audio,
-    so there's nothing to blend there.
-    """
-    bg = (
-        f"[0:v]scale={cw}:{ch}:force_original_aspect_ratio=decrease,"
-        f"pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2:color=black,fps={fps},split=2[bg1][bg2]"
-    )
-    order = "[ov][bg2]" if reverse else "[bg2][ov]"
-    return (
-        f"{bg};"
-        # -loop'd image inputs default to 25fps regardless of the clip's
-        # native rate - forced to match here so xfade blends two streams
-        # with identical frame pacing instead of resampling one on the fly.
-        f"[1:v]fps={fps}[ovsrc];"
-        f"[bg1][ovsrc]overlay=0:0:format=auto[ov];"
-        f"{order}xfade=transition={transition}:duration={duration}:offset=0[vout]"
-    )
+    parts.append(f"{''.join(segments)}concat=n={len(segments)}:v=1:a=0[vout]")
+    return ";\n".join(parts)
 
 
 def build_transition_filter_complex(cw, ch, video_transition, duration, fps=30):
     """
     Pure clip-to-clip crossfade between two adjacent clips' bare footage.
     By the time footage reaches this boundary, each clip has already wiped
-    its own overlay off (see build_overlay_phase_filter_complex) during its
-    own encode, using up the `duration` seconds this transition sits
-    between - so both sides are plain video here, no overlay involved.
+    its own overlay off (see build_song_filter_complex) during its own
+    encode, using up the `duration` seconds this transition sits between -
+    so both sides are plain video here, no overlay involved.
 
     Inputs: 0 = clip A's video+audio (its last `duration`s), 1 = clip B's
     video+audio (its first `duration`s).
@@ -413,7 +463,17 @@ def build_transition_filter_complex(cw, ch, video_transition, duration, fps=30):
     return (
         f"{_bg(0, 'bgA')};"
         f"{_bg(1, 'bgB')};"
-        f"[bgA][bgB]xfade=transition={video_transition}:duration={duration}:offset=0[vout];"
+        # xfade and acrossfade disagree on what happens after the blend
+        # window: acrossfade stops sharply at exactly `duration`, but xfade
+        # (offset=0) keeps playing clip B's remaining frames past that point
+        # instead of ending there. Clip B's demuxed/retimed frame count
+        # rarely lands exactly on `duration`, so that tail is usually a few
+        # extra frames of unblended clip-B video with no matching audio -
+        # audibly, a brief dead-air stutter right at the end of every
+        # transition. Trimming [vout] back to `duration` keeps video and
+        # audio the same length so the two segments splice cleanly.
+        f"[bgA][bgB]xfade=transition={video_transition}:duration={duration}:offset=0,"
+        f"trim=duration={duration},setpts=PTS-STARTPTS[vout];"
         f"[0:a][1:a]acrossfade=d={duration}[aout]"
     )
 

@@ -9,9 +9,19 @@ data/*.db-wal
 data/*.db-shm
 data/.yt_dlp_update_check.json
 data/.api_usage.json
-data/.manual-grouping-progress.json
-data/.grouping_audit_state.json
+# Grouping-audit sidecars (progress/state/log + session scratch).
+# Whole directory is local-only - see docs/manual-grouping-prompt.md
+# "Session file layout". Leading-dot dir names need an explicit rule;
+# gitignore's `*` does not match a leading `.`.
+data/.grouping-audit/
 assets/clips/_concat_list.txt
+scripts/*.py
+scripts/*.txt
+
+# The registry data repo's local checkout - its own separate git
+# repository (see src/registry/db.py's DATA_REPO_PATH), not tracked by
+# this one.
+data/.registry-data/
 
 # API keys and secrets
 .env

@@ -17,7 +17,7 @@ No test reaches the network.
 import unittest
 from unittest import mock
 
-from .context import make_db, add_channel
+from .context import make_db, add_channel, add_video, fake_gemini_assign_singles
 
 from registry import catalog, db, song_grouping
 
@@ -70,8 +70,8 @@ class SyncResilienceTest(unittest.TestCase):
              mock.patch.object(catalog, "_prefetch_channel_statuses", side_effect=_prefetch), \
              mock.patch.object(catalog, "_list_new_uploads",
                                side_effect=uploads_side_effect or (lambda *a: [])), \
-             mock.patch.object(catalog, "_fetch_durations", return_value={}), \
-             mock.patch.object(song_grouping, "call_gemini", lambda p, model=None: None):
+             mock.patch.object(catalog, "_fetch_video_details", return_value={}), \
+             mock.patch.object(song_grouping, "call_gemini", fake_gemini_assign_singles):
             return catalog.sync_videos()
 
     def _synced(self):
@@ -176,12 +176,44 @@ class SyncResilienceTest(unittest.TestCase):
              mock.patch.object(catalog, "_prefetch_channel_statuses", side_effect=_prefetch), \
              mock.patch.object(catalog, "_channel_status", return_value=("PL_UC_1", 5)) as status, \
              mock.patch.object(catalog, "_list_new_uploads", return_value=[]), \
-             mock.patch.object(catalog, "_fetch_durations", return_value={}), \
-             mock.patch.object(song_grouping, "call_gemini", lambda p, model=None: None):
+             mock.patch.object(catalog, "_fetch_video_details", return_value={}), \
+             mock.patch.object(song_grouping, "call_gemini", fake_gemini_assign_singles):
             catalog.sync_videos()
 
         status.assert_called_once_with(mock.ANY, "UC_1")
         self.assertEqual(self._synced(), {"UC_0", "UC_1", "UC_2"})
+
+
+class UngroupedTipTest(unittest.TestCase):
+    """
+    After sync, leftover song_id NULL rows must be obvious in the log so
+    the operator runs regroup instead of assuming grouping finished.
+    """
+
+    def setUp(self):
+        self.conn = make_db(keep_open=True)
+        self.addCleanup(self.conn.really_close)
+        add_channel(self.conn, "UC_a", "kpop", "Artist", "wikidata")
+        add_video(self.conn, "orphan", "UC_a", title="Orphan MV", song_id=None)
+        self.conn.commit()
+        patcher = mock.patch.object(db, "get_connection", return_value=self.conn)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_sync_mentions_regroup_when_null_song_ids_remain(self):
+        import io
+        import contextlib
+
+        buf = io.StringIO()
+        with mock.patch.object(catalog, "get_client", return_value=mock.Mock()), \
+             mock.patch.object(catalog, "_prefetch_channel_statuses",
+                               return_value={"UC_a": ("PL_a", 0)}), \
+             mock.patch.object(song_grouping, "call_gemini", fake_gemini_assign_singles), \
+             contextlib.redirect_stdout(buf):
+            catalog.sync_videos()
+        out = buf.getvalue()
+        self.assertIn("song_id NULL", out)
+        self.assertIn("python run.py regroup", out)
 
 
 class PrefetchChannelStatusesTest(unittest.TestCase):

@@ -19,6 +19,7 @@ import sys
 import os
 
 from render.chart_state import DATA_FILE as OUTPUT_FILE, FIELDNAMES
+from shared.ytdlp_throttle import ytdlp_cmd
 
 
 def clean_url(url):
@@ -32,7 +33,7 @@ def clean_url(url):
 def fetch_title_artist(url):
     """Use yt-dlp to get the video title and uploader without downloading."""
     result = subprocess.run(
-        ["yt-dlp", "--no-playlist", "--print", "%(title)s|||%(uploader)s", url],
+        ytdlp_cmd("--no-playlist", "--print", "%(title)s|||%(uploader)s", url),
         capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
     )
     raw = result.stdout.strip()

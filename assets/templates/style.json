@@ -3,8 +3,8 @@
   "font_regular": "C:/Windows/Fonts/malgun.ttf",
 
   "canvas": {
-    "width":  1920,
-    "height": 1080,
+    "width":  2560,
+    "height": 1440,
     "fps":    30
   },
 
@@ -17,57 +17,57 @@
   },
 
   "bar": {
-    "solid_height":   132,
-    "fade_height":    18,
-    "bottom_margin":  50,
+    "solid_height":   176,
+    "fade_height":    24,
+    "bottom_margin":  67,
     "color":          [8, 9, 18],
     "opacity":        0.93,
     "opacity_right":  0.15,
-    "margin_left":    48,
-    "margin_right":   48,
-    "padding_top":    18,
-    "padding_bottom": 18
+    "margin_left":    64,
+    "margin_right":   64,
+    "padding_top":    24,
+    "padding_bottom": 24
   },
 
   "rank": {
-    "fontsize":      50,
+    "fontsize":      67,
     "color":         [255, 199, 46],
     "shadow_color":  [0, 0, 0],
     "shadow_alpha":  130,
-    "shadow_offset": [0, 2]
+    "shadow_offset": [0, 3]
   },
 
   "rank_change": {
-    "chip_gap":   22,
-    "fontsize":   22,
+    "chip_gap":   29,
+    "fontsize":   29,
     "color_up":   [110, 231, 183],
     "color_down": [248, 113, 113],
     "color_same": [170, 170, 170]
   },
 
   "divider": {
-    "gap":    24,
-    "width":  2,
+    "gap":    32,
+    "width":  3,
     "color":  [255, 255, 255],
     "alpha":  55
   },
 
   "title": {
-    "fontsize":          39,
+    "fontsize":          52,
     "color":             [255, 255, 255],
-    "max_width_reserve": 220,
+    "max_width_reserve": 293,
     "separator":         "  by  ",
     "separator_color":   [130, 134, 160],
-    "artist_fontsize":   23,
+    "artist_fontsize":   31,
     "artist_color":      [160, 165, 195]
   },
 
-  "row_gap": -2,
+  "row_gap": -3,
 
   "stats": {
-    "group_gap":   34,
-    "value_gap":   9,
-    "fontsize":    24,
+    "group_gap":   45,
+    "value_gap":   12,
+    "fontsize":    32,
     "label_color": [175, 178, 200],
     "items": [
       {"key": "released", "label": "RELEASED:",           "value_color": [200, 205, 255]},
@@ -80,15 +80,15 @@
   },
 
   "badge": {
-    "diameter":      150,
-    "margin_right":  54,
+    "diameter":      200,
+    "margin_right":  72,
     "center_y_offset": 0,
     "ring_color":    [255, 255, 255],
     "ring_alpha":    140,
-    "ring_width":    3,
-    "fontsize":      24,
-    "min_fontsize":  14,
-    "line_gap":      4,
+    "ring_width":    4,
+    "fontsize":      32,
+    "min_fontsize":  19,
+    "line_gap":      5,
     "text_color":    [255, 255, 255]
   },
 

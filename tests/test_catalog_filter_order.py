@@ -14,7 +14,7 @@ No test reaches the network: the API client is stubbed.
 import unittest
 from unittest import mock
 
-from .context import make_db, add_channel
+from .context import make_db, add_channel, fake_gemini_assign_singles
 
 from registry import catalog, db, song_grouping
 
@@ -41,16 +41,16 @@ class FilterOrderTest(unittest.TestCase):
         """Sync the broadcast channel with `uploads`, returning fetched duration IDs."""
         fetched = []
 
-        def _fake_durations(youtube, video_ids):
+        def _fake_details(youtube, video_ids):
             fetched.extend(video_ids)
-            return {vid: 200 for vid in video_ids}  # all inside the MV window
+            return {vid: {"duration": 200, "tags": []} for vid in video_ids}  # all inside the MV window
 
         with mock.patch.object(catalog, "get_client", return_value=mock.Mock()), \
              mock.patch.object(catalog, "_prefetch_channel_statuses",
                                return_value={"UC_broadcast": ("PL_x", 9999)}), \
              mock.patch.object(catalog, "_list_new_uploads", return_value=uploads), \
-             mock.patch.object(catalog, "_fetch_durations", side_effect=_fake_durations), \
-             mock.patch.object(song_grouping, "call_gemini", lambda p, model=None: None):
+             mock.patch.object(catalog, "_fetch_video_details", side_effect=_fake_details), \
+             mock.patch.object(song_grouping, "call_gemini", fake_gemini_assign_singles):
             catalog.sync_videos(["UC_broadcast"])
         return fetched
 
@@ -87,8 +87,8 @@ class FilterOrderTest(unittest.TestCase):
              mock.patch.object(catalog, "_prefetch_channel_statuses",
                                return_value={"UC_broadcast": ("PL_x", 9999)}), \
              mock.patch.object(catalog, "_list_new_uploads", return_value=uploads), \
-             mock.patch.object(catalog, "_fetch_durations", return_value={"short": 5}), \
-             mock.patch.object(song_grouping, "call_gemini", lambda p, model=None: None):
+             mock.patch.object(catalog, "_fetch_video_details", return_value={"short": {"duration": 5, "tags": []}}), \
+             mock.patch.object(song_grouping, "call_gemini", fake_gemini_assign_singles):
             catalog.sync_videos(["UC_broadcast"])
 
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0], 0)

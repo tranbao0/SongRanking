@@ -11,6 +11,7 @@ otherwise different prompt/response shape.
 
 import os
 import random
+import threading
 import time
 
 try:
@@ -32,7 +33,22 @@ except ImportError:
 
 from shared import api_budget
 
-MODEL = "models/gemini-3.5-flash"
+# Interactions API model id (Aug 2026). 3.6 Flash matches 3.5 Flash on
+# input price ($1.50/1M) but is cheaper on output including thinking
+# ($7.50/1M vs $9.00/1M) and typically emits fewer thinking tokens.
+MODEL = "gemini-3.6-flash"
+
+# Default for this project's callers (grouping + title cleanup), which are
+# classification/extraction - not agent loops. Google recommends low/minimal
+# for that class of work; at medium, thinking often dominates the output bill.
+# Callers can still raise it per request.
+THINKING_LEVEL = "low"
+
+# Cap for thinking + final text combined on Gemini 3.x. 65k invited the
+# model to spend a huge thinking budget on short JSON answers; a few
+# thousand is enough for a CHUNK_SIZE grouping/cleanup response while
+# still leaving room for low/medium thinking.
+MAX_OUTPUT_TOKENS = 8192
 
 # Chunking exists to bound how much one request has to reason about, but
 # measurement says it costs far more than it protects. Benchmarked on
@@ -56,15 +72,16 @@ MODEL = "models/gemini-3.5-flash"
 #
 # 60 rather than the 140 the numbers alone would argue for, because a chunk
 # is the blast radius of a single failed call: song_grouping leaves a failed
-# chunk's videos ungrouped, and grouping is additive, so they are never
-# revisited. 60 keeps most of the saving without putting an entire channel
-# on one response.
+# chunk's videos with song_id NULL for regroup. Smaller chunks limit how
+# many titles one outage delays, without putting an entire channel on one
+# response.
 CHUNK_SIZE = 60
 
-# Retried rather than surfaced, because song_grouping treats a failed call
-# as "leave these ungrouped" and grouping is additive - an ungrouped video
-# is never revisited, so a transient 429 would permanently split a song
-# instead of merely delaying it.
+# Retried rather than surfaced as a hard error, because a failed call used
+# to mint locked singletons. Sync now leaves those videos with song_id
+# NULL instead, and regroup can finish them - but a transient 429 that
+# isn't retried still costs a wasted attempt and delays grouping, so
+# transport retries remain worthwhile.
 #
 # Patience is sized for the failure seen in practice, which is not a brief
 # blip: a 500 "currently experiencing high demand" on a Flash model can
@@ -75,6 +92,13 @@ CHUNK_SIZE = 60
 # spend the whole allowance on retries.
 _MAX_ATTEMPTS = 4
 _BACKOFF_BASE = 4.0
+
+# One Client per process/api key. Creating a new Client on every attempt
+# (and every parallel chunk) paid setup cost for no benefit - the SDK is
+# safe to share across threads for independent interactions.create calls.
+_CLIENT = None
+_CLIENT_KEY = None
+_CLIENT_LOCK = threading.Lock()
 
 
 def chunked(items: list, size: int = CHUNK_SIZE) -> list[list]:
@@ -117,6 +141,16 @@ def is_available() -> bool:
     return False
 
 
+def _get_client(api_key: str):
+    """Return a process-wide Client for `api_key`, creating it once."""
+    global _CLIENT, _CLIENT_KEY
+    with _CLIENT_LOCK:
+        if _CLIENT is None or _CLIENT_KEY != api_key:
+            _CLIENT = genai.Client(api_key=api_key)
+            _CLIENT_KEY = api_key
+        return _CLIENT
+
+
 def _is_retryable(exc: Exception) -> bool:
     """
     True for rate limits and transient server-side failures only. A bad key
@@ -134,9 +168,23 @@ def _is_retryable(exc: Exception) -> bool:
                                    "deadline", "timeout", "internal error", "503", "500"))
 
 
-def _extract_text(step) -> str:
-    """Pull plain text out of a Gemini interaction step."""
-    if hasattr(step, "text"):
+def _extract_text(interaction) -> str:
+    """
+    Pull plain text out of an Interactions response.
+
+    Prefer `.output_text` (SDK convenience for the final model text) when
+    present; fall back to the last step for older response shapes used in
+    tests and for responses where convenience properties are empty.
+    """
+    text = getattr(interaction, "output_text", None)
+    if isinstance(text, str) and text.strip():
+        return text
+
+    steps = getattr(interaction, "steps", None) or []
+    if not steps:
+        return ""
+    step = steps[-1]
+    if hasattr(step, "text") and step.text:
         return step.text
     if hasattr(step, "content"):
         content = step.content
@@ -148,12 +196,23 @@ def _extract_text(step) -> str:
     return str(step)
 
 
-def call_gemini(prompt: str, model: str = MODEL) -> str | None:
+def call_gemini(
+    prompt: str,
+    model: str = MODEL,
+    response_schema: dict | None = None,
+    thinking_level: str | None = THINKING_LEVEL,
+    max_output_tokens: int = MAX_OUTPUT_TOKENS,
+) -> str | None:
     """
     Send `prompt` to Gemini and return the raw response text (markdown
     code fences stripped), or None if the call can't be made or fails for
     any reason (SDK not installed, no API key, budget exhausted, API
     error) - callers should fall back to their pre-AI behavior on None.
+
+    `response_schema` is an optional JSON Schema passed through
+    Interactions `response_format`, so the API enforces structured JSON
+    instead of relying on prompt wording. `thinking_level` maps to
+    generation_config (Gemini 3.x); pass None to leave the model default.
     """
     if not _SDK_AVAILABLE:
         print("  [gemini_client] 'google-genai' package not installed - skipping AI call.")
@@ -163,6 +222,24 @@ def call_gemini(prompt: str, model: str = MODEL) -> str | None:
     if not api_key:
         print("  [gemini_client] GEMINI_API_KEY not set - skipping AI call.")
         return None
+
+    generation_config: dict = {"max_output_tokens": max_output_tokens}
+    if thinking_level:
+        generation_config["thinking_level"] = thinking_level
+
+    create_kwargs: dict = {
+        "model": model,
+        "input": prompt,
+        "generation_config": generation_config,
+    }
+    if response_schema is not None:
+        # Interactions API (May 2026+): mime_type + schema live on
+        # response_format, not generation_config.
+        create_kwargs["response_format"] = {
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": response_schema,
+        }
 
     for attempt in range(_MAX_ATTEMPTS):
         # Recorded per attempt, not per call: a retry is another billed
@@ -177,13 +254,9 @@ def call_gemini(prompt: str, model: str = MODEL) -> str | None:
             return None
 
         try:
-            client = genai.Client(api_key=api_key)
-            interaction = client.interactions.create(
-                model=model,
-                input=prompt,
-                generation_config={"max_output_tokens": 65536},
-            )
-            text = _extract_text(interaction.steps[-1]).strip()
+            client = _get_client(api_key)
+            interaction = client.interactions.create(**create_kwargs)
+            text = _extract_text(interaction).strip()
 
             if text.startswith("```"):
                 text = "\n".join(

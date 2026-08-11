@@ -1,86 +1,76 @@
 """
-Local-working-copy-backed registry, synced with a hosted Turso (libSQL)
-database: genre-tagged channels, their catalogued videos, song groupings
-across duplicate uploads, and daily view-count snapshots. This is the
-historical data store that chart computation (charts.py) reads from -
-separate from data/songs.csv, which remains the render pipeline's own
-per-chart working file.
+Local-working-copy-backed registry, synced with a private git repo (the
+"data repo"): genre-tagged channels, their catalogued videos, song
+groupings across duplicate uploads, and daily view-count snapshots. This
+is the historical data store that chart computation (charts.py) reads
+from - separate from data/songs.csv, which remains the render pipeline's
+own per-chart working file.
 
-Hosted rather than a local-only SQLite file: the registry used to live at
-data/registry.db, inside this repo's OneDrive-synced folder. OneDrive gives
-no real multi-writer safety for a single binary file - a delete on one
-machine silently propagates to every synced machine - which cost a real
-data-loss incident. See README's "Hosted registry database (Turso)"
-section for one-time setup.
+Git-synced rather than a single local SQLite file: the registry used to
+live at data/registry.db, inside this repo's OneDrive-synced folder, which
+gives no real multi-writer safety for a single binary file (a delete on
+one machine silently propagates to every synced machine) - that cost a
+real data-loss incident. It then moved to a hosted Turso (libSQL)
+database, which fixed that but made every statement a network round trip
+(too slow at this project's scale) and cost a paid hosted service for
+something that only ever has one writer.
 
-Reading/writing the hosted database directly, statement by statement,
-turns out to be the wrong default though: every read/write becomes a real
-network round trip, and sync's own write pattern is thousands of small
-per-video/per-channel statements (see snapshot.py's deliberate per-row
-commits, catalog.py's per-channel commits) - each one now paying network
-latency it never used to. So get_connection() instead opens a *local*
-working copy (LOCAL_WORKING_DB_PATH): every command that mutates the
-registry (sync/decouple/regroup) calls pull_to_local() once at the start -
-so a fresh run sees what other machines already pushed, and skips
-re-spending YouTube/Gemini budget on channels the hosted registry already
-has - does all of its own work at local-disk speed exactly like this
-project did before it had a hosted db at all, runs grouping_audit.py's
-headless agent against that same local file (no turso CLI/WSL relay
-needed for that routine path - see scripts/turso_shell.sh for the rarer
-manual/ad-hoc case of querying the hosted db directly), then
-push_from_local() once at the very end, after everything - the sync
-itself and any audit pass - is done.
+The data repo (REGISTRY_DATA_REPO_URL) holds the registry as deterministic
+SQL text, not a binary database file - see DATA_REPO_PATH's layout below.
+Text diffs/compresses far better than a SQLite file's binary layout (which
+re-diffs almost entirely on nearly any change), and lets the owner's daily
+push double as real version control (git log/diff/revert over readable
+INSERT statements) without ever committing a binary blob. `channels`,
+`songs`, and `videos` stay small (low tens of thousands of rows) and are
+fully re-dumped on every push - simple, and cheap enough to redo every
+time. `rejected_videos` and `view_snapshots` are the two tables with real
+long-term growth (hundreds of thousands of rows and climbing by design),
+so those are append-only chunk files (one per calendar month, keyed off
+each row's own date column) - a routine push only touches the current
+month's file, never rewrites history, which is what keeps git's history
+growing proportional to new content rather than to total size. See
+_FULL_DUMP_TABLES/_APPEND_TABLES below.
 
-The local working copy is gitignored scratch space, never the source of
-truth - safe to delete between runs. If something eats it mid-run, the
-worst case is redoing that one run's work from a fresh pull, not losing
-history: the hosted copy is what stays durable.
+`sync`/`decouple`/`regroup` don't read/write the data repo statement by
+statement - `pull_to_local()` materializes a *local* working copy
+(LOCAL_WORKING_DB_PATH) from the data repo's current files once, at the
+start; every command that mutates the registry does its own work against
+that local file at local-disk speed; `push_from_local()` re-derives the
+data repo's files from that local file's current state once, at the end,
+and commits+pushes them. This is the same shape the Turso-backed design
+used, for the same reason (thousands of small per-video/per-channel
+writes would each cost a git operation otherwise) - only the transport
+underneath changed.
 
-Both pull_to_local() and push_from_local() default to replacing the
-destination's contents outright rather than merging - correct as long as
-nothing else writes to the hosted registry between this command's own
-pull and push, the same single-writer-at-a-time assumption every other
-destructive registry operation in this project already makes (see
-decouple's confirmation prompt, the manual grouping doc's "run instances
-one at a time"). That default (override=True) is what every internal
-caller here uses (sync/decouple/regroup, grouping_audit's own pull+push
-bracket), unchanged. `python run.py pull`/`push` instead default to
-override=False (merge) - see run.py's --override flag - which upserts
-by primary key (adds a row the destination is missing, overwrites a row
-it already has with the source's current values) but never deletes a
-row that only exists on the destination, for the manual case of
-reconciling two copies without either one wiping out the other's data.
-
-push_from_local()'s override=True is itself just that same upsert,
-followed by a separate step that deletes whatever the hosted registry
-still has that the upsert didn't touch - never a wholesale DELETE before
-the rebuild starts. That ordering is what makes an override push safe to
-interrupt at any point (dropped connection, killed process, sleeping
-laptop): every already-committed chunk (see _push_chunk/_delete_chunk)
-is either a row that should exist with correct values or a stale row
-not yet cleaned up, never a row that's missing. This replaced an earlier
-design that deleted every table up front and rebuilt it incrementally
-over many separate round trips - safe only as long as nothing interrupted
-the rebuild, and silently truncated the hosted registry with no way to
-detect or recover from it otherwise when something did.
+Both pull and push are always full operations now, not a merge/override
+choice: pull_to_local() always rebuilds the local working copy from
+scratch from whatever the data repo currently holds, and push_from_local()
+always publishes the local working copy's complete current state. The
+old merge mode existed to reconcile two independently-writable copies
+without either one silently discarding the other's data - unnecessary
+now that there is exactly one writer (this project's owner) and the git
+repo is unambiguously the single source of truth. `python run.py pull`/
+`push` no longer take an --override flag; see run.py.
 """
 
-import concurrent.futures
 import os
 import shutil
 import sqlite3
-import threading
+import subprocess
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-import turso_serverless
-
 from shared import shutdown
 
-_TURSO_URL = os.environ.get("TURSO_DATABASE_URL")
-_TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
+DATA_REPO_URL = os.environ.get("REGISTRY_DATA_REPO_URL")
 
 LOCAL_WORKING_DB_PATH = Path(__file__).parent.parent.parent / "data" / ".registry_working.db"
+
+# The data repo's local checkout - its own separate git repository, not
+# tracked by this one (see .gitignore). Persists between runs so a pull
+# is normally an incremental `git pull`, not a fresh clone.
+DATA_REPO_PATH = Path(__file__).parent.parent.parent / "data" / ".registry-data"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS channels (
@@ -135,20 +125,6 @@ CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id);
 CREATE INDEX IF NOT EXISTS idx_rejected_videos_channel ON rejected_videos(channel_id);
 """
 
-# Created after _MIGRATIONS run, since one of them indexes a column
-# (videos.song_id) that only exists on fresh databases via that migration.
-#
-# idx_snapshots_video is dropped rather than created: view_snapshots'
-# PRIMARY KEY (video_id, snapshot_date) already has video_id as its leading
-# column, so a separate index on video_id alone could never be chosen over
-# it - confirmed with EXPLAIN QUERY PLAN, which uses the primary key's
-# implicit index for every query in this codebase. It only ever cost write
-# time on each day's snapshot insert.
-#
-# What was actually missing is the reverse: snapshot.take_snapshot filters
-# by snapshot_date alone to find videos still pending for today, which the
-# primary key can't serve (wrong column order) and which was therefore a
-# full table scan growing by one row per video per day.
 _POST_MIGRATION_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_videos_song ON videos(song_id);
 CREATE INDEX IF NOT EXISTS idx_snapshots_date ON view_snapshots(snapshot_date);
@@ -164,13 +140,36 @@ _MIGRATIONS = [
     "ALTER TABLE videos ADD COLUMN song_id INTEGER REFERENCES songs(song_id)",
     "ALTER TABLE channels ADD COLUMN last_catalog_sync TEXT",
     "ALTER TABLE channels ADD COLUMN last_known_video_count INTEGER",
+    # JSON-encoded list of the uploader's own creator-supplied tags, empty/
+    # NULL for a video catalogued before this column existed. See
+    # song_grouping's module docstring for why this only ever feeds the AI
+    # tier's context, never a deterministic tier's matching key.
+    "ALTER TABLE videos ADD COLUMN tags TEXT",
 ]
 
-_TABLES = ("channels", "songs", "videos", "view_snapshots", "rejected_videos")
+# Small, routinely-mutated tables (channels.last_catalog_sync bumps every
+# sync; videos.song_id changes via regroup/decouple) - fully re-dumped to
+# a single file on every push. Ordered by primary key so an unchanged row
+# produces a byte-identical line, letting git's own line diff carry the
+# "what actually changed" signal instead of a custom diff needing to.
+_FULL_DUMP_TABLES = ("channels", "songs", "videos")
 
-# Primary key column(s) per table, used to build the ON CONFLICT target
-# for merge mode's upserts (see pull_to_local/push_from_local). Must
-# match _SCHEMA exactly - view_snapshots is the only composite key.
+# Large, append-heavy tables - see module docstring. Never deleted from in
+# normal operation; only discovery.py's _purge_excluded (rare, manual
+# channel-exclusion) ever removes rows, handled by _needs_full_regen.
+_APPEND_TABLES = ("rejected_videos", "view_snapshots")
+
+# The date column each append table's chunk files are bucketed by (one
+# file per calendar month of this column's value) - not "today", so a
+# push after a multi-day gap still files rows under the month they
+# actually belong to rather than lumping them into the push date's month.
+_APPEND_DATE_COLUMN = {"rejected_videos": "checked_at", "view_snapshots": "snapshot_date"}
+
+_TABLES = _FULL_DUMP_TABLES + _APPEND_TABLES
+
+# Primary key column(s) per table - used for full-dump ORDER BY and as
+# the tie-breaker ordering within a regenerated append-table chunk file.
+# Must match _SCHEMA exactly - view_snapshots is the only composite key.
 _PRIMARY_KEYS = {
     "channels": ("channel_id",),
     "songs": ("song_id",),
@@ -199,39 +198,16 @@ def _apply_schema(conn) -> None:
     conn.commit()
 
 
-def get_remote_connection() -> turso_serverless.Connection:
-    """
-    Open a connection directly to the hosted Turso registry - the network,
-    every-statement-is-a-round-trip path. Used only by pull_to_local() and
-    push_from_local() themselves, and by low-volume read-only callers like
-    charts.py that don't need a local working copy at all. Never called
-    from sync/decouple/regroup's own per-channel/per-row work - see
-    module docstring.
-    """
-    if not _TURSO_URL or not _TURSO_AUTH_TOKEN:
-        raise EnvironmentError(
-            "TURSO_DATABASE_URL / TURSO_AUTH_TOKEN are not set. Add them to .env - "
-            "see README's \"Hosted registry database (Turso)\" section."
-        )
-    conn = turso_serverless.connect(_TURSO_URL, auth_token=_TURSO_AUTH_TOKEN)
-    conn.row_factory = turso_serverless.Row
-    try:
-        _apply_schema(conn)
-    except Exception:
-        conn.close()
-        raise
-    return conn
-
-
 def get_connection() -> sqlite3.Connection:
     """
     Open a connection to the local working copy, creating the schema (and
     applying any pending column migrations) on first use. Row factory
     returns dict-like rows so callers can index by column name. This is
     what every registry-mutating command (sync/decouple/regroup) and
-    grouping_audit.py's headless agent actually reads/writes - see module
-    docstring for why, and call pull_to_local() first so it reflects the
-    hosted registry's current state rather than being empty or stale.
+    grouping_audit.py's headless agent actually reads/writes, and also
+    what charts.py reads from - call pull_to_local() first if you want it
+    to reflect the data repo's latest pushed state rather than whatever
+    was last pulled.
 
     If the file exists but isn't a readable SQLite database, schema
     application raises - explicitly closed before that propagates rather
@@ -253,13 +229,8 @@ def get_connection() -> sqlite3.Connection:
 
 def _backup_and_prune_local() -> None:
     """
-    Copy the local working copy aside before pull_to_local() overwrites it,
+    Copy the local working copy aside before pull_to_local() rebuilds it,
     then delete all but the _LOCAL_BACKUP_KEEP most recent such backups.
-
-    Same discipline as decouple.py's own pre-write backup, for the other
-    operation that discards whatever is currently in the local working
-    copy: a pull replaces it wholesale with the hosted registry's state,
-    same as decouple's own changes replace what was there before them.
     """
     if not LOCAL_WORKING_DB_PATH.exists():
         return
@@ -273,139 +244,42 @@ def _backup_and_prune_local() -> None:
         stale.unlink()
 
 
-def _conflict_clause(table: str, columns: list[str]) -> str:
+def _run_git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
+    result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed:\n{result.stderr.strip()}")
+    return result
+
+
+def _sync_data_repo() -> None:
     """
-    The ON CONFLICT clause shared by merge mode's local and remote
-    upserts: a row `columns`/values apply to a primary key the
-    destination already has overwrites that row's non-key columns with
-    the incoming values (this is what makes merge actually carry
-    changes to already-known rows, not just add new ones), while a
-    primary key the destination doesn't have yet is a plain insert.
-    Nothing on the destination is ever deleted by this - a row only the
-    destination has is simply never mentioned in `rows`.
+    Bring DATA_REPO_PATH's checkout up to date: clone it if it doesn't
+    exist yet, otherwise a plain fast-forward pull. --ff-only rather than
+    a merge/rebase pull is deliberate - this checkout is only ever
+    fast-forwarded by this same pull, or advanced by this machine's own
+    push; a real divergence would mean something unexpected happened to
+    the checkout (or the single-writer assumption was violated), which
+    should surface as an error here rather than silently merge.
     """
-    pk_cols = _PRIMARY_KEYS[table]
-    update_cols = [c for c in columns if c not in pk_cols]
-    if not update_cols:
-        return f"ON CONFLICT({', '.join(pk_cols)}) DO NOTHING"
-    set_clause = ", ".join(f"{c}=excluded.{c}" for c in update_cols)
-    return f"ON CONFLICT({', '.join(pk_cols)}) DO UPDATE SET {set_clause}"
-
-
-def _merge_insert_local(local: sqlite3.Connection, table: str, columns: list[str], rows: list[tuple]) -> None:
-    """Upsert `rows` into the local working copy - see _conflict_clause."""
-    placeholders = ", ".join("?" * len(columns))
-    sql = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders}) {_conflict_clause(table, columns)}"
-    local.executemany(sql, rows)
-
-
-def _pk_set(conn, table: str) -> set[tuple]:
-    """
-    The full set of primary-key tuples currently in `table` on `conn` - a
-    lightweight primary-key-only SELECT, one round trip if `conn` is
-    remote. Used to diff local against remote in both directions' cleanup
-    step: pull_to_local deletes local_pks - remote_pks (rows local has
-    that the hosted registry doesn't), push_from_local deletes
-    remote_pks - local_pks (the reverse).
-    """
-    pk_list = ", ".join(_PRIMARY_KEYS[table])
-    return {tuple(row) for row in conn.execute(f"SELECT {pk_list} FROM {table}").fetchall()}
-
-
-def _delete_local_rows(local: sqlite3.Connection, table: str, pk_cols: tuple[str, ...], pks: list[tuple]) -> None:
-    """Delete `pks` from the local working copy's `table` - the cleanup
-    half of an override pull, see pull_to_local. Unchunked/unthreaded
-    unlike the remote-side equivalent (_delete_chunk): this is local disk,
-    not a network round trip, so there's no batching benefit to chase."""
-    if not pks:
-        return
-    where = " AND ".join(f"{c} = ?" for c in pk_cols)
-    local.executemany(f"DELETE FROM {table} WHERE {where}", pks)
-
-
-def pull_to_local(override: bool = True) -> None:
-    """
-    Bring the hosted registry's rows into the local working copy: every
-    row the hosted registry has is upserted into local first (see
-    _conflict_clause), then, only if override=True, whatever local still
-    has that the hosted registry doesn't (by primary key) is deleted (see
-    _pk_set). That order - and never deleting the local file itself -
-    means an interruption at any point (dropped connection, killed
-    process, sleeping laptop) leaves local either at its previous state
-    or with a few stale rows not yet cleaned up, never empty or missing
-    something it should have. This replaced an earlier design that
-    deleted the local file outright and rebuilt it from nothing in one
-    long-uncommitted pass - safe only because everything was wrapped in a
-    single final commit, but an interruption anywhere before that commit
-    (a crash, an outside kill - the same gap shutdown.critical_section()
-    can't close, see shared/shutdown.py) still left local with nothing at
-    all, not even what it had before the pull started.
-
-    override=True (default - every internal caller here uses this,
-    unchanged) is what makes this a full replace rather than a merge: the
-    delete-orphans step runs, discarding whatever local-only, not-yet-
-    pushed work existed - correct as long as nothing else writes to the
-    hosted registry between this command's own pull and push (see the
-    module docstring). Call once, before any of sync/decouple/regroup's
-    own work - that's what lets a fresh run see whatever another machine
-    already pushed, and skip re-spending YouTube/Gemini budget on
-    channels the hosted registry already has (catalog.py's incremental
-    per-channel logic needs to see their real last_catalog_sync/existing
-    videos, not an empty local file). A timestamped backup of whatever
-    the local working copy held is written first - see
-    _backup_and_prune_local() - so a pull that clobbers not-yet-pushed
-    local work is still recoverable.
-
-    override=False stops after the upsert step - a row that only exists
-    locally is left alone, merge never deletes, and the local file is
-    never backed up either (nothing destructive happens to it). This is
-    what `python run.py pull` uses by default (see run.py's --override
-    flag).
-
-    If the local file exists but isn't a readable SQLite database (this
-    has happened for real - see data/.registry_working.db.corrupted-
-    backup-before-restore from this project's own history), the upsert
-    approach above has nothing to build on, so this falls back to the old
-    discard-and-rebuild-from-nothing behavior for that one case: a
-    corrupted file has no salvageable content regardless of override, so
-    there's nothing an upsert could have preserved anyway.
-    """
-    if override:
-        _backup_and_prune_local()
-    remote = get_remote_connection()
-    try:
-        try:
-            local = get_connection()
-        except sqlite3.DatabaseError:
-            if LOCAL_WORKING_DB_PATH.exists():
-                LOCAL_WORKING_DB_PATH.unlink()
-            local = get_connection()
-        try:
-            with shutdown.critical_section():
-                for table in _TABLES:
-                    cursor = remote.execute(f"SELECT * FROM {table}")
-                    columns = [d[0] for d in cursor.description]
-                    rows = [tuple(row) for row in cursor.fetchall()]
-                    if rows:
-                        _merge_insert_local(local, table, columns, rows)
-                if override:
-                    for table in _TABLES:
-                        orphans = list(_pk_set(local, table) - _pk_set(remote, table))
-                        _delete_local_rows(local, table, _PRIMARY_KEYS[table], orphans)
-                local.commit()
-        finally:
-            local.close()
-    finally:
-        remote.close()
+    if not DATA_REPO_URL:
+        raise EnvironmentError(
+            "REGISTRY_DATA_REPO_URL is not set. Add it to .env - see README's "
+            "\"Git-synced registry database\" section."
+        )
+    if (DATA_REPO_PATH / ".git").is_dir():
+        _run_git("pull", "--ff-only", cwd=DATA_REPO_PATH)
+    else:
+        DATA_REPO_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _run_git("clone", DATA_REPO_URL, str(DATA_REPO_PATH), cwd=DATA_REPO_PATH.parent)
 
 
 def _sql_literal(value) -> str:
     """
-    Encode a Python value as a SQLite text literal, for the batched
-    INSERT statements _push_rows builds. Only the value shapes this
-    registry's columns actually hold (TEXT, INTEGER, NULL) are exercised;
-    float/blob handling is included for completeness, not because a
-    column here uses them.
+    Encode a Python value as a SQLite text literal, for the INSERT
+    statements this module writes into the data repo's dump files. Only
+    the value shapes this registry's columns actually hold (TEXT,
+    INTEGER, NULL) are exercised; float/blob handling is included for
+    completeness, not because a column here uses them.
     """
     if value is None:
         return "NULL"
@@ -418,178 +292,217 @@ def _sql_literal(value) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-# Rows per executescript() call in _push_chunk/_delete_chunk. Each chunk
-# is one network round trip, so this trades a larger request body for
-# fewer round trips - large enough that a full-registry push costs
-# hundreds of requests rather than hundreds of thousands, small enough
-# that one chunk's SQL text stays a reasonable HTTP payload size.
-#
-# turso_serverless.Connection.executemany() (confirmed in its own
-# source: Cursor.executemany loops, calling _execute_stmt once per item)
-# issues one HTTP request per row - for this registry's videos table
-# alone, tens of thousands of sequential round trips. Values are inlined
-# as SQL literals instead (via _sql_literal, which quotes/escapes text
-# and never accepts anything from outside this codebase's own already-
-# validated rows) and sent through executescript(), which - like
-# _apply_schema's own use of it against this same remote connection type -
-# sends its whole SQL text as a single pipelined request. That turns a
-# chunk of _PUSH_CHUNK_SIZE rows into one round trip regardless of chunk
-# size.
-#
-# The explicit BEGIN/COMMIT wrapping each chunk matters as much as the
-# batching itself: measured directly, 500 INSERTs in one executescript()
-# call without it took 8.0s (one commit - and its replication ack - per
-# statement, inside the "sequence" pipeline type), against 0.22s with it
-# (one commit for the whole chunk). The round-trip batching alone would
-# still have paid that per-statement commit cost server-side.
-_PUSH_CHUNK_SIZE = 500
-
-# Worker threads for _run_chunked. Each chunk is an independent HTTP
-# round trip, so this is I/O-bound and benefits from real concurrency
-# despite the GIL - the interpreter releases it for the duration of each
-# socket read/write. Kept modest rather than maximized: large enough
-# that a full-registry push (hundreds of chunks for the videos/
-# rejected_videos tables) finishes in a fraction of a sequential loop's
-# time, small enough not to look like abuse to Turso's own rate limiting.
-_PUSH_WORKERS = 8
+def _insert_line(table: str, columns: list[str], values: tuple) -> str:
+    cols = ", ".join(columns)
+    vals = ", ".join(_sql_literal(v) for v in values)
+    return f"INSERT INTO {table} ({cols}) VALUES ({vals});"
 
 
-def _run_chunked(jobs: list[tuple], worker) -> None:
+def _load_dump_file(conn: sqlite3.Connection, path: Path) -> None:
     """
-    Run `worker(remote_connection, *job)` for each job in `jobs` across
-    _PUSH_WORKERS threads. Each thread gets its own hosted-registry
-    connection, opened lazily on first use and reused for every later job
-    that lands on that same thread - turso_serverless.Connection tracks a
-    Hrana stream "baton" that must advance in request order, so two
-    threads sharing one Connection would race and corrupt that stream.
-    Capping at _PUSH_WORKERS connections (rather than one per job) also
-    matters because opening one costs its own round trip (see
-    get_remote_connection's _apply_schema call) - one per job would
-    multiply request count instead of cutting it.
-
-    Jobs are assumed independent of each other: nothing in this registry
-    enforces foreign keys (never `PRAGMA foreign_keys = ON` on either
-    connection type - see the module docstring), so neither which table a
-    job belongs to nor the order jobs complete in affects correctness.
-    The only ordering this codebase relies on is between *batches* of
-    jobs, which is the caller's job: push_from_local doesn't start
-    deleting orphaned rows until every upsert job across every table has
-    already returned from its own _run_chunked call.
+    Load one dump file's INSERT statements into `conn`, wrapped in a
+    single explicit transaction. Without this, executescript() commits
+    each statement individually (Python's sqlite3 module only commits a
+    *pending* transaction before running a script, it doesn't wrap the
+    script's own statements in one) - for a chunk file with hundreds of
+    thousands of rows, that's hundreds of thousands of individual fsyncs.
+    Measured directly: this is the same fix the old Turso-era code made
+    for its own per-chunk network pushes (see this module's history),
+    just missed here on the file-loading side - a few seconds instead of
+    several minutes for this registry's largest table.
     """
-    if not jobs:
+    if not path.exists():
         return
-    connections: list = []
-    lock = threading.Lock()
-    thread_state = threading.local()
-
-    def get_conn():
-        conn = getattr(thread_state, "remote", None)
-        if conn is None:
-            conn = get_remote_connection()
-            thread_state.remote = conn
-            with lock:
-                connections.append(conn)
-        return conn
-
-    def run(job):
-        worker(get_conn(), *job)
-
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=_PUSH_WORKERS) as pool:
-            # list(...) drains the iterator, which is what actually
-            # re-raises a worker's exception here on the calling thread -
-            # pool.map() alone would silently leave it unobserved.
-            list(pool.map(run, jobs))
-    finally:
-        for conn in connections:
-            conn.close()
+    text = path.read_text(encoding="utf-8").strip()
+    if text:
+        conn.executescript(f"BEGIN;\n{text}\nCOMMIT;")
 
 
-def _push_chunk(remote, table: str, columns: list[str], chunk: list[tuple]) -> None:
-    """Upsert one chunk of rows into `table` (see _conflict_clause) as a
-    single pipelined request - see _PUSH_CHUNK_SIZE's comment for why
-    this is batched and BEGIN/COMMIT-wrapped rather than one row or one
-    statement per request."""
-    conflict_clause = _conflict_clause(table, columns)
-    inserts = "\n".join(
-        f"INSERT INTO {table} ({', '.join(columns)}) VALUES "
-        f"({', '.join(_sql_literal(v) for v in row)}) {conflict_clause};"
-        for row in chunk
-    )
-    remote.executescript(f"BEGIN;\n{inserts}\nCOMMIT;")
-
-
-def _delete_chunk(remote, table: str, pk_cols: tuple[str, ...], chunk: list[tuple]) -> None:
-    """Delete one chunk of primary keys from `table` on the hosted
-    registry - the cleanup half of an override push, see _pk_set/
-    push_from_local. Chunked/threaded unlike the local-side equivalent
-    (_delete_local_rows): this is a network round trip, so it gets the
-    same batching treatment as _push_chunk."""
-    if len(pk_cols) == 1:
-        where = f"{pk_cols[0]} IN ({', '.join(_sql_literal(pk[0]) for pk in chunk)})"
-    else:
-        pk_list = ", ".join(pk_cols)
-        values = ", ".join("(" + ", ".join(_sql_literal(v) for v in pk) + ")" for pk in chunk)
-        where = f"({pk_list}) IN ({values})"
-    remote.executescript(f"BEGIN;\nDELETE FROM {table} WHERE {where};\nCOMMIT;")
-
-
-def push_from_local(override: bool = True) -> None:
+def pull_to_local() -> None:
     """
-    Send the local working copy's rows to the hosted registry: every
-    local row is upserted first (see _conflict_clause - a primary key the
-    hosted registry doesn't have yet is added, one it already has gets
-    its non-key columns overwritten with the local copy's current
-    values), then, only if override=True, whatever the hosted registry
-    still has that local doesn't (by primary key) is deleted - see
-    _pk_set. Both steps run their many independent chunk
-    requests across a small thread pool rather than one at a time - see
-    _run_chunked.
+    Rebuild the local working copy from scratch from the data repo's
+    current files: pull the data repo's checkout, back up whatever the
+    local working copy currently holds (see _backup_and_prune_local - a
+    pull discards not-yet-pushed local work, so this is what makes that
+    recoverable), then replay channels.sql/songs.sql/videos.sql followed
+    by every rejected_videos/*.sql and view_snapshots/*.sql chunk file (in
+    filename order, which is chronological - see _APPEND_DATE_COLUMN) into
+    a fresh schema.
 
-    That upsert-then-delete order is what makes this safe to interrupt at
-    any point (dropped connection, killed process, sleeping laptop, a
-    stray Ctrl+C outside the critical sections below): every
-    already-committed chunk is either a row that should exist with
-    correct values, or a stale row not yet cleaned up - never a row
-    that's missing. See the module docstring for why that matters.
-
-    override=True (default - every internal caller here uses this,
-    unchanged) is what makes this a full replace rather than a merge: the
-    delete-orphans step runs. Call once, after all of sync/decouple/
-    regroup's own work - including any grouping_audit pass - is done, so
-    the hosted registry only ever settles into a fully-finished,
-    already-audited state.
-
-    override=False stops after the upsert step - a row that only exists
-    on the hosted registry is left alone, merge never deletes. This is
-    what `python run.py push` uses by default (see run.py's --override
-    flag) - useful for reconciling two copies without either one wiping
-    out data the other already has.
+    Always a full rebuild - see module docstring for why the old
+    merge/override distinction no longer applies. Call once, before any
+    of sync/decouple/regroup's own work, so a fresh run sees whatever was
+    last pushed and skips re-spending YouTube/Gemini budget on channels
+    the data repo already has current data for.
     """
+    _sync_data_repo()
+    _backup_and_prune_local()
+    if LOCAL_WORKING_DB_PATH.exists():
+        LOCAL_WORKING_DB_PATH.unlink()
+
     local = get_connection()
     try:
-        jobs = []
-        for table in _TABLES:
-            cursor = local.execute(f"SELECT * FROM {table}")
-            columns = [d[0] for d in cursor.description]
-            rows = [tuple(row) for row in cursor.fetchall()]
-            for i in range(0, len(rows), _PUSH_CHUNK_SIZE):
-                jobs.append((table, columns, rows[i:i + _PUSH_CHUNK_SIZE]))
         with shutdown.critical_section():
-            _run_chunked(jobs, _push_chunk)
+            for table in _FULL_DUMP_TABLES:
+                _load_dump_file(local, DATA_REPO_PATH / f"{table}.sql")
+            for table in _APPEND_TABLES:
+                table_dir = DATA_REPO_PATH / table
+                if table_dir.is_dir():
+                    for chunk in sorted(table_dir.glob("*.sql")):
+                        _load_dump_file(local, chunk)
+            local.commit()
+    finally:
+        local.close()
 
-        if override:
-            remote = get_remote_connection()
-            try:
-                delete_jobs = []
-                for table in _TABLES:
-                    pk_cols = _PRIMARY_KEYS[table]
-                    orphans = list(_pk_set(remote, table) - _pk_set(local, table))
-                    for i in range(0, len(orphans), _PUSH_CHUNK_SIZE):
-                        delete_jobs.append((table, pk_cols, orphans[i:i + _PUSH_CHUNK_SIZE]))
-            finally:
-                remote.close()
-            with shutdown.critical_section():
-                _run_chunked(delete_jobs, _delete_chunk)
+
+def _dump_table_full(conn: sqlite3.Connection, table: str, path: Path) -> None:
+    pk_cols = _PRIMARY_KEYS[table]
+    cursor = conn.execute(f"SELECT * FROM {table} ORDER BY {', '.join(pk_cols)}")
+    columns = [d[0] for d in cursor.description]
+    lines = [_insert_line(table, columns, tuple(row)) for row in cursor.fetchall()]
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
+def _existing_append_pks(table: str, table_dir: Path) -> set[tuple]:
+    """
+    The set of primary keys already recorded in `table`'s chunk files, by
+    actually replaying those files (the same way pull_to_local() does)
+    into a scratch in-memory database rather than parsing the SQL text by
+    hand - correct by construction, since it's the exact same INSERT
+    statements SQLite itself will later execute for real.
+    """
+    if not table_dir.is_dir():
+        return set()
+    scratch = sqlite3.connect(":memory:")
+    scratch.row_factory = sqlite3.Row
+    try:
+        scratch.executescript(_SCHEMA)
+        for chunk in sorted(table_dir.glob("*.sql")):
+            _load_dump_file(scratch, chunk)
+        pk_cols = _PRIMARY_KEYS[table]
+        return {tuple(row) for row in scratch.execute(f"SELECT {', '.join(pk_cols)} FROM {table}")}
+    finally:
+        scratch.close()
+
+
+def _regenerate_append_table(conn: sqlite3.Connection, table: str, table_dir: Path) -> None:
+    """
+    Rebuild every chunk file for `table` from its current local state,
+    replacing whatever chunk files exist - the correctness-over-cleverness
+    fallback _sync_append_table takes when a previously-recorded row is no
+    longer present locally (only possible via discovery.py's
+    _purge_excluded, a rare, manual channel-exclusion cascade).
+    """
+    date_col = _APPEND_DATE_COLUMN[table]
+    pk_cols = _PRIMARY_KEYS[table]
+
+    if table_dir.is_dir():
+        for stale in table_dir.glob("*.sql"):
+            stale.unlink()
+
+    cursor = conn.execute(f"SELECT * FROM {table} ORDER BY {date_col}, {', '.join(pk_cols)}")
+    columns = [d[0] for d in cursor.description]
+    by_month: dict[str, list[tuple]] = defaultdict(list)
+    for row in cursor.fetchall():
+        by_month[row[date_col][:7]].append(tuple(row))
+
+    if by_month:
+        table_dir.mkdir(parents=True, exist_ok=True)
+    for month, rows in by_month.items():
+        lines = [_insert_line(table, columns, v) for v in rows]
+        (table_dir / f"{month}.sql").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _sync_append_table(conn: sqlite3.Connection, table: str, table_dir: Path) -> None:
+    """
+    Bring `table`'s chunk files up to date with the local working copy's
+    current state: append whatever primary keys exist locally but aren't
+    in the chunk files yet (see _existing_append_pks) to their date
+    column's chunk file, without touching existing content - unless a
+    primary key the chunk files already have is now missing locally, in
+    which case that's a deletion the append-only path can't represent
+    (see _regenerate_append_table's docstring), so every chunk file is
+    rebuilt from scratch instead.
+
+    Diffing full primary-key sets against each other, rather than
+    tracking a watermark, is deliberate: SQLite's implicit rowid is *not*
+    a safe append-order marker here - it's reassigned as "one more than
+    the current max in the table", so deleting the highest-rowid row and
+    inserting a new one can silently reuse that same rowid. A primary-key
+    set diff has no such failure mode, and at this registry's actual
+    scale (hundreds of thousands of rows, entirely local/in-memory, no
+    network) is fast enough to just do on every push.
+    """
+    pk_cols = _PRIMARY_KEYS[table]
+    date_col = _APPEND_DATE_COLUMN[table]
+    existing = _existing_append_pks(table, table_dir)
+
+    cursor = conn.execute(f"SELECT * FROM {table}")
+    columns = [d[0] for d in cursor.description]
+    pk_idx = [columns.index(c) for c in pk_cols]
+    date_idx = columns.index(date_col)
+
+    current_pks = set()
+    new_rows = []
+    for row in cursor.fetchall():
+        values = tuple(row)
+        pk = tuple(values[i] for i in pk_idx)
+        current_pks.add(pk)
+        if pk not in existing:
+            new_rows.append(values)
+
+    if existing - current_pks:
+        _regenerate_append_table(conn, table, table_dir)
+        return
+    if not new_rows:
+        return
+
+    by_month: dict[str, list[tuple]] = defaultdict(list)
+    for values in new_rows:
+        by_month[values[date_idx][:7]].append(values)
+
+    table_dir.mkdir(parents=True, exist_ok=True)
+    for month, month_rows in by_month.items():
+        lines = [_insert_line(table, columns, v) for v in month_rows]
+        with (table_dir / f"{month}.sql").open("a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+
+def push_from_local() -> None:
+    """
+    Publish the local working copy's complete current state to the data
+    repo: fully re-dump channels/songs/videos, append-or-regenerate
+    rejected_videos/view_snapshots (see _sync_append_table), then commit
+    and push - inside a single shutdown.critical_section() (a git commit
+    is itself transactional, so this only guards the narrower window
+    between commit and push: a Ctrl+C there leaves an already-valid local
+    commit simply not yet on the remote, which the next push carries
+    along harmlessly).
+
+    Always a full publish - see module docstring for why the old
+    merge/override distinction no longer applies. Call once, after all of
+    sync/decouple/regroup's own work - including any grouping_audit pass
+    - is done.
+    """
+    _sync_data_repo()
+    local = get_connection()
+    try:
+        for table in _FULL_DUMP_TABLES:
+            _dump_table_full(local, table, DATA_REPO_PATH / f"{table}.sql")
+        for table in _APPEND_TABLES:
+            _sync_append_table(local, table, DATA_REPO_PATH / table)
+
+        with shutdown.critical_section():
+            _run_git("add", "-A", cwd=DATA_REPO_PATH)
+            status = _run_git("status", "--porcelain", cwd=DATA_REPO_PATH)
+            if not status.stdout.strip():
+                return
+            timestamp = datetime.now().isoformat(timespec="seconds")
+            _run_git("commit", "-m", f"registry update {timestamp}", cwd=DATA_REPO_PATH)
+            # -u origin HEAD (rather than a bare `git push`) so the very
+            # first push from a freshly-cloned empty data repo doesn't fail
+            # with "no upstream branch" - harmless to repeat on every push
+            # after that, since it's already set from then on.
+            _run_git("push", "-u", "origin", "HEAD", cwd=DATA_REPO_PATH)
     finally:
         local.close()

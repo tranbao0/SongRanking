@@ -29,15 +29,45 @@ Shard sizes are uneven (a distributor's catalogue dwarfs a single artist's), whi
 
 ## Before starting any instance
 
-The registry is a hosted Turso database, not a local file (see README's "Hosted registry database (Turso)" section) - back it up with a real dump rather than copying a file:
+The registry is a git-synced data repo, not a hosted database (see README's "Git-synced registry database" section) - its own git history already keeps a full, real backup of every previously-pushed state, so there is no separate manual dump step. If you want an extra local safety net before a big multi-session pass, just copy the local working copy aside:
 
 ```bash
-echo ".dump" | bash scripts/turso_shell.sh > "data/registry-backup-$(date +%Y%m%d-%H%M%S).sql"
+cp data/.registry_working.db "data/registry-backup-$(date +%Y%m%d-%H%M%S).db"
 ```
 
 Run instances **one at a time** unless you've confirmed applying concurrently is safe.
-Turso handles concurrent connections properly (no single-writer file lock the way a local SQLite file has), but a failed apply mid-shard is still annoying to unpick if two instances' edits interleave unexpectedly.
+Concurrent writers to the same local SQLite file can corrupt it (no server-side connection arbitration the way a hosted database has), and a failed apply mid-shard is still annoying to unpick if two instances' edits interleave unexpectedly.
 Safest pattern: let every instance produce its plan, then apply them in sequence.
+
+### Session file layout
+
+All grouping-audit sidecars live under `data/.grouping-audit/` (gitignored as a
+unit - never commit this directory). Do not write audit scratch next to
+`data/.registry_working.db` or as loose `data/.audit_*` files.
+
+```
+data/.grouping-audit/
+  progress.json              # durable "channels already reviewed" log
+  state.json                 # headless grouping_audit trigger state
+  log.jsonl                  # headless agent transcript (when audit runs)
+  shards/
+    progress-{N}.json        # per-shard progress while parallel agents run
+    scratch-{N}.txt          # per-shard working notes
+  candidates/                # candidate-list dumps for a session
+  scripts/                   # one-off apply/precheck scripts for a session
+  reports/                   # session summaries / reports
+```
+
+Rules for agents writing files here:
+- Progress that should survive the session → `progress.json` (or
+  `shards/progress-{N}.json` while a parallel shard is in flight; merge
+  into `progress.json` and delete the shard file when that shard finishes).
+- Freeform notes / title dumps while reading → `shards/scratch-{N}.txt`
+  (or a dated file under `reports/` for a whole-registry sweep).
+- Generated candidate lists → `candidates/`.
+- One-off Python you write to apply a batch → `scripts/` (delete after
+  the session's merges are verified - see Procedure step 7).
+- Lasting rules and precedents → this doc, not a scratch file.
 
 ---
 
@@ -48,18 +78,18 @@ Paste this into each instance, replacing `SHARD` and `SHARD_COUNT`.
 ````
 You are grouping songs in the local working-copy SQLite file at
 data/.registry_working.db (see src/registry/db.py's module docstring).
-This is NOT data/registry.db - that path is a pre-Turso-migration
-artifact and is stale; writing to it silently loses your work, since
-nothing reads it back into the hosted registry. Before you start,
-confirm the working copy is current - either it was populated very
-recently by a command that calls db.pull_to_local() (sync/decouple/
-regroup all do), or pull it yourself:
+This is NOT data/registry.db - that path is a pre-migration artifact
+and is stale; writing to it silently loses your work, since nothing
+reads it back into the data repo. Before you start, confirm the
+working copy is current - either it was populated very recently by a
+command that calls db.pull_to_local() (sync/decouple/regroup all do),
+or pull it yourself:
 
     python -c "from registry import db; db.pull_to_local()"
 
 When your session's approved batches are applied, push them back so
-the hosted registry (the actual source of truth every machine reads)
-sees them:
+the data repo (the actual source of truth every machine reads) sees
+them:
 
     python -c "from registry import db; db.push_from_local()"
 
@@ -69,6 +99,21 @@ terminal) between pull and push leaves real merge work sitting only in
 the local file, invisible to any other instance or machine.
 
 You are instance SHARD of SHARD_COUNT. Work ONLY on your shard.
+
+## Session files
+
+All audit sidecars go under `data/.grouping-audit/` (gitignored). Do not
+write loose `data/.audit_*` / `data/.apply_*` files. Layout:
+
+- `progress.json` - durable reviewed-channel log (this instance: also
+  `shards/progress-SHARD.json` while in flight, merge into progress.json
+  when done and delete the shard file)
+- `shards/scratch-SHARD.txt` - working notes
+- `candidates/` - candidate-list dumps
+- `scripts/` - one-off apply/precheck scripts (delete after verified)
+- `reports/` - session summaries
+
+See the doc's "Session file layout" section for the full convention.
 
 ## Your shard
 
@@ -136,7 +181,9 @@ right tool for it. Two examples that turned up real misses this way:
    Clip or Stage Clip sitting unmerged from its MV for exactly this
    reason), plus one more deterministic-tier over-merge (a `Vocal Ver.`
    wrongly fused with `Band Ver.`, caught while reading one of the
-   clusters).
+   clusters - superseded 2026-08-10: a `Vocal Ver.` now merges with
+   everything else per the Rules section's reversal, so this was not
+   actually a bug under the current rule).
 2. **Making/Behind excision** (see the DO-NOT-merge entry above) - a
    decided, binary classification with no judgment involved once a
    candidate is surfaced, so generating the candidate list by regex and
@@ -151,24 +198,35 @@ cannot reach.
 
 ## Rules - these are decided, do not re-litigate them
 
-MERGE two song rows only when they are the same recording of the same
-song, presented differently. Those are: official MV, lyric video, dance
-practice, choreography video, performance/encore/live-clip video, plain
-audio upload, visualizer.
+**2026-08-10 operator-directed reversal - read this before anything below.** Two categories
+that used to be DO-NOT-merge are now MERGE, project-wide and retroactively: arrangement variants
+(remix - including a named producer/DJ remix - acoustic, instrumental, vocal, karaoke, a
+cappella, sped-up/slowed) and language versions (Japanese Ver., English Ver., etc.). Every
+section below this point - the DO-NOT-merge precedent list, the "sharper read on Ver tags"
+section, the SEVENTEEN/KBS exclusion list, the "LEMONADE" / "LEMONADE (2Spade Remix)" example -
+predates this reversal and says the opposite for these two categories specifically. Where an
+older entry conflicts with this note on those two categories, this note wins; everything else in
+those entries (Making/Behind excision, different-artist, numbered-sequel, feat.-credit,
+cross-channel-duplicate guidance) is unaffected and still applies exactly as written. See
+`src/registry/song_grouping.py`'s module docstring for the code side of this change, and
+`src/registry/merge_versions.py` for the one-off migration that applied it to the
+already-grouped registry.
+
+MERGE two song rows when they are the same underlying song, whether presented as the same
+recording in a different format (official MV, lyric video, dance practice, choreography video,
+performance/encore/live-clip video, plain audio upload, visualizer) or as a different
+arrangement/mix of the same song (remix, acoustic, instrumental, vocal, karaoke, a cappella,
+sped-up/slowed) or a different-language recording of the same song (Japanese Ver., English Ver.,
+etc., recognized by the explicit tag/translation, not by comparing native-script text).
 
 DO NOT merge, in any of these cases:
 
-- Different arrangements. A remix, acoustic, instrumental, sped-up or
-  slowed version is a DIFFERENT song and charts separately. This is the
-  single most common trap in this data - "LEMONADE" and "LEMONADE (2Spade
-  Remix)" are two songs.
 - Different artists, even with identical titles.
 - Numbered or qualified variants: "Supernova" and "Supernova 2" differ.
-- Any difference at all in native-script (Hangul/Japanese/Chinese) text.
-  Treat native script as the most reliable identity signal and compare it
-  character by character. If it differs even by one character, they are
-  different songs.
-- Language versions ("Japanese Ver.", "English Ver.") - different songs.
+- Any difference at all in native-script (Hangul/Japanese/Chinese) text, UNLESS the two titles
+  are a language-version pair per the MERGE rule above. For any other pair, treat native script
+  as the most reliable identity signal and compare it character by character - if it differs
+  even by one character, they are different songs.
 
 The genuine merges you ARE looking for are mostly:
 - the same song romanised differently, or native script vs romanisation
@@ -278,24 +336,16 @@ patterns dozens of times.
   MV`, `놀라운 토요일(Amazing Saturday) Reaction | ...`) - cast members
   watching and reacting to the MV, not the MV itself; same bucket as
   Commentary.
-- `(Acoustic Ver.)` / `(Instrumental)` / `(Inst.)` / `(Vocal Ver.)` /
-  `(Karaoke Ver.)` / `(Remix)` / named remixes (`(Sara Landry Remix)`,
-  `(Champions Remix)`) / `(Sped Up Ver.)` / a cappella - a distinct mix
-  or arrangement, even when everything else about the surrounding
-  context (same OST, same feat. credit) otherwise matches. NOTE:
-  `(Piano Ver.)` was moved OFF this list - see "Decided: merge bare
-  (Ver.) tags too" below, which supersedes this for that specific tag.
-  This bullet used to list it; if you're skimming and stop here, you'll
-  get it backwards.
-- A producer/DJ name used as a bare `"(Ver.)"` tag with no "Remix" word
-  present (ATEEZ's `BAD (Steve Aoki Ver.)` / `(Ofenbach Ver.)` /
-  `(James Carter Ver.)` / `(LEEZ Ver.)` / `(Ollounder Ver.)`, or a
-  numbered official remix-EP rollout like `WORK Pt.2 - ATEEZ X Don
-  Diablo` / `Pt.3 - ... X Eden-ary` / `Pt.4 - ... X G-Eazy`) - functions
-  as a remix credit even without the word "Remix" in the title; keep
-  each one split from the plain version and from each other. Contrast
-  with a *member's* name in a Ver. tag (`Adrenaline Choreography Demo
-  (SAN Ver.)`), which is a per-member cam and merges normally.
+- **Superseded 2026-08-10 - now MERGE, see the Rules section above.** `(Acoustic Ver.)` /
+  `(Instrumental)` / `(Inst.)` / `(Vocal Ver.)` / `(Karaoke Ver.)` / `(Remix)` / named remixes
+  (`(Sara Landry Remix)`, `(Champions Remix)`) / `(Sped Up Ver.)` / a cappella, and a
+  producer/DJ name used as a bare `"(Ver.)"` tag with no "Remix" word present (ATEEZ's `BAD
+  (Steve Aoki Ver.)` / `(Ofenbach Ver.)` / `(James Carter Ver.)` / `(LEEZ Ver.)` / `(Ollounder
+  Ver.)`, or a numbered official remix-EP rollout like `WORK Pt.2 - ATEEZ X Don Diablo` / `Pt.3 -
+  ... X Eden-ary` / `Pt.4 - ... X G-Eazy`) - all of these now merge into the plain version and
+  into each other, same as any other presentation variant. (A *member's* name in a Ver. tag,
+  e.g. `Adrenaline Choreography Demo (SAN Ver.)`, was never in this bucket - that's a
+  per-member cam and has always merged normally.)
 - A different feat./collab credit on an otherwise identical title
   (`(feat. GURU RANDHAWA)` vs `(feat. SANTOS BRAVOS)` vs no feat. at
   all) - each regional/collab edit is its own recording unless the only
@@ -312,13 +362,12 @@ patterns dozens of times.
 - Two different named artists crediting the identical OST title (common
   when a drama OST has several artists each release their own take on
   one title) - stays split even though the title text is identical.
-- Any language-version tag (`(Korean Ver.)`, `(Chinese Ver.)`, `(Japanese
-  Ver.)`, `(English Ver.)` as a *sung* MV/Visualizer, or two titles that
-  differ only by one carrying native-script text the other lacks, e.g.
-  `Love Shot` vs `宣告 (Love Shot)`) - a different recording even without
-  an explicit "(Ver.)" tag, and even when the surrounding video format
-  (Performance Video, Dance Practice) otherwise matches within that one
-  language.
+- **Superseded 2026-08-10 - now MERGE, see the Rules section above.** Any language-version tag
+  (`(Korean Ver.)`, `(Chinese Ver.)`, `(Japanese Ver.)`, `(English Ver.)` as a *sung* MV/
+  Visualizer, or two titles that differ only by one carrying native-script text the other
+  lacks, e.g. `Love Shot` vs `宣告 (Love Shot)`) now merges with the original-language version,
+  even without an explicit "(Ver.)" tag and regardless of whether the surrounding video format
+  matches.
 - Combined/medley videos whose title names two or more different songs
   at once (`"Candle" & "I Feel You" Comeback Stage`, `Intro & 딱 좋아`
   when Intro genuinely is a separate pre-existing track) - ambiguous
@@ -341,9 +390,11 @@ and merged once this call was made.
 Extending the same logic, `(Live Ver.)` / `(Band Ver.)` / `(Drama
 Ver.)` / `(Busking Ver.)` / `(Onetake Ver.)` / `(Piano Ver.)` should
 also just be merged rather than flagged - treat any `(...Ver.)` tag as
-presentation unless it names an unambiguous arrangement change
-(Remix, Acoustic, Instrumental, Sped Up, Karaoke, Vocal, a cappella -
-see the DO-NOT-merge list above, which is the real dividing line).
+presentation. **Superseded 2026-08-10:** the "unless it names an
+unambiguous arrangement change" carve-out no longer applies - a Remix,
+Acoustic, Instrumental, Sped Up, Karaoke, Vocal, or a cappella tag now
+merges too, same as everything else in this paragraph, per the Rules
+section above.
 
 **Ambiguous, defaulted to NOT merging - flag rather than guess:**
 - A real artist name paired with an identical title credited to "Various
@@ -356,20 +407,45 @@ see the DO-NOT-merge list above, which is the real dividing line).
 - `[LYRIC ASMR] "Song" (Member Ver.)` x N, one per member, each reading/
   whispering the lyrics solo (GOT7's "Miracle") - unlike per-member dance
   fancams, these are not different camera angles on one shared performance
-  instance; each is its own individually-recorded take. Left split.
+  instance; each is its own individually-recorded take. **Superseded
+  2026-08-11:** the deterministic tier now merges these too, as a
+  side effect of the 2026-08-10 reversal making any `(...Ver.)` tag merge
+  unconditionally - confirmed by the operator as an acceptable
+  simplification rather than worth a special-case carve-out. No longer
+  left split.
 
 **If you find the deterministic tier over-merged (opposite problem):**
-Rare, but happened once (Monsta X's `WHO DO U LOVE? (will.i.am REMIX -
-Audio) ft. French Montana` had been auto-merged into the plain `WHO DO U
-LOVE?` song, purely because title-normalization strips parentheticals).
-This violates the same remix rule as above, just in the other direction.
-Fix it: `INSERT INTO songs (channel_id, canonical_title, grouped_at)
+Originally noted as rare (one instance: Monsta X's `WHO DO U LOVE?
+(will.i.am REMIX - Audio) ft. French Montana` had been auto-merged into
+the plain `WHO DO U LOVE?` song, purely because title-normalization
+strips parentheticals). **Revise that framing** - a full-registry manual
+pass (2026-08-06 through 2026-08-10, ~500 channels) turned up at least
+six more: KNK (a SUNSET Performance video wrongly fused into RIDE's
+song row), N.O.M ("I'm so sexy" M/V had a `[BEHIND]` video fused in),
+Minseo (two different songs both titled "Growing Up" in English but
+different Korean parentheticals, fused on the English title alone),
+AleXa (an English-Ver. vocal take fused into the plain version), Maywish
+(an instrumental Audio upload fused into the vocal version), and Lee
+Ju-eun (a Sped Up Ver. fused into the plain version). This is not a
+one-off anymore - expect to find a small number of these in any
+large-enough batch, still worth fixing opportunistically rather than
+proactively hunting for across the whole registry (still out of scope
+as its own sweep), but don't dismiss it as unlikely when you do spot
+one. Fix it: `INSERT INTO songs (channel_id, canonical_title, grouped_at)
 VALUES (<same anchor channel_id as the wrongly-merged song>, <the
 remix's own title>, strftime('%Y-%m-%dT%H:%M:%f','now'))`, then `UPDATE
 videos SET song_id = last_insert_rowid() WHERE video_id = '<that
-video>'`. Don't go looking for these proactively across the whole
-registry (out of scope for this pass) but fix one if you notice it
-while reading a channel.
+video>'`.
+
+**Superseded 2026-08-10, for four of these six:** the Monsta X will.i.am
+REMIX case, the AleXa English-Ver. case, the Maywish instrumental case,
+and the Lee Ju-eun Sped Up Ver. case were "fixes" that split a remix/
+language-version/arrangement-version pair back apart. Per the Rules
+section's reversal, those pairs are now correctly merged, not a bug -
+do not apply this fix to that shape of case going forward. The KNK
+(wrong-song fusion) and N.O.M (Behind-video fusion) cases are unrelated
+bugs (a genuinely different song, and non-song content, respectively
+fused in by mistake) and this fix procedure still applies to those.
 
 ### Precedents from the 2026-08-02 new-batch review
 
@@ -413,14 +489,11 @@ that pass - apply them going forward rather than re-deriving them.
   not Making/Behind.
 
 **A sharper read on Ver. tags:**
-- The same style of named `(Ver.)` tag can mean different things
-  depending on *what kind of video* it's attached to. On a Lyric Video or
-  Visualizer, a named tag (often a producer's alias) usually functions as
-  a remix/producer credit - don't merge, same logic as the existing ATEEZ
-  bare-producer-name rule below. The identical-looking tag on a Dance
-  Practice or Performance Video usually just names the cut - merge. When
-  one channel uses the same tag text both ways, let the video type
-  decide, not the tag text.
+- **Superseded 2026-08-10:** this bullet used to say a named `(Ver.)` tag on a Lyric Video or
+  Visualizer (usually a producer's alias) is a remix credit and shouldn't merge, unlike the same
+  tag on a Dance Practice/Performance Video. Per the Rules section's reversal, a remix/producer
+  credit now merges too, regardless of video type - so this distinction no longer matters; every
+  named `(Ver.)` tag merges the same way now.
 - A Ver. tag that names a specific broadcast/award-show occasion (e.g.
   "(Rock Ver.)" performed at a named festival, "(Christmas Ver.)" at a
   year-end awards show) is more likely a genuinely rearranged special
@@ -511,6 +584,290 @@ unmatchable without checking for one.
   which keys on `channel_id` and video titles, not `display_name`, but
   worth flagging separately as a channel-metadata issue if you notice it.
 
+### Precedents from the 2026-08-04 automated backstop audit
+
+A whole-registry normalize-and-cluster cross-channel scan of 10,818 songs
+surfaced 368 candidate clusters; 208 were genuine merges, reducing the song count to 10,594.
+The vast majority applied rules already documented above.
+One new judgment call:
+
+**A headline feat. credit present in only one of two same-language-version uploads.**
+LE SSERAFIM "HOT (English Ver.) feat. JADE" (MV) and "HOT (English Ver.) Performance Film"
+(no feat. credit in title) were merged as the same English recording in different video formats.
+The feat. credit's absence from the Performance Film's title is a title-formatting decision,
+not evidence of a separate vocal cut without JADE.
+This extends the existing "same feat. credit, different camera cut" rule to language-version pairs:
+when two uploads share the same language-ver. tag and differ only in video format and whether
+the feat. credit appears in the title, merge normally.
+Contrast with the DO-NOT-merge "different feat. credit" rule (`feat. GURU RANDHAWA` vs.
+`feat. SANTOS BRAVOS`), which applies when the collab itself differs - not when one title simply
+omits a credit integral to the shared language version's release identity.
+
+### Precedents and process notes from the 2026-08-05 session
+
+**Bug, not a judgment call: some titles are stored as NFD (decomposed) Unicode, not NFC.**
+A whole-registry normalize-and-cluster script written this session used a character-class regex
+(`가-힣`, the precomposed Hangul Syllables block) to decide which characters survive
+normalization. That block does not cover decomposed Hangul (individual Jamo, `ᄀ-ᇿ`),
+so a title stored in NFD had its entire Korean portion silently stripped to nothing - collapsing
+several unrelated songs on the same channel (Jang Na-ra's discography, worst case) into one false
+cluster, since they all normalized to just the artist's romanised name. 132 `songs.canonical_title`
+rows and 138 `videos.title` rows registry-wide are affected (spread across ~50 channels - Maywish,
+NCT, Highlight, Onewe, Weeekly, ToHeart, and others each had at least one). Any future
+normalize-and-cluster candidate script must call `unicodedata.normalize('NFC', title)` before
+anything else, not just widen the character class - the fix is normalizing the input, not
+special-casing the regex. This is a real data-quality issue independent of grouping: two uploads
+of the same song could fail to match anywhere they're compared by string equality (search,
+dedup, the free tiers' own exact-match tier) purely because one is NFC and the other NFD, with no
+title-level clue anything is wrong. Worth a source-level fix (normalize at catalog time) and a
+one-time backfill on existing rows; out of scope for a grouping pass to fix itself.
+
+**Open question from this session, moot as of 2026-08-10:** is ATEEZ's "TOPPINGS" tag a
+named-concept presentation variant or a remix/producer series? Both readings now merge per the
+Rules section's reversal, so "Lemon Drop (TOPPINGS Drift Ver.)" should simply be merged with the
+plain version - no need to resolve which category it was. The original open question is kept
+below for context. The 2026-08-04 audit's precedent (see above)
+treats a themed/branded alternate video as a presentation variant to merge, by analogy with
+aespa's `(æ-aespa Ver.)` and SKZOO/GROUND SOCCER-style tags. Under that reading, ATEEZ's "Ice On
+My Teeth" `(Double Pepperoni Ver.)` / `(OIive Alive Ver.)` / `(TELL ME BYE Ver.)` lyric videos were
+merged into the main song this session, at the operator's explicit direction. But "Lemon Drop
+(TOPPINGS Drift Ver.)" surfaced in the same session's whole-registry sweep uses the literal word
+"TOPPINGS" in its tag - suggesting these are all installments of one named alternate-version
+*series* tied to a release (closer to the producer/DJ-name-Ver.-tag non-merge precedent than to a
+one-off themed concept video). This session left "Lemon Drop (TOPPINGS Drift Ver.)" split from
+the plain version pending a clearer read, and did not revisit the already-applied Ice On My Teeth
+merge. A future session with more context on whether "TOPPINGS" is an official named rollout
+(check the release's own promotional material, not just the titles) should resolve both
+consistently rather than treating them case by case.
+
+**Process: check whether the local working copy is ahead of the data repo before any command that
+pulls.** `python run.py regroup` and `decouple` used to wrap themselves in an automatic
+`pull_to_local()` / `push_from_local()`, matching `sync`. That pull discards whatever local-only,
+not-yet-pushed work exists (by design - `pull_to_local()` is always a full rebuild from the data
+repo's current state, see `db.py`'s module docstring), which is exactly what happened this
+session: a local working copy held a prior audit's 208 merges plus this session's own manual work,
+none of it ever pushed to the hosted registry this project used at the time, and running `regroup`
+silently reverted all of it before applying its own (otherwise correct) grouping of 188
+newly-added, never-grouped channels. Recovered only because `pull_to_local()` also takes a
+`registry.<ts>.pre-pull.db` backup before overwriting (see `_backup_and_prune_local()`) - that
+backup is what made reconstructing the merged state possible. `regroup` and `decouple` no longer
+auto pull/push (see `run.py` - they now behave like `audit`, local-working-copy-only); this doesn't
+remove the underlying risk, since a plain `python run.py pull` can still discard un-pushed local
+work the same way. Before pulling, check whether the local working copy is meaningfully ahead of
+the data repo (e.g. lower `songs` count than expected, or a recent audit's progress-file entry with
+no matching push) rather than assuming pull is always safe to run first.
+
+**The cross-channel duplicate pattern (1theK, KBS WORLD TV, and same-song reposts across an
+artist's own channel and a broadcaster/label channel) is not a rare miss - it was the large
+majority of a fresh whole-registry sweep.** Of 245 genuine merge clusters found in one pass over
+16,770 songs, the large majority were exactly this shape: a fully-grouped song on the artist's own
+channel, with a duplicate (often multi-video itself) sitting unmerged on 1theK
+(`UCweOkPb1wVVH0Q0Tlj4a5Pw`) or a broadcaster channel. This confirms the 2026-08-04 audit's note
+that 1theK/HYBE LABELS are the source of nearly every cross-channel miss - it is worth treating
+this specific shape (same artist name + same song title + one side anchored to a known aggregator
+channel) as close to a decided-rule fast path during future reads, same spirit as the Making/
+Behind excision sweep, rather than re-deriving the judgment call fresh on every one.
+
+**Bug fixed at the source, not just noted: `normalize_title` (tier 1/2's own matching key,
+`src/registry/song_grouping.py`) missed nearly every "Dance Practice/Performance Video (X Ver.)"
+pairing with its own plain MV.** Found via VIXX's "향 (Scentist)" Dance Practice Video (Moving Cam
+ver.) never matching its Official M/V - the bracket-stripper only fired when the bracket contained
+a recognizable video-type word (mv/lyric/performance/video/etc.); a pure camera/motion qualifier
+like "Moving Cam ver." or "Fix ver." contains none of those and survived untouched, silently
+blocking the free tiers from ever linking the two. A follow-up whole-registry sweep using the
+fixed function found 282 more genuine merge clusters of exactly this shape across channels that
+had each already been through a per-channel manual pass - meaning this was not a rare miss, it was
+systematically hiding almost every dance-practice-ver-tag pairing tier 1/2 should have caught for
+free. Three fixes landed together in `normalize_title`:
+1. A `_CAMERA_ANGLE_RE` (`moving`, `fix(ed)`, `cam`, `close-up`, `onetake`, `front-cam`, `vertical`,
+   `horizontal`) strips a bracket containing only these words, regardless of video type - none of
+   them double as a producer name or language name anywhere in this project's data.
+2. Broader than that: **any** Ver. tag on a Dance Practice / Performance Video / Choreography Video
+   now merges regardless of what the tag says - a costume theme, an occasion, a camera setup - per
+   the operator's call that these video types have no separate audio mix to credit, so a Ver. tag
+   there is never a producer alias the way it can be on a Lyric Video or Visualizer. This is the
+   doc's existing "sharper read on Ver tags" section made literal in code rather than left to a
+   human/AI reader to apply consistently. **Except** a tag naming a language (`(Japanese Ver.)`,
+   `(Chinese Ver.)`, ...) - that always stays a different vocal recording regardless of video type,
+   and this exception had to be added after RIIZE's "Love 119 (Japanese Ver.)" Dance Practice and
+   ZHOUMI's Chinese-Ver/Korean-Ver "Uncontact LIVE Performance Video" pair both wrongly matched
+   their other-language counterpart on the first pass.
+3. A bare numbered/lettered Ver. tag (`(Ver.1)`, `(Ver. A)`) now merges unconditionally - the
+   doc's "Decided: merge bare (Ver.) tags too" call was never actually implemented in the
+   deterministic tier before this, only ever caught by a human/AI pass.
+
+Also NFC-normalizes the title first (see the NFD bug above) - same function, same fix, applied at
+the source instead of only in an ad-hoc audit script. See `tests/test_song_grouping.py`'s
+`NormalizeTitleTest` for the regression tests locking all of this in (camera-angle match, any-Ver-
+tag-on-dance/performance match, language-Ver-tag non-match, bare-numbered-Ver match, NFD match).
+
+**Excised the same session, same categories as always, just new title shapes: numbered vlog/EP
+series and "Talk" segments.** A whole-registry sweep for `\bep\.?\s*\d+` / `\btalk\b` / `\bvlog\b`
+found the same Making/Behind/Reaction pattern wearing different words - `EP.14 M/V BEHIND`,
+`Ep.31 ... 코멘터리` (commentary), `Ep.11 ... 촬영기` (filming diary), `Talk Marathon.mp4 ⏵ 'X' MV
+Filming`, `JINHO-LOG EP.06/07 ... 촬영 Behind`, a dorm-log "뒤풀이 TALK" (afterparty talk) clip, a
+fan-lyric-rewrite bit, a performance-tips discussion episode, and tripleS's own `MV ep.01`-`ep.11`
+documentary series and two `MV 리액션` (reaction) uploads - all excised. Two long-running general
+vlog shows (MONSTA X's "몬채널", ITZY's "ITZY? ITZY!") got the same call even where one episode's
+title named a real content type ("Dance Practice") embedded in it: the whole video is a variety-
+show episode, not a dedicated upload of that content, so it's excised entirely rather than kept
+for the fragment. Contrast with KBS WORLD TV's "TALK & STAGE" broadcasts (2AM, SOLAR, KISS OF
+LIFE, HYOLYN & RALRAL) - left alone, same call as the NCT "Behind Story & Live Stage" precedent
+above: a combined interview+performance broadcast keeps its genuine performance half. And one
+merge, not an excision: `평민에서 왕까지 EP.01/02/03` (commoner/noble/king costume theme) turned out
+to be a themed 3-part Dance Practice rollout of one song, not a making-of series - merged, per the
+"Day 1/2/3 progress" precedent above, once actually read rather than pattern-matched on "EP."
+alone. The "false positive" side of this sweep was large too: "Talk" is the literal song title in
+GOTTA TALK TO YOU/U, BODY TALK, Small Talk, Talk that Talk, Talk Saxy, Love Talk, Can We Talk
+Again, We don't talk together, and Cherry Talk, and "EP" numbering on a genuine competition-show
+cover performance (THE ORIGIN, KandiSilkWayStar) or the explicitly doc-protected 하와유.MOV MV-
+parody series isn't Making/Behind at all - read the content the numbering wraps, not just the
+numbering.
+
+**AI-tier context, added this session: video tags.** `song_grouping.group_channel_videos` now
+passes each new video's YouTube tags (persisted in `videos.tags`, fetched at zero extra quota cost
+alongside the metadata catalog.py already pulls) into the Tier 3 prompt as a `[tags: ...]` hint -
+see `_video_tags_label` and the prompt's own instruction that tags are supporting evidence only,
+never grounds to override what the title (especially native-script text) says. Deliberately not
+wired into Tier 1/2's deterministic matching: tags are uploader-supplied and inconsistent enough
+that blind string comparison deciding a merge from them would be a real regression risk, whereas
+the AI tier can weigh them with judgment the same way it already weighs everything else in this
+doc. A video catalogued before this column existed simply has no tags - `_video_tags_label`
+returns "" and the label falls back to plain title, no special-casing needed elsewhere.
+
+### Precedents from a 2026-08-05 full-channel deep-read pass (BTS, BLACKPINK)
+
+Prompted by the operator spotting "many Dynamite stage cam duplicates" and DDU-DU DDU-DU
+split across song rows. Read both artists' entire anchor-channel song list by hand (324 songs
+for BTS, 58 for BLACKPINK) rather than generating candidates with a script, per the operator's
+explicit request this round. Found the "different live occasions merge" rule (decided
+2026-08-02, see above) had never been retroactively swept - BTS's own channel alone had ~30
+songs that should have been one ("Dynamite" was split across 13 song rows, one per award-show
+Stage CAM; similar splits existed for Black Swan, FAKE LOVE, Boy With Luv, Dionysus, IDOL,
+Life Goes On, DNA, ON, MIC Drop, and about a dozen smaller ones). BLACKPINK's channel had the
+same shape at smaller scale (DDU-DU DDU-DU, Kill This Love, BOOMBAYAH, Pink Venom, Shut Down,
+Typa Girl, JUMP, Ready For Love, plus JENNIE/LISA/ROSE solo-stage splits). 49 merge groups and
+19 excisions applied across the two channels.
+
+**New excision pattern: "MV Shooting" without the word "Behind" is still Behind footage.**
+BTS's channel had 8 songs titled `'FIRE' MV Shooting - <thing>` / `'FIRE' MV Shooting-
+'<Member>' Follow ver.` - shooting-day footage of the FIRE MV, same bucket as `MV Behind`, just
+missing that literal word. Confirms the existing guidance to match on content, not vocabulary,
+covers phrasings without "behind"/"making" anywhere in them at all, not just unfamiliar
+synonyms for those words.
+
+**New excision categories, same "not a performance of the song" judgment, no keyword overlap
+with any prior list:** backstage "standby time" between/before stage performances; "monitoring
+time" (members watching a stage-performance's own playback afterward); a member's on-camera
+opinions about other members' solo stages (commentary); a "[Member] is directing a new music
+video?!" clickbait-style vlog clip; a literal movie-trailer "Sneak Peek"; a between-song New
+Year's stage greeting (announcement, not a performance); a "Choreographers BTS" feature about
+the choreography staff themselves.
+
+**Cross-script identity confirmed on two more real pairs, same underlying rule as the
+Supernova/슈퍼노바 precedent:** BTS's `Stage SELF CAM '앙팡맨 by BTS'` and its own `'Anpanman'
+Stage CAM` entries are the same song (앙팡맨 is a Korean phonetic rendering of "Anpanman," not
+a different title) - merged despite sharing zero Latin-script characters. Separately, Agust D's
+`'대취타' Live Clip` and BTS's own `SUGA's Daechwita Sword Dance Practice` are the same song
+credited under the artist's group-member name instead of the solo persona used elsewhere on the
+same channel - romanization (Daechwita) vs native script (대취타) plus a different-but-known
+same-person artist credit, still one song.
+
+**New presentation-format call: a game/avatar-rendered dance video is a presentation variant,
+not a different recording.** `BLACKPINK X Selena Gomez - 'Ice Cream' DANCE PERFORMANCE VIDEO
+(in ZEPETO)` - the same choreography and audio rendered through a virtual-avatar game
+(ZEPETO) instead of filmed normally - judged the same way as a lyric video or visualizer
+(same recording, different visual presentation), not a different recording. Merged with the
+plain M/V.
+
+**Scope note - not a whole-registry sweep.** This pass covered only these two artists' own
+anchor channels in full. The underlying gap (the 2026-08-02 "different live occasions" rule
+never being retroactively swept) almost certainly also affects other artists with a heavy
+per-occasion live-stage upload habit (own-channel BANGTAN BOMB-style sub-brands, or any group
+whose channel reposts award-show stages under distinctly-named titles rather than repeat
+date-stamped reruns) - flagged for a future whole-registry pass, not resolved here.
+
+**Note added 2026-08-06, mid whole-registry pass:** re-confirmed this section's two rules
+(lowest song_id survives; canonical_title gets reset to the shortest title in the group) after
+noticing the apply scripts used earlier in this session's channel sweep picked survivors somewhat
+inconsistently and never touched canonical_title. Not worth re-deriving every prior channel's
+merges to fix retroactively - the dedupe itself (one song_id, one video set) is correct either
+way, canonical_title is a display nicety - but every merge from this point in the pass forward
+follows both rules exactly as written below.
+
+**Extended scope for "different live occasions merge" (2026-08-06):** the rule isn't limited to
+Stage CAM videos. Any video representation of the same underlying song - Official MV, Official
+Audio, Dance Practice, Performance Video, ENG/native Lyric Video, a broadcaster's re-aired
+lyrics-overlay clip (e.g. "KBS WORLD TV"), a Director's Note re-upload of the same MV - collapses
+into one song_id, regardless of content type or which occasion/broadcast it came from. Confirmed
+against SEVENTEEN's channel, which mixes PLEDIS's own MV catalog with KBS WORLD TV re-broadcasts:
+MAESTRO, LOVE MONEY FAME, 손오공, HOME;RUN, Rock with you, HOT, and THUNDER each had their KBS
+lyrics-clip or ENG Lyric Video split into a separate song row from the Official MV of the exact
+same song. **Superseded 2026-08-10:** this used to list named remixes/DJ Ver., a genuine
+different-language re-recording ("(English Ver.)" with re-sung vocals), and Sped Up Ver. as
+still excluded from this merge. Per the Rules section's reversal, all three now merge too -
+only a feat.-credit version with an added guest vocalist stays excluded (that's a different-
+collaborator rule, untouched by this reversal).
+
+### The full-registry manual pass (2026-08-06 through 2026-08-10) - complete
+
+Every channel with at least one `song_id` (506 channels at completion) has now been read in
+full by hand at least once, either solo or via a parallel Task-agent shard (see below). Song
+count went from ~16,000 at the start of this stretch to 12,381 at completion; video count never
+moved (19,831 throughout - only `song_id` reassignment/nullification, no data loss). A future
+session should treat this as **maintenance, not a fresh pass**: only channels added or expanded
+since the last sync need a from-scratch read; an already-swept channel only needs re-reading if
+its video count grew. `data/.grouping-audit/progress.json` has one entry per channel covered,
+each with a `scope` field naming the channel(s) and a `note` summarizing what was found - check
+it before re-reading a channel to confirm it isn't already done.
+
+**Parallel Task-agent sharding, distinct from the "How to shard" section's terminal-instance
+model above.** For a pass this large, dispatching multiple `Agent` tool calls (not separate
+terminal instances) in parallel - each given a fixed, disjoint list of `channel_id`s and the same
+rules/procedure as this doc - worked well and is the recommended approach for any future
+large-scale sweep of this shape. Practical notes from doing it at ~500-channel scale:
+- Give each shard agent its own scratch file (`data/.grouping-audit/shards/scratch-{N}.txt`) and
+  its own progress-log file (`data/.grouping-audit/shards/progress-{N}.json`) rather than the
+  shared `data/.grouping-audit/progress.json` - concurrent agents writing the same file corrupts
+  it. Merge each shard's log into the main file (and delete the shard file) only after that shard
+  reports fully complete. The whole `data/.grouping-audit/` tree is gitignored; still delete
+  session scratch after the session so it doesn't accumulate or get re-read by mistake (see
+  Procedure step 7 and "Session file layout" above).
+- Concurrent `python run.py push` calls from sibling shards can hit a transient
+  `git pull --ff-only` conflict. This is expected and self-resolves on a short wait-and-retry
+  (~5s) - it is not data loss, just a race on which shard's push lands first.
+- **The practical ceiling on shard count is the account's spend limit, not anything about the
+  task itself.** Running many shards in parallel (10 was tried once, failed outright; 3 at a time
+  repeatedly hit a *monthly* spend cap partway through a batch) will get agents killed mid-task
+  with an API error, not a graceful stop. Recovery is straightforward: resend the interrupted
+  agent a message telling it to check its own shard progress-log file for what's already
+  applied+tested+pushed, then continue from the next unlogged channel in its original list - do
+  not restart it fresh, since a fresh agent has no memory of which channel it was mid-way through
+  and no channel list without being given one again.
+- For the tail end (small channels, 1-10 songs each), pack far more channels per shard than for
+  the head end (large aggregator/label channels) - a 40-channel shard of 1-6-song channels
+  finishes faster than a 30-channel shard of 50-300-song channels. Batch by total *song count*
+  across the shard, not channel count, when sizing shards unevenly.
+
+**New excision categories found at this scale, same "not a presentation of the song" judgment,
+no keyword overlap with prior lists:** a fan concert "Encore VCR" naming no song; a "Self MV" or
+`[공약영상]` (pledge/milestone video) despite its MV-shaped title; a "watch-along"/reaction-style
+vlog; a "MV 촬영 브이로그" (shooting vlog) distinct from a literal Behind/Making clip; a "SOLO
+CONCERT HISTORY" retrospective/milestone-anniversary clip naming no specific song; a subscriber-
+count-milestone-plus-fan-naming-contest video; a "Before shooting MV" pre-shoot clip; an old
+Cube/BEAST-era literal `BTS` (Behind The Scenes) mislabel confirmed again on a different artist,
+same pattern as the entry already documented above.
+
+**Known open issue, flagged not fixed (out of scope for a grouping pass): a channel-anchor
+assignment bug, not a grouping judgment call.** The "After School" channel has a Weeekly song
+anchored to it purely because of a coincidental title match with the channel-artist's name - the
+anchor assignment itself is wrong at the source (whatever process picked the anchor channel for
+that song), not something a merge/excise decision inside this doc's scope can correct. Same class
+of issue as the Wikidata `display_name` bugs already documented above (doesn't affect correctness
+of grouping, which keys on `channel_id` not `display_name`, but worth fixing at the source
+eventually) - flagged here so a future session investigating anchor-assignment logic has a known
+repro case.
+
 ## How to apply a merge
 
 Keep the LOWEST song_id of the group as the survivor.
@@ -559,11 +916,14 @@ Never DELETE from videos. Never touch a song outside your shard.
    selection, canonical_title recompute, empty-song cleanup, as below),
    and verify integrity after every batch, not just at the end.
 5. This spans more than one session on a large registry. Keep a
-   progress file (e.g. `data/.manual-grouping-progress.json`, gitignored
-   like the other sidecar caches in `data/`) recording which channels
-   are fully reviewed and exactly where you stopped in the current one,
-   so a resumed session doesn't re-read what's already done or silently
-   skip what isn't.
+   progress file at `data/.grouping-audit/progress.json` (gitignored with
+   the rest of `data/.grouping-audit/` - see "Session file layout" above)
+   recording which channels are fully reviewed and exactly where you
+   stopped in the current one, so a resumed session doesn't re-read
+   what's already done or silently skip what isn't. Any other scratch
+   from this session (candidate dumps, one-off scripts, reports, shard
+   notes) goes under the matching subdirectory there - never as a loose
+   `data/.audit_*` / `data/.apply_*` file.
 6. Verify and report, both per batch and at the end of a session:
 
     -- must both be 0
@@ -577,6 +937,19 @@ Never DELETE from videos. Never touch a song outside your shard.
 
 Report: songs before, songs after, merges applied, and any case you
 deliberately left alone because you were not confident.
+
+7. Clean up session scratch before treating the session as done. Files
+   under `data/.grouping-audit/candidates/`, `scripts/`, `reports/`, and
+   `shards/` are local working notes only - leave them on disk if you
+   still need them, but they must never land in this repo (the whole
+   `data/.grouping-audit/` tree is gitignored). Delete session scratch
+   once the session's merges are verified, so a later agent doesn't
+   re-run an already-applied apply script against an updated DB. Keep
+   `data/.grouping-audit/progress.json` (durable "already reviewed" log)
+   and `state.json` / `log.jsonl` when the headless auditor wrote them.
+   Keep timestamped DB backups under `data/` only until after a
+   successful push, then delete those too. Any lasting rule or precedent
+   belongs in this doc's Precedents section, not in a scratch file.
 ````
 
 ---
@@ -590,9 +963,12 @@ python -c "from registry import db; db.push_from_local()"
 ```
 
 Confirm every shard has pushed (or push once here after collecting all shards'
-local working copies) before treating the pass as done - the hosted Turso
-registry, not any local file, is what the next sync/chart run and every other
-machine actually reads.
+local working copies) before treating the pass as done - the data repo, not
+any local file, is what the next sync/chart run and every other machine
+actually reads. Then delete leftover session scratch under
+`data/.grouping-audit/{candidates,scripts,reports,shards}/` and any
+pre-merge DB backups you no longer need - same cleanup as Procedure step 7.
+Keep `progress.json` (and `state.json` / `log.jsonl` if present).
 
 Cross-shard merges are not attempted by design.
 A song split across two anchors is rare and is a symptom of the anchor being wrong, which is worth fixing at the source rather than by hand here.

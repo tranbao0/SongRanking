@@ -33,26 +33,17 @@ class KeepOpenConnection(sqlite3.Connection):
         super().close()
 
 
-def make_db(keep_open: bool = False, check_same_thread: bool = True) -> sqlite3.Connection:
+def make_db(keep_open: bool = False) -> sqlite3.Connection:
     """
     An in-memory registry with the same schema get_connection() produces,
     including the migrated columns. Built by replaying db.py's own schema
     statements rather than by copying them, so a schema change there is
     picked up here automatically.
-
-    check_same_thread=False is for tests standing this in as a mocked
-    get_remote_connection() against db.push_from_local(): that function's
-    _run_chunked dispatches each chunk to its own worker thread (see
-    db.py), so a test remote connection needs to tolerate being used from
-    a thread other than the one that created it - safe here because
-    SQLite's own default build is thread-safe ("serialized" mode), which
-    is exactly what this flag exists to let a caller opt into.
     """
     from registry import db
 
     conn = sqlite3.connect(
         ":memory:",
-        check_same_thread=check_same_thread,
         factory=KeepOpenConnection if keep_open else sqlite3.Connection,
     )
     conn.row_factory = sqlite3.Row
@@ -90,3 +81,19 @@ def add_snapshot(conn, video_id, snapshot_date, views):
         "INSERT INTO view_snapshots (video_id, snapshot_date, views) VALUES (?, ?, ?)",
         (video_id, snapshot_date, views),
     )
+
+
+def fake_gemini_assign_singles(prompt, model=None, **kwargs):
+    """
+    Stub for call_gemini that succeeds and assigns every numbered title
+    its own new song. Catalog/sync tests used to pass None and rely on
+    the old "mint singletons on failure" behavior; failures now leave
+    song_id NULL, so tests that need a grouped row must succeed explicitly.
+    """
+    import re
+    match = re.search(r"numbered 1 to (\d+)", prompt)
+    n = int(match.group(1)) if match else 1
+    groups = ",".join(
+        f'{{"existing_id": null, "members": [{i}]}}' for i in range(1, n + 1)
+    )
+    return f"[{groups}]"

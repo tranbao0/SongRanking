@@ -39,6 +39,10 @@ class CallGeminiRetryTest(unittest.TestCase):
         # Neutralise the real usage file and the backoff sleep.
         recorded = []
         self.recorded = recorded
+        # Force a fresh Client for each test so call-count assertions are
+        # about this test's traffic, not a Client left over from another.
+        gemini_client._CLIENT = None
+        gemini_client._CLIENT_KEY = None
         patches = [
             mock.patch.object(api_budget, "record_gemini_request", lambda: recorded.append(1)),
             mock.patch.object(gemini_client.time, "sleep", lambda s: None),
@@ -116,6 +120,56 @@ class CallGeminiRetryTest(unittest.TestCase):
         with mock.patch.dict("os.environ", {"GEMINI_API_KEY": ""}):
             self.assertIsNone(gemini_client.call_gemini("p"))
         self.assertEqual(len(self.recorded), 0)
+
+    def test_passes_thinking_level_and_default_model(self):
+        client = self._client_returning("[]")
+        with mock.patch.object(gemini_client.genai, "Client", return_value=client) as Client:
+            gemini_client.call_gemini("p")
+        kwargs = client.interactions.create.call_args.kwargs
+        self.assertEqual(kwargs["model"], gemini_client.MODEL)
+        self.assertEqual(kwargs["generation_config"]["thinking_level"], gemini_client.THINKING_LEVEL)
+        self.assertEqual(kwargs["generation_config"]["max_output_tokens"], gemini_client.MAX_OUTPUT_TOKENS)
+        self.assertNotIn("response_format", kwargs)
+        Client.assert_called_once()
+
+    def test_reuses_client_across_retries(self):
+        """A retry must not pay Client construction again."""
+        good = self._client_returning("[]")
+        calls = {"n": 0}
+
+        def _create(**kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise Exception("429 RESOURCE_EXHAUSTED")
+            return good.interactions.create(**kwargs)
+
+        client = mock.Mock()
+        client.interactions.create.side_effect = _create
+        with mock.patch.object(gemini_client.genai, "Client", return_value=client) as Client:
+            self.assertEqual(gemini_client.call_gemini("p"), "[]")
+        Client.assert_called_once()
+        self.assertEqual(calls["n"], 2)
+
+    def test_passes_response_schema_via_response_format(self):
+        schema = {"type": "array", "items": {"type": "string"}}
+        client = self._client_returning("[]")
+        with mock.patch.object(gemini_client.genai, "Client", return_value=client):
+            gemini_client.call_gemini("p", response_schema=schema)
+        kwargs = client.interactions.create.call_args.kwargs
+        self.assertEqual(kwargs["response_format"], {
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": schema,
+        })
+
+    def test_prefers_output_text_when_present(self):
+        interaction = mock.Mock()
+        interaction.output_text = '[{"ok": true}]'
+        interaction.steps = []
+        client = mock.Mock()
+        client.interactions.create.return_value = interaction
+        with mock.patch.object(gemini_client.genai, "Client", return_value=client):
+            self.assertEqual(gemini_client.call_gemini("p"), '[{"ok": true}]')
 
 
 class ChunkedTest(unittest.TestCase):

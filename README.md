@@ -9,7 +9,7 @@ Three components: a discovery/data layer, a chart engine, and a render pipeline.
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
 - [Setup](#setup)
-- [Hosted registry database (Turso)](#hosted-registry-database-turso)
+- [Git-synced registry database](#git-synced-registry-database)
 - [Commands](#commands)
 - [Guide: adding a new genre](#guide-adding-a-new-genre)
 - [Guide: adding or customizing a chart](#guide-adding-or-customizing-a-chart)
@@ -30,7 +30,7 @@ This is a working pipeline, not a turnkey product. Cloning it and running `sync`
 - **Channel coverage requires manual curation, not just Wikidata.** Wikidata only links artists to their *own* channel; label, distributor, and broadcaster channels - which carry a large share of real uploads - have no entry there at all and have to be added to `data/channels/<genre>_manual.yaml` by hand. Skip this and your registry is missing most of what actually charts. See [manual channel curation](#guide-manual-channel-curation).
 - **The automated grouping tiers alone are not good enough for a fresh channel.** They merge the easy cases; a channel's first sync still leaves real duplicates (the same song as separate chart entries) that need an actual read-through to catch, especially cross-channel duplicates and judgment-heavy presentation-format calls no regex or one-shot AI chunk can resolve. Budget for either running the manual review process yourself (see [keeping song grouping accurate](#guide-keeping-song-grouping-accurate)) or setting up the [automated audit hook](#automated-grouping-audits) - which itself needs a coding-agent CLI installed and authenticated separately, it is not covered by your `.env` API keys.
 - **API keys have real, separate limits to manage.** `YOUTUBE_API_KEY` is required for `sync`/`chart` and its quota is fixed by Google regardless of your billing tier. `GEMINI_API_KEY` is optional, but a large first sync is meaningfully more accurate with it than without. See [API spend safeguards](#api-spend-safeguards).
-- **The render pipeline's clip downloads can hit YouTube's bot-check wall outright** ("Sign in to confirm you're not a bot"), independent of anything above - this is IP/session-level, not something pacing requests fixes. The pipeline retries through an alternate client and finally exported browser cookies automatically, but that last tier needs a one-time `cookies.txt` export - see [yt-dlp bot-check fallback](#yt-dlp-bot-check-fallback).
+- **The render pipeline's clip downloads can hit YouTube's bot-check wall outright** ("Sign in to confirm you're not a bot"), independent of anything above - this is IP/session-level, not something pacing requests fixes. The pipeline retries through quality-preserving player clients (with a PO Token provider for `mweb`), then low-res `android`, and finally exported browser cookies - see [yt-dlp bot-check fallback](#yt-dlp-bot-check-fallback).
 - **You have to define your own charts.** `data/charts.yaml` ships empty - see [adding or customizing a chart](#guide-adding-or-customizing-a-chart).
 - **Render workers need tuning to your own hardware/connection**, or the render step bottlenecks somewhere you didn't expect - see [tuning worker pools](#tuning-worker-pools).
 
@@ -40,7 +40,7 @@ If you only do the [Setup](#setup) steps below and nothing else, `sync` will run
 
 ### 1. Discovery & data layer
 
-Tracks genre-tagged artists and their view-count history. Everything it produces lives in a hosted Turso (libSQL) database - see [Hosted registry database (Turso)](#hosted-registry-database-turso) - shared across every machine that runs `sync`/`chart`.
+Tracks genre-tagged artists and their view-count history. Everything it produces lives in a private git repo, as SQL text - see [Git-synced registry database](#git-synced-registry-database) - shared across every machine that runs `sync`/`chart`.
 
 Channel discovery, per genre:
 
@@ -103,62 +103,59 @@ exclude   ─┘                                    │
 
 ## Prerequisites
 
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp)
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) (via pip - the pipeline invokes `python -m yt_dlp`)
 - [FFmpeg](https://ffmpeg.org/)
 - Python 3.10+
-- [Turso CLI](https://docs.turso.tech/cli/installation) - only needed for the one-time database setup below (and wherever `sync`'s [automated grouping audit](#automated-grouping-audits) runs). **On Windows this requires WSL** - the install script is bash-only; run it from a WSL shell.
+- [Node.js](https://nodejs.org/) ≥ 20 - only for the optional bgutil PO Token HTTP server (high-res `mweb` fallback); see [yt-dlp bot-check fallback](#yt-dlp-bot-check-fallback)
+- [Git](https://git-scm.com/) - the registry database itself is git-synced (see below), so `sync`/`pull`/`push` shell out to it directly.
 
 ## Setup
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/SongRanking.git
 cd SongRanking
-cp .env.example .env   # add your GEMINI_API_KEY, YOUTUBE_API_KEY, and TURSO_DATABASE_URL/TURSO_AUTH_TOKEN
+cp .env.example .env   # add your GEMINI_API_KEY, YOUTUBE_API_KEY, and REGISTRY_DATA_REPO_URL
 pip install -r requirements.txt   # install all Python dependencies
 ```
 
 `YOUTUBE_API_KEY`: required for `sync`/`chart`; also improves `csv`/`search` results.
 `GEMINI_API_KEY`: optional, used for AI title cleanup and song grouping; both fall back to non-AI behavior if unset.
-`TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN`: required for `sync`/`chart`/`decouple`/`regroup` - see below.
+`REGISTRY_DATA_REPO_URL`: required for `sync`/`chart`/`decouple`/`regroup` - see below.
 
-## Hosted registry database (Turso)
+## Git-synced registry database
 
-The registry (`channels`, `videos`, `songs`, `view_snapshots`) lives in a private [Turso](https://turso.tech/) (hosted libSQL) database rather than a local SQLite file.
+The registry (`channels`, `videos`, `songs`, `view_snapshots`, `rejected_videos`) lives in a private git repo (the "data repo") as deterministic SQL text, rather than a local SQLite file or a hosted database.
 This exists because the registry used to be `data/registry.db`, a local file inside this repo's OneDrive-synced folder - and OneDrive gives no real multi-writer safety for a single binary file: a delete on one machine silently propagates to every synced machine, with no real history beyond whatever survives in a Recycle Bin.
 That cost a real data-loss incident.
+It then moved to a hosted Turso (libSQL) database, which fixed the multi-writer problem but cost a paid service and a network round trip per statement for something that only ever has one writer (the project owner - everyone else pulls a read-only copy).
 
-`sync`/`decouple`/`regroup` don't read/write the hosted database statement-by-statement, though - each opens with exactly one network round trip (pull the current hosted state into a local working copy, `data/.registry_working.db`) and closes with exactly one more (push that copy's final state back), same as this project's own backup-and-import discipline. Everything in between - the actual API-driven catalog work, `grouping_audit.py`'s headless agent - runs against that local file at local-disk speed, with zero network calls to Turso in the middle. See `src/registry/db.py`'s module docstring for the full reasoning; a statement-per-round-trip design was tried first and was too slow at this project's scale.
+Text, not a binary database file, is what actually makes git a good fit here: an unchanged row produces a byte-identical line, so git's own diffing/delta compression carries the "what actually changed" signal - a raw SQLite file's binary layout re-diffs almost entirely on nearly any change, which would make the repo's history balloon fast at this registry's scale (hundreds of thousands of rows). `channels`/`songs`/`videos` are small and re-dumped in full on every push; `rejected_videos`/`view_snapshots` are the two tables with real long-term growth, so those are append-only chunk files (one per calendar month) that a routine push only appends to, never rewrites. See `src/registry/db.py`'s module docstring for the full reasoning.
 
-**One-time setup** (once per registry, not per machine):
+`sync`/`decouple`/`regroup` don't read/write the data repo statement-by-statement, though - each opens with exactly one `git pull` (into a local working copy, `data/.registry_working.db`) and closes with exactly one `git commit` + `push`, same as this project's own backup-and-import discipline. Everything in between - the actual API-driven catalog work, `grouping_audit.py`'s headless agent - runs against that local file at local-disk speed, with zero git operations in the middle.
 
-```bash
-turso auth login                          # or: turso auth signup
-turso db import path/to/your/registry.db  # seed a new hosted db from an existing local file
-                                           # (names the database after the file, e.g. "registry")
-turso db show registry --url              # -> TURSO_DATABASE_URL
-turso db tokens create registry           # -> TURSO_AUTH_TOKEN
-```
+**One-time setup** (once per registry, not per machine): create a new private git repo (e.g. on GitHub) to hold the registry data - it starts empty, `push_from_local()` populates it on the first `sync`/`push`.
 
-Add both to `.env`:
+Add its URL to `.env`:
 
 ```bash
-TURSO_DATABASE_URL=libsql://registry-your-org.turso.io
-TURSO_AUTH_TOKEN=your_token_here
+REGISTRY_DATA_REPO_URL=git@github.com:your-org/your-registry-data-repo.git
 ```
 
-**Every other machine** just needs the same two `.env` values - no shared local file, no per-machine setup beyond that; each machine's own `sync` pulls a fresh working copy for itself.
+**Every other machine** just needs the same `.env` value and read access to that repo - no shared local file, no per-machine setup beyond that; each machine's own `sync` pulls a fresh working copy for itself.
 
-`decouple`'s backup (see [Redoing grouping](#redoing-grouping)) is a plain copy of that local working copy, taken before decouple's own changes land - restoring it means putting it back at `data/.registry_working.db` before `push_from_local()` runs (or importing it into a fresh Turso database directly with `turso db import <backup-file>` if the bad state already got pushed).
+**Read-only demo access** - for people who want to try the system without building their own registry from scratch - is self-service: [tools/demo-access](tools/demo-access) is a small Cloudflare Worker that auto-invites anyone who signs in with GitHub as a pull-only collaborator on the data repo, no manual per-person invite needed. See that directory's README for one-time setup.
+
+`decouple`'s backup (see [Redoing grouping](#redoing-grouping)) is a plain copy of that local working copy, taken before decouple's own changes land - restoring it means putting it back at `data/.registry_working.db` before `push_from_local()` runs.
 
 `sync`/`decouple`/`regroup` each pull then push automatically, but the two halves are also available on their own:
 
 ```bash
-python run.py pull    # overwrite the local working copy with Turso's current state
-python run.py push    # overwrite Turso with the local working copy's current state
+python run.py pull    # rebuild the local working copy from the data repo's current state
+python run.py push    # publish the local working copy's current state to the data repo
 ```
 
-`pull` writes a timestamped backup of whatever the local working copy held (`data/registry.<timestamp>.pre-pull.db`) before overwriting it, and keeps only the 3 most recent such backups - restoring one means putting it back at `data/.registry_working.db` before `push` runs.
-`push` has no equivalent backup on the Turso side, since Turso itself is the durable copy - export one first with the `turso` CLI (`turso db shell registry .dump`, or see [scripts/turso_shell.sh](scripts/turso_shell.sh)) if you want a point-in-time snapshot of what's currently live before overwriting it.
+`pull` writes a timestamped backup of whatever the local working copy held (`data/registry.<timestamp>.pre-pull.db`) before rebuilding it, and keeps only the 3 most recent such backups - restoring one means putting it back at `data/.registry_working.db` before `push` runs.
+`push` has no equivalent backup on the data-repo side, since the data repo's own git history is the durable copy - its commit log is itself a point-in-time record of every previous state.
 
 ## Commands
 
@@ -201,8 +198,8 @@ python run.py regroup --genre kpop      # one genre only
 `sync`/`decouple`/`regroup` each pull then push automatically around their own work - these expose the two halves on their own, for inspecting or restoring the registry without running a full command:
 
 ```bash
-python run.py pull                      # overwrite the local working copy with Turso's current state
-python run.py push                      # overwrite Turso with the local working copy's current state
+python run.py pull                      # rebuild the local working copy from the data repo's current state
+python run.py push                      # publish the local working copy's current state to the data repo
 ```
 
 Grouping is additive: a video's `song_id` is set once and never re-derived, which is what keeps a daily `sync` cheap.
@@ -217,13 +214,14 @@ It never deletes videos. Only the grouping goes.
 - A song holding several videos is a real decision, and any made by the AI tier cost API calls to make again.
 
 The prompt reports both counts, and requires you to type `decouple` rather than accept a `y`.
-A timestamped local backup (`data/registry.<timestamp>.pre-decouple.db`) is written before anything changes, so an accidental run costs no quota to undo (see [Hosted registry database (Turso)](#hosted-registry-database-turso) for how to restore it).
+A timestamped local backup (`data/registry.<timestamp>.pre-decouple.db`) is written before anything changes, so an accidental run costs no quota to undo (see [Git-synced registry database](#git-synced-registry-database) for how to restore it).
 
-`regroup` is the other half: it runs the videos `decouple` left with a NULL `song_id` back through the same grouping tiers, channel by channel.
-It makes no YouTube API call - every candidate was already fetched and MV-filtered on a prior sync, so only the grouping is redone, not the catalogue.
-It costs nothing beyond whatever the AI tier spends (subject to the same daily Gemini budget as `sync`), and is safe to interrupt and re-run: a channel with nothing left ungrouped is skipped.
+`regroup` is the other half: it runs the videos `decouple` left with a NULL `song_id` through free grouping tiers 1 and 2 only (exact match + local clustering), channel by channel.
+Titles those tiers cannot resolve are minted as provisional songs (so same-run cross-channel matching still works), then handed to the configured CLI coding agent (`grouping_audit.run_regroup_handoff`) for merge review - not to Gemini.
+It makes no YouTube or Gemini API call.
+It is safe to interrupt and re-run: a channel with nothing left ungrouped is skipped.
 
-- `sync` only updates the hosted registry - no download/render.
+- `sync` only updates the registry - no download/render.
 - `chart` only reads what `sync` last recorded - no fresh YouTube fetch.
 - A channel's first `sync` walks its full upload history; later syncs only check for new uploads (see [API spend safeguards](#api-spend-safeguards)).
 
@@ -248,8 +246,13 @@ Charts are configuration in `data/charts.yaml`. Each entry:
   genre: kpop                 # must match a genre channels are tracked under
   metric: gained               # cumulative | gained | newest
   window_days: 7                # only used by "gained"; use null otherwise
+  views_delta_days: null        # overlay "views gained" baseline retention; 30 = monthly
   limit: 50                     # how many songs to include
 ```
+
+`views_delta_days` controls the CSV overlay delta, not chart ranking.
+`null` (default) rewrites the baseline every chart run, so gained is only since the last run.
+A value like `30` keeps one fixed `views_baseline` for that many days so gained accumulates across runs in the period, then resets.
 
 Adding a chart = adding an entry, for any combination of an existing genre + metric.
 
@@ -319,7 +322,7 @@ Real example, from `data/channels/kpop_manual_videos.yaml`: the *KPop Demon Hunt
 - The AI tier only ever sees one chunk of one channel at a time, so it cannot catch the same song uploaded to a *different* channel (an artist's own channel and a label/aggregator channel like a broadcaster both posting the same MV).
 - Neither tier can apply judgment to genuinely ambiguous cases - is a `(Rock Ver.)` tag a real rearrangement or just a stage cut? Is a bracketed `[Artist TV Behind]` show name actually behind-the-scenes footage, or a real performance video released under a branded show? - the kind of call that only comes from reading the title (and often the native-script text) directly.
 
-`docs/manual-grouping-prompt.md` is the accumulated methodology for doing that reading by hand, built up over repeated audits of this project's own registry: the decided rules (what merges, what doesn't), a large "Precedents from prior runs" section of worked examples, and the exact SQL for applying a fix once you've found one. It's meant to be pasted directly into a fresh coding-agent session (Claude Code or similar) pointed at your `data/registry.db`.
+`docs/manual-grouping-prompt.md` is the accumulated methodology for doing that reading by hand, built up over repeated audits of this project's own registry: the decided rules (what merges, what doesn't), a large "Precedents from prior runs" section of worked examples, and the exact SQL for applying a fix once you've found one. It's meant to be pasted directly into a fresh coding-agent session (Claude Code or similar) pointed at your `data/.registry_working.db`.
 
 **When you need this:**
 - After a channel's *first* sync (its whole catalog is unreviewed).
@@ -333,19 +336,22 @@ That's exactly the trigger set [the automated audit hook](#automated-grouping-au
 `src/shared/api_budget.py` tracks daily usage for the YouTube Data API and Gemini API in `data/.api_usage.json` (resets at midnight, git-ignored).
 `sync` and AI-assisted steps (title cleanup, song grouping) stop before exceeding budget instead of erroring mid-run.
 
-Defaults: YouTube 10,000 units/day, Gemini 500 requests/day. Override in `.env`:
+Set daily budgets in `.env` (copied from `.env.example`):
 
 ```bash
 YOUTUBE_DAILY_QUOTA=10000
-GEMINI_DAILY_LIMIT=500
+GEMINI_DAILY_LIMIT=100
 ```
+
+`api_budget.py` only reads those env vars (fallback: YouTube 10,000 units/day, Gemini 100 requests/day if unset).
 
 `YOUTUBE_DAILY_QUOTA` matches YouTube's standard free-tier allocation.
 That allocation is fixed - raising it goes through a quota extension request rather than billing - so cloud credit does not lift it and there is rarely a reason to change this value.
 
 `GEMINI_DAILY_LIMIT` is a spend guard, not an estimate of any tier's rate limit.
+The default is sized to sit under a typical Gemini API free-tier Flash RPD (check your project's live RPD in Google AI Studio; raise the env var if yours is higher).
 Gemini bills per token, so the request count isn't the cost directly, but capping requests bounds a runaway loop - which is the failure worth insuring against on a small prepaid balance.
-The default is deliberately low because the AI tier is optional: the free grouping tiers do the bulk of the work, so a sync that stops early loses little.
+`regroup` does not spend this budget: it runs free tiers only, then hands leftovers to the CLI agent.
 On a first full `sync` this value, not wall-clock speed, is what caps how many channels complete per day - raise it if the bootstrap keeps stopping before you want it to.
 
 ### Running without Gemini at all
@@ -363,7 +369,39 @@ A budget-stopped `sync` resumes from the least-recently-synced channel on the ne
 Every yt-dlp call in the render pipeline (clip download in `encoding.py`, heatmap extraction in `heatmap.py`) can hit YouTube's "Sign in to confirm you're not a bot" wall. Two distinct causes look identical in the error message, so there are two distinct fixes, tried in order automatically:
 
 1. **Rate-triggered** - firing many yt-dlp requests at once is what actually trips this in practice. `src/shared/ytdlp_throttle.py` paces every yt-dlp launch (across every worker thread and call site: metadata fetch, heatmap extraction, clip download) at least `YTDLP_MIN_REQUEST_INTERVAL` seconds apart (default 0.35).
-2. **IP/session-flagged** - no amount of pacing gets past this; only an authenticated request does. The pipeline retries with the `android` player client first (fixes a separate, unrelated extraction bucketing issue), then as a last resort with cookies from a real logged-in session.
+2. **Client / session wall** - the default clients (`android_vr` + `web_safari`) failed. The pipeline walks a quality-preserving fallback chain before cookies:
+
+   `mweb` → `web_embedded` → `android` → cookies
+
+   `mweb` needs a **Web PO Token** (via `bgutil-ytdlp-pot-provider`) to unlock full-res adaptive formats; if that server isn't reachable, `mweb` is skipped automatically. Each download attempt is soft-capped at `YTDLP_DOWNLOAD_ATTEMPT_TIMEOUT` seconds (default 60) so a hung client moves on instead of pinning a worker. `android` is last among player clients because it only exposes progressive format 18 (~360p) - a real quality hit, kept as a "something rather than cookies" safety net. Cookies remain last resort for a hard IP/session flag. `ios` / `tv_simply` are omitted: without an iOSGuard token `ios` almost always fails, and `tv_simply` tends to fail alongside `mweb` when the session is already hostile - both just add multi-minute stalls.
+
+   After a successful download (or on a cache hit), the pipeline probes the raw clip's height.
+   If it is below `max(YTDLP_MIN_RAW_HEIGHT, canvas height)` (default / canvas: 1440), it re-fetches that same section with quality-preserving clients only (never `android`) and keeps the taller file when one lands.
+   Raw files are stored as `assets/clips/raw/<video_id>_<height>p.mp4` (legacy `<video_id>.mp4` is migrated on touch).
+   The section window is saved beside them as `<video_id>.window` so upgrades do not re-roll the heatmap.
+   Final output resolution comes from `assets/templates/style.json` (currently 2560×1440).
+
+### PO Token provider (one-time setup)
+
+Needed for the high-res `mweb` tier. Without it that client degrades and the run falls through to android (360p) or cookies sooner.
+
+1. `pip install -U bgutil-ytdlp-pot-provider` (also listed in `requirements.txt`).
+2. Clone and build the HTTP server (Node ≥ 20):
+   ```bash
+   git clone --single-branch --branch 1.3.1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git %USERPROFILE%\bgutil-ytdlp-pot-provider
+   cd %USERPROFILE%\bgutil-ytdlp-pot-provider\server
+   npm ci
+   npx tsc
+   ```
+3. Keep the server running while you render (default `http://127.0.0.1:4416`):
+   ```bash
+   node build/main.js
+   ```
+4. Optional: override the URL in `.env` with `YTDLP_POT_BASE_URL=...` if you published it elsewhere.
+
+`python run.py chart` / `csv` / `search` prints whether the provider is reachable at startup. All pipeline yt-dlp calls go through `python -m yt_dlp` so the pip plugin loads (a bare Chocolatey `yt-dlp.exe` on PATH will not see it).
+
+### Cookies fallback (last resort)
 
 That last resort needs a one-time export, since reading cookies directly out of a running browser's profile is unreliable on Windows: the profile's cookie DB is locked while the browser is open, and recent Chrome/Edge encrypt cookies with App-Bound Encryption, which yt-dlp cannot decrypt from a separate process ([yt-dlp#10927](https://github.com/yt-dlp/yt-dlp/issues/10927)) even once the lock is out of the way.
 
@@ -383,7 +421,7 @@ Never commit that file - it carries a live YouTube session. If `YTDLP_COOKIES_FI
 
 `src/registry/grouping_audit.py` hands the registry to a subscription-based coding-agent CLI (Claude Code by default) for the judgment-heavy review described in [keeping song grouping accurate](#guide-keeping-song-grouping-accurate), automatically, as part of `sync`.
 
-**This needs its own one-time setup and does nothing out of the box.** It shells out to a CLI (`claude -p` by default) that must already be installed *and authenticated* on the machine running `sync` - there is no API key for this in `.env`, the subprocess inherits whatever login state that CLI already has. The agent reaches the registry through the same local working copy `sync` already pulled (see [Hosted registry database (Turso)](#hosted-registry-database-turso)) - a plain local SQLite file, no turso CLI needed for this routine path. If the agent CLI isn't available, `sync` logs a one-line warning and moves on; the audit is skipped, the sync itself is not affected.
+**This needs its own one-time setup and does nothing out of the box.** It shells out to a CLI (`claude -p` by default) that must already be installed *and authenticated* on the machine running `sync` - there is no API key for this in `.env`, the subprocess inherits whatever login state that CLI already has. The agent reaches the registry through the same local working copy `sync` already pulled (see [Git-synced registry database](#git-synced-registry-database)) - a plain local SQLite file, no git operations needed for this routine path. If the agent CLI isn't available, `sync` logs a one-line warning and moves on; the audit is skipped, the sync itself is not affected.
 
 Three independent triggers, checked after every `sync`, any one of which is enough:
 
@@ -402,11 +440,11 @@ GROUPING_AUDIT_VOLUME_THRESHOLD=50    # new uploads on one channel in one sync t
 GROUPING_AGENT_TIMEOUT=3600           # seconds to wait before giving up on the agent
 ```
 
-The agent runs headless (its prompt piped over stdin, one shot, no back-and-forth), reads `docs/manual-grouping-prompt.md` for the full methodology, and is told to apply fixes directly to the local working copy rather than propose a diff - safe here because this is a lone unattended pass with nothing else writing to it at the same time, and its edits become part of what `sync` pushes back to Turso once it finishes. It's also told to fold anything it learns that isn't already in that doc's precedents section back into it, so the next audit (human or agent) inherits the judgment call instead of re-deriving it.
+The agent runs headless (its prompt piped over stdin, one shot, no back-and-forth), reads `docs/manual-grouping-prompt.md` for the full methodology, and is told to apply fixes directly to the local working copy rather than propose a diff - safe here because this is a lone unattended pass with nothing else writing to it at the same time, and its edits become part of what `sync` pushes back to the data repo once it finishes. It's also told to fold anything it learns that isn't already in that doc's precedents section back into it, so the next audit (human or agent) inherits the judgment call instead of re-deriving it.
 
 It's safe to run alongside routine syncs, and safe to skip a cycle if the agent CLI isn't available: a missed correction just sits as a minor chart inaccuracy until the next audit catches it. `view_snapshots` keys on `video_id`, not `song_id`, and a chart re-aggregates through `videos.song_id` at render time - so a late grouping fix never loses or corrupts anything already collected.
 
-State (which trigger last fired, how many quiet syncs since) lives in `data/.grouping_audit_state.json`, git-ignored like the other sidecar caches.
+State (which trigger last fired, how many quiet syncs since) lives in `data/.grouping-audit/state.json`, git-ignored like the other sidecar caches under `data/.grouping-audit/`.
 
 ### What a run actually spends
 
@@ -416,16 +454,19 @@ Titles the blocklist already rejects are dropped before their durations are fetc
 
 **Gemini** is billed per token, and a request's instruction preamble, candidate-song list and thinking cost are all paid per call regardless of how many titles it carries.
 Grouping therefore sends large chunks (`CHUNK_SIZE` in `src/shared/gemini_client.py`) rather than many small ones - see the measured table in that file.
-Failures are retried at two levels, because song grouping is additive: a chunk that fails is never revisited, so its videos would stay permanently ungrouped.
-Rate limits and transient server errors are retried with jittered backoff inside `gemini_client`, and a response that arrives but can't be parsed is re-asked once by `song_grouping` (sampling is stochastic, so a re-ask usually succeeds).
+Failures are retried at the transport layer inside `gemini_client`.
+If a chunk still fails after retries, those videos are inserted with `song_id` NULL rather than minted as locked singletons, so `regroup` (free tiers + CLI agent) can finish them later.
+Rate limits and transient server errors use jittered backoff.
+Grouping requests pass a JSON Schema via Interactions `response_format`, so the API enforces parseable output and the prompt no longer teaches JSON shape.
 Errors that cannot succeed - a bad key, a malformed request - are not retried at all, since every attempt is a billed request.
 
 ## Data files
 
 | Path | What it is |
 |---|---|
-| Hosted Turso database | channels, videos, songs (same-song groupings), view_snapshots - the durable source of truth. See [Hosted registry database (Turso)](#hosted-registry-database-turso). |
-| `data/.registry_working.db` | Local working copy `sync`/`decouple`/`regroup`/`pull`/`push` pull from Turso, do their own work against, and push back. Ephemeral - safe to delete. Git-ignored. |
+| Data repo (`REGISTRY_DATA_REPO_URL`) | channels, videos, songs (same-song groupings), view_snapshots, rejected_videos - the durable source of truth, as SQL text. See [Git-synced registry database](#git-synced-registry-database). |
+| `data/.registry-data/` | Local checkout of the data repo `pull`/`push` clone/commit against. Its own separate git repository. Git-ignored. |
+| `data/.registry_working.db` | Local working copy `sync`/`decouple`/`regroup`/`pull`/`push` rebuild from the data repo, do their own work against, and push back. Ephemeral - safe to delete. Git-ignored. |
 | `data/registry.<timestamp>.pre-decouple.db` | Local backup written before a `decouple`. Git-ignored. |
 | `data/registry.<timestamp>.pre-pull.db` | Local backup of the working copy written before a `pull` overwrites it. Only the 3 most recent are kept. Git-ignored. |
 | `data/channels/<genre>_manual.yaml` | Hand-curated channel additions per genre. Tracked in git. |
@@ -442,8 +483,9 @@ There are three pools in total: two in the render pipeline, exposed as CLI flags
 
 ### Song grouping (Gemini)
 
-`_AI_CHUNK_WORKERS` in `src/registry/song_grouping.py` (default 4) controls how many grouping requests are in flight at once.
+`_AI_CHUNK_WORKERS` in `src/registry/song_grouping.py` (default 2) controls how many grouping requests are in flight at once.
 A grouping call is ~10s of mostly waiting, and a channel can need several, so overlapping them is the difference between a sync that looks responsive and one that looks hung.
+The default stays low so a free-tier Flash RPM is less likely to trip; raise it toward 4 on a paid tier with headroom.
 
 This pool is safe to widen or narrow because **the chunks are independent by construction**.
 Every chunk is handed the same snapshot of already-known songs, that snapshot is never updated mid-pass, and no song row is written until all chunks have returned.
@@ -464,7 +506,7 @@ Chunk *size* is the setting that affects cost and accuracy; see `CHUNK_SIZE` in 
 
 ### Rule of thumb by connection speed
 
-Assuming ~15s clips at 1080p, default frame rate (roughly 5-10 MB per clip):
+Assuming ~15s clips at 1440p, default frame rate (roughly 10-25 MB per clip):
 
 | Connection speed | `--download-workers` | `--encode-workers` (GPU) | `--encode-workers` (CPU only) | Bottleneck |
 |---|:---:|:---:|:---:|---|

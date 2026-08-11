@@ -30,12 +30,18 @@ from shared.dates import months_since
 CHARTS_FILE = Path(__file__).parent.parent / "data" / "charts.yaml"
 
 
-def _load_definition(name: str) -> dict:
+def load_definition(name: str) -> dict:
+    """Return the named chart entry from data/charts.yaml."""
     definitions = yaml.safe_load(CHARTS_FILE.read_text(encoding="utf-8"))
     for entry in definitions:
         if entry["name"] == name:
             return entry
     raise ValueError(f"No chart named {name!r} in {CHARTS_FILE}")
+
+
+# Kept as an alias so older call sites / tests that imported the private
+# name keep working; new code should call load_definition.
+_load_definition = load_definition
 
 
 def _video_rows(conn, genre: str) -> list:
@@ -240,12 +246,13 @@ def compute_chart(name: str, limit: int | None = None) -> list[dict]:
     limit       = limit if limit is not None else definition["limit"]
     window_days = definition.get("window_days")
 
-    # A direct remote read, not the local-working-copy pull/push cycle
-    # sync/decouple/regroup use - charts.py doesn't mutate the registry,
-    # and this is a handful of aggregate queries, not the thousands of
-    # small per-video/per-channel writes that made a local copy worth it
-    # for sync (see db.py's module docstring).
-    conn = db.get_remote_connection()
+    # Reads the local working copy, same as sync/decouple/regroup - the
+    # data repo itself is just files in git, not a queryable database, so
+    # there's no separate "direct remote read" path anymore (see db.py's
+    # module docstring). This reflects whatever the last `pull`/`sync`
+    # left in the local working copy; run `python run.py pull` first if
+    # you want it to reflect the data repo's latest pushed state.
+    conn = db.get_connection()
     try:
         # Charts read view_snapshots, but nothing else in the chart path
         # takes one - only `sync` did, so a chart run following a sync

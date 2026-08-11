@@ -7,34 +7,77 @@ from the download/encode orchestration.
 
 import csv
 import os
+from datetime import date, datetime
+
+from shared.dates import months_since
 
 DATA_FILE = "data/songs.csv"
 FIELDNAMES = [
     "rank", "title", "artist", "url", "peak",
     "is_new_entry", "start", "end", "years_on_chart", "release_date",
     "last_views", "last_rank",
+    "views_baseline", "views_baseline_at",
 ]
+
+_HISTORY_KEYS = (
+    "last_views", "last_rank", "peak", "start", "end",
+    "views_baseline", "views_baseline_at",
+)
 
 
 def load_history(csv_path):
     """
     Return a dict keyed by URL containing last_views, last_rank, peak,
-    start, and end from the previous run's CSV.
+    start, end, and views-baseline fields from the previous run's CSV.
     """
     if not os.path.exists(csv_path):
         return {}
     with open(csv_path, newline="", encoding="utf-8") as f:
         return {
-            row["url"]: {k: row.get(k, "") for k in ("last_views", "last_rank", "peak", "start", "end")}
+            row["url"]: {k: row.get(k, "") for k in _HISTORY_KEYS}
             for row in csv.DictReader(f)
         }
+
+
+def _baseline_is_active(baseline_at: str, views_delta_days: int | None, today: date) -> bool:
+    """True when a stored baseline is still inside its retention window."""
+    if not views_delta_days or not baseline_at:
+        return False
+    try:
+        started = date.fromisoformat(baseline_at.strip())
+    except ValueError:
+        return False
+    return (today - started).days < views_delta_days
+
+
+def compute_views_gained(current_views: int, song: dict, views_delta_days: int | None = None,
+                         today: date | None = None) -> int | None:
+    """
+    Views gained for the overlay delta.
+
+    When views_delta_days is set and the song still has an active
+    views_baseline, gained is current - baseline (accumulates across runs
+    in the same period). Otherwise gained is current - last_views (the
+    every-run default, also used when a retained baseline has expired).
+    """
+    today = today or date.today()
+    baseline_raw = (song.get("views_baseline") or "").strip()
+    baseline_at  = (song.get("views_baseline_at") or "").strip()
+
+    if baseline_raw and _baseline_is_active(baseline_at, views_delta_days, today):
+        return current_views - int(baseline_raw)
+
+    raw_last = (song.get("last_views") or "").strip()
+    if raw_last:
+        return current_views - int(raw_last)
+    return None
 
 
 def songs_from_search(results, history):
     """
     Convert search_kpop() results into pipeline song dicts, merging in
-    history (last_views, last_rank, peak, clip timestamps) by URL.
-    Pre-populates _meta so pre_fetch_all skips redundant yt-dlp calls.
+    history (last_views, last_rank, peak, clip timestamps, views baseline)
+    by URL. Pre-populates _meta so pre_fetch_all skips redundant yt-dlp calls.
     """
     songs = []
     for r in results:
@@ -52,6 +95,8 @@ def songs_from_search(results, history):
             "release_date":   r["release_date"],
             "last_views":     hist.get("last_views", ""),
             "last_rank":      hist.get("last_rank",  ""),
+            "views_baseline":    hist.get("views_baseline", ""),
+            "views_baseline_at": hist.get("views_baseline_at", ""),
             "_meta": {
                 "views":           r["views"],
                 "release_year":    r["release_year"],
@@ -63,7 +108,7 @@ def songs_from_search(results, history):
     return songs
 
 
-def pre_fetch_all(songs, batch_fetch_metadata):
+def pre_fetch_all(songs, batch_fetch_metadata, views_delta_days: int | None = None):
     """
     Fetch view count + release metadata for every song upfront (skipped when
     search pre-populates _meta), rank by descending view count.
@@ -73,6 +118,7 @@ def pre_fetch_all(songs, batch_fetch_metadata):
 
     need_fetch = [song["url"] for song in songs if "_meta" not in song]
     fetched    = batch_fetch_metadata(need_fetch) if need_fetch else {}
+    today      = date.today()
 
     enriched = []
     for song in songs:
@@ -88,9 +134,9 @@ def pre_fetch_all(songs, batch_fetch_metadata):
                 continue
             print(f"    Views: {meta['views']:,}  |  Year: {meta['release_year']}")
 
-        raw_last     = song.get("last_views", "").strip()
-        last_views   = int(raw_last) if raw_last else None
-        views_gained = meta["views"] - last_views if last_views is not None else None
+        views_gained = compute_views_gained(
+            meta["views"], song, views_delta_days=views_delta_days, today=today,
+        )
 
         if views_gained is not None:
             print(f"    +{views_gained:,} views gained")
@@ -171,14 +217,56 @@ def determine_badges(songs):
     return songs
 
 
-def save_run_state(songs, csv_path):
+def _update_views_baseline(row: dict, song: dict, current_views: int,
+                           views_delta_days: int | None, today: date) -> None:
+    """
+    Keep or refresh the retained views baseline used for overlay deltas.
+
+    last_views is always the latest measured count (see save_run_state).
+    views_baseline stays fixed for views_delta_days after it is set so
+    gained can accumulate across runs in that window. When the window
+    expires (or no baseline exists yet), a new period starts.
+
+    First-time migration from a pre-retention CSV: seed the baseline from
+    the song's prior last_views (the value this run already used for
+    gained) so the period continues from that measurement instead of
+    resetting to current and wiping the delta.
+    """
+    today_str = today.isoformat()
+    if not views_delta_days:
+        # Every-run mode: baseline columns stay empty / unused.
+        row["views_baseline"] = row.get("views_baseline", "") or ""
+        row["views_baseline_at"] = row.get("views_baseline_at", "") or ""
+        return
+
+    baseline = (row.get("views_baseline") or "").strip()
+    baseline_at = (row.get("views_baseline_at") or "").strip()
+    if baseline and _baseline_is_active(baseline_at, views_delta_days, today):
+        return
+
+    prior_last = (song.get("last_views") or "").strip()
+    if not baseline and prior_last:
+        row["views_baseline"] = prior_last
+        row["views_baseline_at"] = today_str
+        return
+
+    row["views_baseline"] = str(current_views)
+    row["views_baseline_at"] = today_str
+
+
+def save_run_state(songs, csv_path, views_delta_days: int | None = None,
+                   today: date | None = None):
     """
     Persist current chart state to CSV:
     - Current chart songs: update rank, last_views, last_rank, peak.
+    - When views_delta_days is set, also retain views_baseline until that
+      many days have passed since views_baseline_at (see
+      _update_views_baseline).
     - Songs that fell off the chart: keep last_views, clear last_rank
       so they are detected as re-entries if they return next run.
     - Songs new to the CSV are added as fresh rows.
     """
+    today = today or date.today()
     current_urls = {s["url"] for s in songs}
     views_map    = {s["url"]: s["_meta"]["views"] for s in songs}
     rank_map     = {s["url"]: s["rank"] for s in songs}
@@ -193,7 +281,8 @@ def save_run_state(songs, csv_path):
             fieldnames = list(reader.fieldnames or fieldnames)
         existing_rows = {r["url"]: r for r in rows}
 
-    for col in ("last_views", "last_rank", "release_date"):
+    for col in ("last_views", "last_rank", "release_date",
+                "views_baseline", "views_baseline_at"):
         if col not in fieldnames:
             fieldnames.append(col)
 
@@ -213,14 +302,18 @@ def save_run_state(songs, csv_path):
             "release_date":  song["_meta"]["release_date"],
             "last_views":    "",
             "last_rank":     "",
+            "views_baseline": "",
+            "views_baseline_at": "",
         }
+        current_views = views_map[url]
         row["rank"]         = str(rank_map[url])
         row["title"]        = song["title"]
         row["artist"]       = song["artist"]
-        row["last_views"]   = str(views_map[url])
+        row["last_views"]   = str(current_views)
         row["last_rank"]    = str(rank_map[url])
         row["peak"]         = str(peak_map[url])
         row["release_date"] = song["_meta"]["release_date"]
+        _update_views_baseline(row, song, current_views, views_delta_days, today)
         chart_rows.append(row)
 
     chart_rows.sort(key=lambda r: int(r.get("rank") or 999))
@@ -241,6 +334,32 @@ def save_run_state(songs, csv_path):
 def load_songs(csv_path):
     with open(csv_path, newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
+
+
+def songs_from_csv(csv_path):
+    """
+    Load a CSV and use its own stored columns (last_views, release_date,
+    years_on_chart) as this run's metadata, instead of fetching anything
+    live - a fully offline rebuild of whatever the last successful run
+    already computed. Used both for `csv` mode's --offline flag and as
+    `chart` mode's automatic fallback when compute_chart can't reach the
+    registry/YouTube (see run_pipeline). Reusing last_views as this run's
+    view count means views_gained comes out 0 - nothing fresher is
+    available - rather than pretending a number the broken source can't
+    currently supply.
+    """
+    songs = load_songs(csv_path)
+    for row in songs:
+        release_str = row.get("release_date", "").strip()
+        release = datetime.strptime(release_str, "%Y.%m.%d").date() if release_str else None
+        row["_meta"] = {
+            "views":           int(row.get("last_views") or 0),
+            "release_year":    release.year if release else None,
+            "release_date":    release_str,
+            "years_on_chart":  int(row.get("years_on_chart") or 1),
+            "months_on_chart": months_since(release) if release else 1,
+        }
+    return songs
 
 
 def clean_csv_titles(csv_path):
