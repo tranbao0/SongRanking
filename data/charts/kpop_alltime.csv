@@ -18,9 +18,9 @@ rank,title,artist,url,peak,is_new_entry,start,end,years_on_chart,release_date,la
 17,Pink Venom,BLACKPINK,https://www.youtube.com/watch?v=gQlMMD8auMs,16,false,00:01:00,00:01:15,5,2022.08.19,1489002997,17,1489002997,2026-08-11
 18,SOLO,JENNIE,https://www.youtube.com/watch?v=b73BI9eUkjM,17,false,00:01:00,00:01:15,9,2018.11.12,1451664945,18,1451664945,2026-08-11
 19,FIRE (불타오르네),BTS (방탄소년단),https://www.youtube.com/watch?v=ALj5MKjy2BU,19,false,00:01:00,00:01:15,11,2016.05.01,1398288959,19,1398288959,2026-08-11
-20,[CHOREOGRAPHY] BTS (방탄소년단) '피 땀 눈물 (Blood Sweat & Tears)' Dance Practice,HYBE LABELS,https://www.youtube.com/watch?v=hmE9f-TEutc,15,false,00:01:00,00:01:15,11,2016.10.09,1119080734,20,1119080734,2026-08-11
-20,MONEY,LISA,https://www.youtube.com/watch?v=dNCWe_6HAM8,14,false,00:01:00,00:01:15,6,2021.09.23,1377932263,,,
-20,BLACKPINK - 'Ice Cream (with Selena Gomez)' M/V,Blackpink,https://www.youtube.com/watch?v=vRXZj0DzXIA,19,false,00:01:00,00:01:15,7,2020.08.28,1028715677,,,
-20,BLACKPINK - ‘Shut Down’ M/V,Blackpink,https://www.youtube.com/watch?v=POe9SOEKotk,18,false,00:01:00,00:01:15,5,2022.09.16,1078413024,,,
-20,불장난 (PLAYING WITH FIRE),BLACKPINK,https://www.youtube.com/watch?v=9pdj4iJD08s,19,false,00:01:00,00:01:15,11,2016.10.31,970110178,,,
-20,Lovesick Girls,BLACKPINK,https://www.youtube.com/watch?v=dyRsYk0LyA8,20,false,00:01:00,00:01:15,7,2020.10.02,1199817824,,,
+20,MONEY,LISA,https://www.youtube.com/watch?v=dNCWe_6HAM8,14,false,00:01:00,00:01:15,6,2021.09.23,1377932263,20,1377932263,2026-08-11
+21,Lovesick Girls,BLACKPINK,https://www.youtube.com/watch?v=dyRsYk0LyA8,20,false,00:01:00,00:01:15,7,2020.10.02,1199817824,21,1199817824,2026-08-11
+22,[CHOREOGRAPHY] BTS (방탄소년단) '피 땀 눈물 (Blood Sweat & Tears)' Dance Practice,HYBE LABELS,https://www.youtube.com/watch?v=hmE9f-TEutc,15,false,00:01:00,00:01:15,11,2016.10.09,1119080734,22,1119080734,2026-08-11
+23,BLACKPINK - ‘Shut Down’ M/V,Blackpink,https://www.youtube.com/watch?v=POe9SOEKotk,18,false,00:01:00,00:01:15,5,2022.09.16,1078413024,23,1078413024,2026-08-11
+24,BLACKPINK - 'Ice Cream (with Selena Gomez)' M/V,Blackpink,https://www.youtube.com/watch?v=vRXZj0DzXIA,19,false,00:01:00,00:01:15,7,2020.08.28,1028715677,24,1028715677,2026-08-11
+25,불장난 (PLAYING WITH FIRE),BLACKPINK,https://www.youtube.com/watch?v=9pdj4iJD08s,19,false,00:01:00,00:01:15,11,2016.10.31,970110178,25,970110178,2026-08-11
