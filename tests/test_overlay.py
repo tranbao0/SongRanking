@@ -9,6 +9,7 @@ invisible in a diff but is still a rendering change.
 """
 
 import unittest
+from unittest import mock
 
 from . import context  # noqa: F401  (puts src/ on sys.path)
 
@@ -102,6 +103,51 @@ class BuildOverlayImageTest(unittest.TestCase):
             self._render(title="B" * 200).tobytes(),
             self._render(title="B" * 200).tobytes(),
         )
+
+
+class ResolveFontPathTest(unittest.TestCase):
+    """
+    style.json pins Windows Malgun Gothic. Linux/macOS must pick an
+    installed Hangul font instead of raising OSError on the missing path.
+    """
+
+    def setUp(self):
+        overlay._resolve_font_path.cache_clear()
+        overlay._font.cache_clear()
+
+    def tearDown(self):
+        overlay._resolve_font_path.cache_clear()
+        overlay._font.cache_clear()
+
+    def test_uses_configured_path_when_it_exists(self):
+        configured = "C:/Windows/Fonts/malgunbd.ttf"
+        with mock.patch("render.overlay.os.path.exists", return_value=True):
+            self.assertEqual(overlay._resolve_font_path(configured), configured)
+
+    def test_falls_back_to_first_installed_bold_hangul_font(self):
+        configured = "C:/Windows/Fonts/malgunbd.ttf"
+        nanum_bold = overlay._FALLBACK_FONTS[0][0]
+
+        def exists(path):
+            return path == nanum_bold
+
+        with mock.patch("render.overlay.os.path.exists", side_effect=exists):
+            self.assertEqual(overlay._resolve_font_path(configured), nanum_bold)
+
+    def test_matches_regular_face_for_non_bold_path(self):
+        configured = "C:/Windows/Fonts/malgun.ttf"
+        nanum_regular = overlay._FALLBACK_FONTS[0][1]
+
+        def exists(path):
+            return path == nanum_regular
+
+        with mock.patch("render.overlay.os.path.exists", side_effect=exists):
+            self.assertEqual(overlay._resolve_font_path(configured), nanum_regular)
+
+    def test_returns_original_path_when_no_fallback_is_installed(self):
+        configured = "C:/Windows/Fonts/malgunbd.ttf"
+        with mock.patch("render.overlay.os.path.exists", return_value=False):
+            self.assertEqual(overlay._resolve_font_path(configured), configured)
 
 
 if __name__ == "__main__":
