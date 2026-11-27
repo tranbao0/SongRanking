@@ -49,63 +49,67 @@ would be silently rejected and the audit would be a no-op.
 """
 
 import json
-import os
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from datetime import date
-from pathlib import Path
 
 from registry import db
+from shared import config
 
-_ROOT = Path(__file__).parent.parent.parent
+_ROOT = config.REPO_ROOT
 # All grouping-audit sidecars live under data/.grouping-audit/ (gitignored
 # as a unit) - progress/state/log plus session scratch. Layout is fixed
 # so manual and headless agents don't scatter files under data/; see
 # docs/manual-grouping-prompt.md's "Session file layout" section.
-_AUDIT_DIR = _ROOT / "data" / ".grouping-audit"
+_AUDIT_DIR = config.AUDIT_DIR
 STATE_FILE = _AUDIT_DIR / "state.json"
 LOG_FILE = _AUDIT_DIR / "log.jsonl"
-METHODOLOGY_DOC = "docs/manual-grouping-prompt.md"
-PROGRESS_FILE = "data/.grouping-audit/progress.json"
+METHODOLOGY_DOC = _ROOT / "docs" / "manual-grouping-prompt.md"
+PROGRESS_FILE = _AUDIT_DIR / "progress.json"
 
-# The agent CLI to invoke, as argv tokens - not hardcoded to one vendor.
-# Point this at whatever subscription-based coding-agent CLI is
-# installed and authenticated; the only requirement is that it accepts a
-# one-shot prompt on stdin and can read/write files in the given cwd.
-# Default matches Claude Code's headless/print mode:
-#   --permission-mode bypassPermissions - this is a one-shot run with no
-#     human able to answer a permission prompt (see the module
-#     docstring), so without this every Edit/Write/Bash call the agent
-#     makes is silently rejected and the audit does nothing at all.
-#   --verbose --output-format stream-json - emits one JSON line per
-#     turn (assistant text, tool calls, tool results) as they happen,
-#     which _invoke_agent parses into human-readable progress lines
-#     instead of only learning the outcome after the whole run finishes.
-# A custom GROUPING_AGENT_CLI that doesn't speak stream-json still works
-# - _print_progress_event falls back to echoing unparsable lines as-is.
-AGENT_CLI_COMMAND = os.environ.get(
-    "GROUPING_AGENT_CLI",
-    "claude -p --verbose --output-format stream-json --permission-mode bypassPermissions",
-).split()
+_SETTINGS = {
+    # The agent CLI to invoke, as argv tokens - not hardcoded to one vendor.
+    # Point this at whatever subscription-based coding-agent CLI is
+    # installed and authenticated; the only requirement is that it accepts a
+    # one-shot prompt on stdin and can read/write files in the given cwd.
+    # Default matches Claude Code's headless/print mode:
+    #   --permission-mode bypassPermissions - this is a one-shot run with no
+    #     human able to answer a permission prompt (see the module
+    #     docstring), so without this every Edit/Write/Bash call the agent
+    #     makes is silently rejected and the audit does nothing at all.
+    #   --verbose --output-format stream-json - emits one JSON line per
+    #     turn (assistant text, tool calls, tool results) as they happen,
+    #     which _invoke_agent parses into human-readable progress lines
+    #     instead of only learning the outcome after the whole run finishes.
+    # A custom GROUPING_AGENT_CLI that doesn't speak stream-json still works
+    # - _print_progress_event falls back to echoing unparsable lines as-is.
+    "AGENT_CLI_COMMAND": config.grouping_agent_cli,
+    "AUDIT_EVERY_N_SYNCS": config.grouping_audit_every_n_syncs,
+    # A single channel's new-upload count in one sync that's treated as
+    # carrying the same judgment load as a brand-new channel. Tuned from
+    # this project's own history: a channel that actually needs review
+    # arrives with dozens to low hundreds of new uploads at once; routine
+    # incremental syncs of an already-reviewed channel are usually single
+    # digits (see the module docstring's measurement).
+    "VOLUME_THRESHOLD": config.grouping_audit_volume_threshold,
+    # Generous on purpose: an audit reads and judges titles rather than
+    # calling an API, and a large trigger (a new label channel with a
+    # thousand-video back-catalogue) can legitimately take a while.
+    "AGENT_TIMEOUT_SECONDS": config.grouping_agent_timeout,
+}
 
 
-AUDIT_EVERY_N_SYNCS = int(os.environ.get("GROUPING_AUDIT_EVERY_N_SYNCS", 7))
+def __getattr__(name):
+    if name in _SETTINGS:
+        return _SETTINGS[name]()
+    raise AttributeError(name)
 
-# A single channel's new-upload count in one sync that's treated as
-# carrying the same judgment load as a brand-new channel. Tuned from
-# this project's own history: a channel that actually needs review
-# arrives with dozens to low hundreds of new uploads at once; routine
-# incremental syncs of an already-reviewed channel are usually single
-# digits (see the module docstring's measurement).
-VOLUME_THRESHOLD = int(os.environ.get("GROUPING_AUDIT_VOLUME_THRESHOLD", 50))
 
-# Generous on purpose: an audit reads and judges titles rather than
-# calling an API, and a large trigger (a new label channel with a
-# thousand-video back-catalogue) can legitimately take a while.
-AGENT_TIMEOUT_SECONDS = int(os.environ.get("GROUPING_AGENT_TIMEOUT", 3600*5))
+_module = sys.modules[__name__]
 
 
 def _load_state() -> dict:
@@ -165,10 +169,11 @@ def _decide_trigger(before: dict) -> tuple[str, dict] | tuple[None, None]:
             r["channel_id"]: r["c"]
             for r in conn.execute("SELECT channel_id, COUNT(*) c FROM videos GROUP BY channel_id")
         }
+        volume_threshold = _module.VOLUME_THRESHOLD
         spikes = []
         for channel_id, after_count in current_counts.items():
             delta = after_count - before["video_counts"].get(channel_id, 0)
-            if delta >= VOLUME_THRESHOLD:
+            if delta >= volume_threshold:
                 row = conn.execute(
                     "SELECT display_name FROM channels WHERE channel_id = ?", (channel_id,)
                 ).fetchone()
@@ -177,7 +182,7 @@ def _decide_trigger(before: dict) -> tuple[str, dict] | tuple[None, None]:
             return "volume_spike", {"channels": spikes}
 
         state = _load_state()
-        if state.get("syncs_since_audit", 0) + 1 >= AUDIT_EVERY_N_SYNCS:
+        if state.get("syncs_since_audit", 0) + 1 >= _module.AUDIT_EVERY_N_SYNCS:
             return "periodic", {}
 
         return None, None
@@ -204,7 +209,7 @@ def _build_prompt(reason: str, details: dict, extra_instructions: str | None = N
         listing = "\n".join(f"- {cid} ({name}): {delta} new video(s)" for cid, name, delta in details["channels"])
         scope = (
             f"The following already-reviewed channel(s) received an unusually large batch of "
-            f"new uploads in one sync (>= {VOLUME_THRESHOLD}), which often means a back-catalog "
+            f"new uploads in one sync (>= {_module.VOLUME_THRESHOLD}), which often means a back-catalog "
             f"dump (e.g. old concert clips) rather than routine new releases:\n{listing}\n\n"
             "Review just the new uploads on these channels (videos.discovered_at is date-only in "
             "this schema, so cross-reference against songs.grouped_at, which has microsecond "
@@ -217,7 +222,7 @@ def _build_prompt(reason: str, details: dict, extra_instructions: str | None = N
         scope = details["scope"]
     else:
         scope = (
-            f"This is the periodic backstop audit (runs every {AUDIT_EVERY_N_SYNCS} syncs "
+            f"This is the periodic backstop audit (runs every {_module.AUDIT_EVERY_N_SYNCS} syncs "
             "regardless of volume, to catch what the two targeted triggers don't). Run the "
             "whole-registry normalize-and-cluster duplicate scan described in the doc under "
             "\"Do this by reading, not by writing matching code\" - it generates cross-channel "
@@ -242,7 +247,7 @@ not a workaround. This is a one-shot, non-interactive run - there is no human to
 clarifying question, so make the conservative call (per the doc's "when unsure, don't
 merge" rule) rather than waiting on anything.
 
-Read {METHODOLOGY_DOC} in full before doing anything else. It has the complete decided
+Read {METHODOLOGY_DOC.relative_to(_ROOT).as_posix()} in full before doing anything else. It has the complete decided
 rules, the DO-NOT-merge list, the Making/Behind excision rule and its exact SQL patterns,
 and a large "Precedents from prior runs" section with dozens of worked examples - apply
 those rather than re-deriving them.
@@ -272,14 +277,14 @@ When done:
 2. Run `python -m unittest discover -s tests -t .` and confirm it's clean.
 3. This is the step that makes future audits smarter instead of re-deriving the same
    judgment calls from scratch - don't skip it even on a clean run. If you had to make any
-   judgment call not already covered by {METHODOLOGY_DOC}'s "Precedents from prior runs"
+   judgment call not already covered by {METHODOLOGY_DOC.relative_to(_ROOT).as_posix()}'s "Precedents from prior runs"
    section (a new Ver.-tag reading, a new non-song content shape, anything you weren't sure
    was covered), add it there directly, in that section's existing style - that file is
    what every future run (human or agent) actually reads as "the rules" before doing
    anything, so a precedent that only lives in a log gets rediscovered the hard way next
    time instead of applied. Don't touch anything above the "Precedents" heading - those are
    decided rules, not open for revision by an audit.
-4. Separately, append a dated entry to {PROGRESS_FILE} (create it if missing, following the
+4. Separately, append a dated entry to {PROGRESS_FILE.relative_to(_ROOT).as_posix()} (create it if missing, following the
    shape of the existing entries) recording what you reviewed and what you fixed - this is
    the tracking log, not the rulebook, so a summary is enough; the actual precedent belongs
    in the doc per step 3, not only here.
@@ -374,8 +379,9 @@ def _invoke_agent(prompt: str) -> bool:
     # PATHEXT resolution itself). shutil.which() does that resolution for
     # us, so an npm-installed `claude` (found on PATH as claude.cmd) still
     # launches instead of raising FileNotFoundError.
-    resolved = shutil.which(AGENT_CLI_COMMAND[0])
-    command = [resolved, *AGENT_CLI_COMMAND[1:]] if resolved else AGENT_CLI_COMMAND
+    agent_cli_command = _module.AGENT_CLI_COMMAND
+    resolved = shutil.which(agent_cli_command[0])
+    command = [resolved, *agent_cli_command[1:]] if resolved else agent_cli_command
 
     try:
         process = subprocess.Popen(
@@ -390,7 +396,7 @@ def _invoke_agent(prompt: str) -> bool:
             cwd=_ROOT,
         )
     except FileNotFoundError:
-        print(f"  [grouping_audit] Agent CLI {AGENT_CLI_COMMAND[0]!r} not found on PATH - "
+        print(f"  [grouping_audit] Agent CLI {agent_cli_command[0]!r} not found on PATH - "
               f"skipping this audit. Set GROUPING_AGENT_CLI if it's installed under a "
               f"different name.")
         return False
@@ -400,7 +406,8 @@ def _invoke_agent(prompt: str) -> bool:
     process.stdin.close()
 
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + AGENT_TIMEOUT_SECONDS
+    timeout = _module.AGENT_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout
     timed_out = False
     with LOG_FILE.open("w", encoding="utf-8") as log:
         while True:
@@ -421,7 +428,7 @@ def _invoke_agent(prompt: str) -> bool:
     if timed_out:
         process.kill()
         process.wait()
-        print(f"  [grouping_audit] Agent CLI timed out after {AGENT_TIMEOUT_SECONDS}s - "
+        print(f"  [grouping_audit] Agent CLI timed out after {timeout}s - "
               f"skipping this audit. Raise GROUPING_AGENT_TIMEOUT if it needs more time.")
         return False
 
@@ -517,7 +524,7 @@ def audit_after_sync(before: dict) -> None:
 
     label = {"new_channels": "new channel(s) discovered",
               "volume_spike": "large new-upload batch on an existing channel",
-              "periodic": f"periodic ({AUDIT_EVERY_N_SYNCS}-sync) backstop"}[reason]
+              "periodic": f"periodic ({_module.AUDIT_EVERY_N_SYNCS}-sync) backstop"}[reason]
     print(f"  [grouping_audit] Triggering audit: {label}")
 
     prompt = _build_prompt(reason, details)

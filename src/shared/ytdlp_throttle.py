@@ -1,9 +1,10 @@
-import os
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+
+from shared import config
 
 # Firing many yt-dlp requests at once is what actually trips YouTube's
 # bot-check wall in practice - a burst against a large pending list came
@@ -19,17 +20,34 @@ import urllib.request
 # Shared by every yt-dlp call site (metadata fetch, heatmap extraction,
 # clip download) since they can all trip the same wall and YouTube
 # doesn't rate-limit them separately.
-_MIN_LAUNCH_INTERVAL = float(os.environ.get("YTDLP_MIN_REQUEST_INTERVAL", 1))
 _launch_lock = threading.Lock()
 _last_launch = 0.0
 
 
+_SETTINGS = {
+    "DOWNLOAD_ATTEMPT_TIMEOUT": config.ytdlp_download_attempt_timeout,
+    "COOKIES_BROWSER": config.ytdlp_cookies_browser,
+    # A cookie file works when the browser profile is locked or encrypted.
+    "COOKIES_FILE": config.ytdlp_cookies_file,
+    "POT_PROVIDER_BASE_URL": config.ytdlp_pot_base_url,
+}
+
+
+def __getattr__(name):
+    if name in _SETTINGS:
+        return _SETTINGS[name]()
+    raise AttributeError(name)
+
+
+_module = sys.modules[__name__]
+
+
 def throttle() -> None:
-    """Block until at least _MIN_LAUNCH_INTERVAL has passed since the last
+    """Block until the configured interval has passed since the last
     yt-dlp launch (across every thread and call site), then claim this slot."""
     global _last_launch
     with _launch_lock:
-        wait = _last_launch + _MIN_LAUNCH_INTERVAL - time.monotonic()
+        wait = _last_launch + config.ytdlp_min_request_interval() - time.monotonic()
         if wait > 0:
             time.sleep(wait)
         _last_launch = time.monotonic()
@@ -75,13 +93,6 @@ def ytdlp_cmd(*args: str) -> list[str]:
 #   tv_embedded - removed from yt-dlp; pinning it is a no-op
 DOWNLOAD_FALLBACK_CLIENTS = ["mweb", "web_embedded", "android"]
 
-# Soft ceiling on a single yt-dlp download attempt. A ~20s section at 1080p+
-# almost never needs more than this; without it, a hung client negotiation
-# can burn 2-3 minutes before the fallback ladder moves on. Override via
-# YTDLP_DOWNLOAD_ATTEMPT_TIMEOUT (seconds).
-DOWNLOAD_ATTEMPT_TIMEOUT = float(os.environ.get("YTDLP_DOWNLOAD_ATTEMPT_TIMEOUT", 60))
-
-
 def download_fallback_clients() -> list[str]:
     """Player-client fallbacks for this moment, with dead tiers dropped.
 
@@ -105,29 +116,6 @@ def quality_upgrade_clients() -> list[str]:
     return [c for c in download_fallback_clients() if c != "android"]
 
 
-# Pacing only helps when YouTube's "confirm you're not a bot" wall is
-# rate-triggered. When the IP/session itself gets flagged, no amount of
-# spacing gets past it - the last resort is authenticating requests as a
-# real logged-in browser session instead of an anonymous client. Only
-# used as a final fallback tier (after the plain and player-client
-# attempts) since it requires the named browser to be installed, closed
-# or cookie-DB-readable, and logged into YouTube.
-COOKIES_BROWSER = os.environ.get("YTDLP_COOKIES_BROWSER", "edge")
-
-# Reading cookies straight out of a running Chromium browser's profile
-# needs that profile's DB unlocked *and* (as of Chrome/Edge's App-Bound
-# Encryption rollout) yt-dlp able to decrypt v20 cookies, which plain
-# DPAPI can no longer do on its own - see
-# https://github.com/yt-dlp/yt-dlp/issues/10927. A cookies.txt file
-# exported once via a browser extension sidesteps both problems, so it's
-# preferred over COOKIES_BROWSER whenever it's configured. Never commit
-# the file this points to - it carries a live YouTube session.
-COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE")
-
-# bgutil-ytdlp-pot-provider's HTTP server. The pip plugin defaults to this
-# URL; override only if you published the server on a different host/port.
-POT_PROVIDER_BASE_URL = os.environ.get("YTDLP_POT_BASE_URL", "http://127.0.0.1:4416")
-
 # Avoid pinging the POT server on every fallback decision during a chart
 # run - reachability rarely flips mid-pipeline.
 _POT_REACHABLE_TTL = 60.0
@@ -140,9 +128,10 @@ def cookie_args() -> list[str]:
     """yt-dlp CLI args for the cookies fallback tier: a cookies.txt file
     if one's configured, else falling back to reading the browser's own
     (often locked/undecryptable) cookie store directly."""
-    if COOKIES_FILE:
-        return ["--cookies", COOKIES_FILE]
-    return ["--cookies-from-browser", COOKIES_BROWSER]
+    cookies_file = _module.COOKIES_FILE
+    if cookies_file:
+        return ["--cookies", cookies_file]
+    return ["--cookies-from-browser", _module.COOKIES_BROWSER]
 
 
 def pot_extractor_args() -> list[str]:
@@ -152,9 +141,10 @@ def pot_extractor_args() -> list[str]:
     a redundant arg on every call. Non-default base_url is required for
     the HTTP provider to find the server.
     """
-    if POT_PROVIDER_BASE_URL.rstrip("/") == "http://127.0.0.1:4416":
+    base_url = _module.POT_PROVIDER_BASE_URL
+    if base_url.rstrip("/") == config.DEFAULT_POT_BASE_URL:
         return []
-    return ["--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_PROVIDER_BASE_URL}"]
+    return ["--extractor-args", f"youtubepot-bgutilhttp:base_url={base_url}"]
 
 
 def pot_provider_reachable(timeout: float = 1.0) -> bool:
@@ -173,7 +163,7 @@ def pot_provider_reachable(timeout: float = 1.0) -> bool:
             return _pot_reachable_cache
     try:
         with urllib.request.urlopen(
-            f"{POT_PROVIDER_BASE_URL.rstrip('/')}/ping", timeout=timeout,
+            f"{_module.POT_PROVIDER_BASE_URL.rstrip('/')}/ping", timeout=timeout,
         ) as resp:
             ok = 200 <= getattr(resp, "status", 200) < 300
     except (urllib.error.URLError, TimeoutError, OSError):

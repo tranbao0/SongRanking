@@ -1,48 +1,25 @@
 import os
-import sys
 import time
 import concurrent.futures
 
-# Windows consoles/pipes default Python's stdout to the legacy locale codepage
-# (e.g. cp1252), which can't represent Hangul - printing a Korean song title
-# would otherwise crash the whole run with UnicodeEncodeError.
-sys.stdout.reconfigure(encoding="utf-8")
-sys.stderr.reconfigure(encoding="utf-8")
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
+from render import encoding
 from render.overlay import load_style
 from render.encoding import (
     detect_hw_encoder, download_song, encode_song, encode_transition, concatenate_clips, _log,
-    cached_clip, ensure_raw_quality, read_raw_window, probe_height, MIN_RAW_HEIGHT,
+    cached_clip, ensure_raw_quality, read_raw_window, probe_height,
 )
-from render.heatmap import pick_clip
 from render.chart_state import (
     DATA_FILE, load_history, songs_from_search, pre_fetch_all,
     determine_badges, save_run_state, load_songs, clean_csv_titles,
     songs_from_csv,
 )
-from shared import shutdown
+from shared import config, shutdown
 
 _DEFAULT_START = "00:01:00"
 _DEFAULT_END   = "00:01:15"
 
-# Use YouTube Data API if key is present, otherwise fall back to yt-dlp.
-_YT_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
-if _YT_API_KEY:
-    from shared.youtube_api import batch_fetch_metadata, search_kpop as _search_fn
-    print("[backend] YouTube Data API v3")
-else:
-    from shared.metadata import batch_fetch_metadata
-    from shared.search import search_kpop as _search_fn
-    print("[backend] yt-dlp (no YOUTUBE_API_KEY set)")
-
-CLIPS_DIR  = "assets/clips"
-STYLE_FILE = "assets/templates/style.json"
+CLIPS_DIR = str(config.CLIPS_DIR)
+STYLE_FILE = str(config.STYLE_FILE)
 
 _BADGE_LABELS = {
     "new_entry":        "NEW ENTRY",
@@ -51,6 +28,23 @@ _BADGE_LABELS = {
     "highest_jump":     "HIGHEST JUMP",
     "":                 "",
 }
+
+
+def _select_backend():
+    if config.youtube_api_key():
+        from shared.youtube_api import batch_fetch_metadata, search_kpop
+        print("[backend] YouTube Data API v3")
+    else:
+        from shared.metadata import batch_fetch_metadata
+        from shared.search import search_kpop
+        print("[backend] yt-dlp (no YOUTUBE_API_KEY set)")
+    return batch_fetch_metadata, search_kpop
+
+
+def pick_clip(*args, **kwargs):
+    # Heatmap options are bound when its module loads, after CLI configuration.
+    from render.heatmap import pick_clip as pick
+    return pick(*args, **kwargs)
 
 
 def _fmt_secs(s):
@@ -88,6 +82,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
         clean_csv_titles(DATA_FILE)
         return
 
+    batch_fetch_metadata, search_fn = _select_backend()
     style = load_style(STYLE_FILE)
     # How long the CSV retains a fixed views baseline for the overlay
     # "views gained" delta. Set per chart in data/charts.yaml
@@ -97,7 +92,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
     if chart_name:
         from charts import compute_chart, load_definition
         from shared.title_cleaner import clean_titles as clean_titles_fn
-        csv_path = os.path.join("data", "charts", f"{chart_name}.csv")
+        csv_path = config.CHARTS_DIR / f"{chart_name}.csv"
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
         views_delta_days = load_definition(chart_name).get("views_delta_days")
         print(f'Computing chart "{chart_name}"...\n')
@@ -152,7 +147,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
         from shared.title_cleaner import clean_titles as clean_titles_fn
         search_limit = limit or 20
         print(f'Searching YouTube: "{search}" (fetching top {search_limit})...\n')
-        results = _search_fn(search, limit=search_limit, filter_mv=not no_filter)
+        results = search_fn(search, limit=search_limit, filter_mv=not no_filter)
         if not results:
             print("No search results returned. Exiting.")
             return
@@ -224,7 +219,7 @@ def run_pipeline(search=None, limit=None, no_filter=False,
     fps = style.get("canvas", {}).get("fps", 30)
     # Floor for raw-clip upgrades: at least MIN_RAW_HEIGHT, and never below
     # the canvas so a 1440p style doesn't upscale a 1080p (or 360p) source.
-    min_raw_height = max(MIN_RAW_HEIGHT, ch)
+    min_raw_height = max(encoding.MIN_RAW_HEIGHT, ch)
 
     def _download(song):
         if shutdown.requested():

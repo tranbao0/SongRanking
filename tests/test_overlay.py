@@ -9,6 +9,7 @@ invisible in a diff but is still a rendering change.
 """
 
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from . import context  # noqa: F401  (puts src/ on sys.path)
@@ -72,13 +73,13 @@ class BuildOverlayImageTest(unittest.TestCase):
     """
 
     def setUp(self):
-        self.style = overlay.load_style("assets/templates/style.json")
+        self.style = overlay.load_style()
 
     def _render(self, **kwargs):
         params = dict(
             rank=6, title="Supernova", artist="aespa", peak=6,
             release_date="2024.05.13", months_on_chart=8, views=109_584_467,
-            entry_type="new_entry", views_gained=1_234_567, rank_change="—",
+            entry_type="new_entry", views_gained=1_234_567, rank_change="\u2014",
         )
         params.update(kwargs)
         return overlay.build_overlay_image(self.style, **params)
@@ -106,11 +107,6 @@ class BuildOverlayImageTest(unittest.TestCase):
 
 
 class ResolveFontPathTest(unittest.TestCase):
-    """
-    style.json pins Windows Malgun Gothic. Linux/macOS must pick an
-    installed Hangul font instead of raising OSError on the missing path.
-    """
-
     def setUp(self):
         overlay._resolve_font_path.cache_clear()
         overlay._font.cache_clear()
@@ -143,6 +139,19 @@ class ResolveFontPathTest(unittest.TestCase):
 
         with mock.patch("render.overlay.os.path.exists", side_effect=exists):
             self.assertEqual(overlay._resolve_font_path(configured), nanum_regular)
+
+    def test_bundled_faces_render_hangul_without_system_fonts(self):
+        fonts = context._SRC.parent / "assets" / "fonts"
+        with mock.patch("render.overlay.os.path.exists",
+                        side_effect=lambda path: Path(path).parent == fonts and Path(path).is_file()):
+            for configured, face in (("malgunbd.ttf", "Bold"), ("malgun.ttf", "Regular")):
+                with self.subTest(face=face):
+                    path = "C:/Windows/Fonts/" + configured
+                    self.assertEqual(Path(overlay._resolve_font_path(path)),
+                                     fonts / f"NanumGothic-{face}.ttf")
+                    font = overlay._font(path, 32)
+                    self.assertIsNotNone(font.getmask("한").getbbox())
+                    self.assertNotEqual(bytes(font.getmask("한")), bytes(font.getmask("글")))
 
     def test_returns_original_path_when_no_fallback_is_installed(self):
         configured = "C:/Windows/Fonts/malgunbd.ttf"

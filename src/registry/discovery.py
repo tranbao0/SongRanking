@@ -33,8 +33,9 @@ import yaml
 
 from registry import db
 from registry.providers import wikidata
+from shared import config
 
-CHANNELS_DIR = Path(__file__).parent.parent.parent / "data" / "channels"
+CHANNELS_DIR = config.CHANNELS_DIR
 
 KNOWN_GENRES = sorted(wikidata.GENRE_QIDS)
 

@@ -5,21 +5,23 @@ the orchestration logic (main run flow) isn't tangled with subprocess/ffmpeg
 plumbing.
 """
 
-import subprocess
 import os
 import re
+import subprocess
+import sys
 import threading
 
 from render.overlay import (
     build_overlay_image, build_song_filter_complex, build_transition_filter_complex,
 )
+from shared import config, ytdlp_throttle
 from shared.youtube_api import extract_video_id
 from shared.ytdlp_throttle import (
-    download_fallback_clients, quality_upgrade_clients, DOWNLOAD_ATTEMPT_TIMEOUT,
+    download_fallback_clients, quality_upgrade_clients,
     throttle, cookie_args, ytdlp_cmd, pot_extractor_args,
 )
 
-CLIPS_DIR = "assets/clips"
+CLIPS_DIR = str(config.CLIPS_DIR)
 
 # Raw clips are cached here permanently, keyed by video ID rather than by
 # chart rank (which shifts run to run) - so a song still on the chart next
@@ -29,16 +31,25 @@ CLIPS_DIR = "assets/clips"
 # `{video_id}_{height}p.mp4` (legacy `{video_id}.mp4` is still accepted and
 # renamed on touch). Never evicted: a 15s clip is small even at thousands
 # of songs.
-RAW_CACHE_DIR = f"{CLIPS_DIR}/raw"
+RAW_CACHE_DIR = str(config.RAW_CACHE_DIR)
+
+_print_lock = threading.Lock()
+
 
 # Floor for raw-clip video height. Below this, ensure_raw_quality retries
 # with quality-preserving clients (never android - that caps at ~360p) and
 # keeps the taller file if one lands. Override with YTDLP_MIN_RAW_HEIGHT;
 # pipeline also passes the style canvas height so a 1440p canvas raises the
 # floor automatically. Default 1440 matches the 2560x1440 style canvas.
-MIN_RAW_HEIGHT = int(os.environ.get("YTDLP_MIN_RAW_HEIGHT", "1440"))
+def __getattr__(name):
+    if name == "DOWNLOAD_ATTEMPT_TIMEOUT":
+        return ytdlp_throttle.DOWNLOAD_ATTEMPT_TIMEOUT
+    if name == "MIN_RAW_HEIGHT":
+        return config.ytdlp_min_raw_height()
+    raise AttributeError(name)
 
-_print_lock = threading.Lock()
+
+_module = sys.modules[__name__]
 
 
 def _log(msg):
@@ -442,6 +453,7 @@ def _download_section(url, dest, window_start, window_end, extra_args, *, seed_d
     postchecks, returncode is forced to 1. When seed_duration_for is set
     and the attempt is good, that path's duration memo is updated.
     """
+    timeout = _module.DOWNLOAD_ATTEMPT_TIMEOUT
     throttle()
     try:
         result = subprocess.run(ytdlp_cmd(
@@ -467,7 +479,7 @@ def _download_section(url, dest, window_start, window_end, extra_args, *, seed_d
             "-o", dest,
             url,
         ), capture_output=True, text=True, encoding="utf-8", errors="replace",
-           timeout=DOWNLOAD_ATTEMPT_TIMEOUT)
+           timeout=timeout)
     except subprocess.TimeoutExpired as e:
         # Soft-fail into the next fallback client instead of letting one
         # hung negotiation pin a download worker for minutes.
@@ -478,7 +490,7 @@ def _download_section(url, dest, window_start, window_end, extra_args, *, seed_d
             list(e.cmd or []), returncode=1,
             stdout="",
             stderr=raw_err + (
-                f"\n(timeout) yt-dlp exceeded {DOWNLOAD_ATTEMPT_TIMEOUT:.0f}s "
+                f"\n(timeout) yt-dlp exceeded {timeout:.0f}s "
                 "- treating as a failed attempt"
             ),
         )
@@ -512,7 +524,7 @@ def ensure_raw_quality(rank, url, start, end, raw_clip, min_height=None):
     without re-rolling the heatmap. Returns the canonical height-named path.
     """
     if min_height is None:
-        min_height = MIN_RAW_HEIGHT
+        min_height = _module.MIN_RAW_HEIGHT
     video_id = extract_video_id(url)
     write_raw_window(raw_clip, start, end)
 

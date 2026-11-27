@@ -20,14 +20,14 @@ docstring) - it doesn't belong in a chart until it's grouped.
 """
 
 from datetime import date, datetime, timedelta
-from pathlib import Path
 
 import yaml
 
 from registry import db, snapshot
+from shared import config
 from shared.dates import months_since
 
-CHARTS_FILE = Path(__file__).parent.parent / "data" / "charts.yaml"
+CHARTS_FILE = config.CHARTS_FILE
 
 
 def load_definition(name: str) -> dict:

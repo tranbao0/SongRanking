@@ -3,6 +3,7 @@ assets/clips/*.mp4
 *.mp4
 
 # Local data caches and databases
+data/*.sql
 data/*.db
 data/*.db.bak
 data/*.db-wal

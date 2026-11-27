@@ -8,13 +8,22 @@ it would make a network call - the goal is that `python -m unittest` is
 always safe to run mid-sync.
 """
 
+import atexit
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
+
+
+from shared import api_budget
+
+_usage_directory = tempfile.TemporaryDirectory()
+atexit.register(_usage_directory.cleanup)
+api_budget.USAGE_FILE = Path(_usage_directory.name) / ".api_usage.json"
 
 
 class KeepOpenConnection(sqlite3.Connection):
