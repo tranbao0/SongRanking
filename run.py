@@ -45,11 +45,11 @@ import time
 import argparse
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 from render.pipeline import run_pipeline
-from shared import shutdown
+from shared import config, shutdown
 
-_YT_DLP_CHECK_CACHE = Path("data/.yt_dlp_update_check.json")
+_YT_DLP_CHECK_CACHE = config.YT_DLP_CHECK_CACHE
 _YT_DLP_CHECK_INTERVAL = 24 * 60 * 60  # re-check at most once/day
 
 
@@ -105,6 +105,8 @@ def warn_if_pot_provider_down():
 
 
 def main():
+    config.load_env()
+    config.configure_console()
     parser = argparse.ArgumentParser(
         description="SongRanking command runner",
         formatter_class=argparse.RawDescriptionHelpFormatter,

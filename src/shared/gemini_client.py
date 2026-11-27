@@ -9,7 +9,6 @@ Used by title_cleaner.py (title/artist cleanup) and song_grouping.py
 otherwise different prompt/response shape.
 """
 
-import os
 import random
 import threading
 import time
@@ -25,13 +24,7 @@ try:
 except ImportError:
     genai_errors = None
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
-from shared import api_budget
+from shared import api_budget, config
 
 # Interactions API model id (Aug 2026). 3.6 Flash matches 3.5 Flash on
 # input price ($1.50/1M) but is cheaper on output including thinking
@@ -129,7 +122,7 @@ def is_available() -> bool:
     global _UNAVAILABLE_REPORTED
     if not _SDK_AVAILABLE:
         reason = "'google-genai' package not installed"
-    elif not os.environ.get("GEMINI_API_KEY", "").strip():
+    elif not config.gemini_api_key():
         reason = "GEMINI_API_KEY not set"
     else:
         return True
@@ -218,7 +211,7 @@ def call_gemini(
         print("  [gemini_client] 'google-genai' package not installed - skipping AI call.")
         return None
 
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    api_key = config.gemini_api_key()
     if not api_key:
         print("  [gemini_client] GEMINI_API_KEY not set - skipping AI call.")
         return None

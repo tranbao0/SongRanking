@@ -709,7 +709,9 @@ def group_channel_videos(
     # AI tier to do, and building prompts only to discard them would cost a
     # pass over every remaining title plus a log line per chunk.
     chunks = (
-        chunked(singles) if use_ai and gemini_client.is_available() else []
+        chunked(singles)
+        if use_ai and (call_gemini is not gemini_client.call_gemini or gemini_client.is_available())
+        else []
     )
     if chunks:
         # Even a single chunk is a real network call that can retry with

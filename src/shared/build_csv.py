@@ -17,8 +17,13 @@ import json
 import csv
 import sys
 import os
+from pathlib import Path
+
+if __name__ == "__main__" and not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from render.chart_state import DATA_FILE as OUTPUT_FILE, FIELDNAMES
+from shared import config
 from shared.ytdlp_throttle import ytdlp_cmd
 
 
@@ -94,6 +99,8 @@ def prompt_song_details(rank_default, title, artist, url):
 
 
 def main():
+    config.load_env()
+    config.configure_console()
     args = sys.argv[1:]
     append_mode = "--append" in args
     if append_mode:
@@ -109,7 +116,7 @@ def main():
         print("No URLs provided. Pass them as arguments or pipe via stdin.")
         sys.exit(1)
 
-    os.makedirs("data", exist_ok=True)
+    Path(OUTPUT_FILE).parent.mkdir(parents=True, exist_ok=True)
 
     # Determine starting rank (continue from existing CSV if appending)
     next_rank = 1

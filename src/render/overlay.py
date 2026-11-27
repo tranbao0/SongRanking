@@ -1,25 +1,26 @@
 import json
 import os
+import sys
 import unicodedata
 from functools import lru_cache
+from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 
-def load_style(path="assets/templates/style.json"):
+if __name__ == "__main__" and not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from shared import config
+
+
+def load_style(path=config.STYLE_FILE):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
-# style.json pins Windows Malgun Gothic paths (the machine this project is
-# authored on). Those paths don't exist on Linux/macOS, so on any other OS
-# the configured font is transparently swapped for the first installed
-# Hangul-capable font found below - the overlay draws Korean titles with
-# Pillow precisely because it needs a Hangul font, so a Latin-only default
-# would render tofu boxes. The configured path always wins when it opens,
-# leaving the authoring machine's behavior unchanged.
 _FALLBACK_FONTS = (
-    # (bold, regular) pairs, in preference order. First existing pair wins.
+    # (bold, regular) pairs, in preference order. First existing face wins.
     ("/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
      "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"),
     ("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
@@ -38,9 +39,8 @@ def _looks_bold(path):
 @lru_cache(maxsize=None)
 def _resolve_font_path(path):
     """
-    Return `path` when it can actually be opened as a font; otherwise fall
-    back to an installed Hangul-capable font (bold or regular, matched to
-    the requested face). Cached so the fallback probe runs once per path.
+    Prefer the configured face, then an installed Hangul face, then the
+    bundled Hangul face. Cache the result for each configured path.
     """
     if os.path.exists(path):
         return path
@@ -49,7 +49,8 @@ def _resolve_font_path(path):
         candidate = bold_path if bold else regular_path
         if os.path.exists(candidate):
             return candidate
-    return path  # nothing better available - let the original error surface
+    bundled = config.BUNDLED_FONT_BOLD if bold else config.BUNDLED_FONT_REGULAR
+    return str(bundled) if os.path.exists(bundled) else path
 
 
 @lru_cache(maxsize=None)
@@ -527,9 +528,10 @@ if __name__ == "__main__":
         style,
         rank=6, title="설탕 허니 아이스티", artist="BABYMONSTER",
         peak=6, release_date="2023.06.08", months_on_chart=8, views=109_584_467,
-        entry_type="new_entry", views_gained=1_234_567, rank_change="—",
+        entry_type="new_entry", views_gained=1_234_567, rank_change="\u2014",
     )
     canvas = Image.new("RGB", img.size, (30, 30, 30))
     canvas.paste(img, (0, 0), img)
-    canvas.save("assets/templates/_preview.png")
-    print("Saved assets/templates/_preview.png")
+    preview_path = config.TEMPLATES_DIR / "_preview.png"
+    canvas.save(preview_path)
+    print(f"Saved {preview_path}")

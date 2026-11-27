@@ -53,24 +53,29 @@ repo is unambiguously the single source of truth. `python run.py pull`/
 `push` no longer take an --override flag; see run.py.
 """
 
-import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-from shared import shutdown
+from shared import config, shutdown
 
-DATA_REPO_URL = os.environ.get("REGISTRY_DATA_REPO_URL")
 
-LOCAL_WORKING_DB_PATH = Path(__file__).parent.parent.parent / "data" / ".registry_working.db"
+def __getattr__(name):
+    if name == "DATA_REPO_URL":
+        return config.registry_data_repo_url()
+    raise AttributeError(name)
+
+
+LOCAL_WORKING_DB_PATH = config.LOCAL_WORKING_DB_PATH
 
 # The data repo's local checkout - its own separate git repository, not
 # tracked by this one (see .gitignore). Persists between runs so a pull
 # is normally an incremental `git pull`, not a fresh clone.
-DATA_REPO_PATH = Path(__file__).parent.parent.parent / "data" / ".registry-data"
+DATA_REPO_PATH = config.DATA_REPO_PATH
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS channels (
@@ -261,7 +266,8 @@ def _sync_data_repo() -> None:
     the checkout (or the single-writer assumption was violated), which
     should surface as an error here rather than silently merge.
     """
-    if not DATA_REPO_URL:
+    data_repo_url = sys.modules[__name__].DATA_REPO_URL
+    if not data_repo_url:
         raise EnvironmentError(
             "REGISTRY_DATA_REPO_URL is not set. Add it to .env - see README's "
             "\"Git-synced registry database\" section."
@@ -270,7 +276,7 @@ def _sync_data_repo() -> None:
         _run_git("pull", "--ff-only", cwd=DATA_REPO_PATH)
     else:
         DATA_REPO_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _run_git("clone", DATA_REPO_URL, str(DATA_REPO_PATH), cwd=DATA_REPO_PATH.parent)
+        _run_git("clone", data_repo_url, str(DATA_REPO_PATH), cwd=DATA_REPO_PATH.parent)
 
 
 def _sql_literal(value) -> str:

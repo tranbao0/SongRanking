@@ -9,9 +9,10 @@ import csv
 import os
 from datetime import date, datetime
 
+from shared import config
 from shared.dates import months_since
 
-DATA_FILE = "data/songs.csv"
+DATA_FILE = str(config.SONGS_CSV)
 FIELDNAMES = [
     "rank", "title", "artist", "url", "peak",
     "is_new_entry", "start", "end", "years_on_chart", "release_date",

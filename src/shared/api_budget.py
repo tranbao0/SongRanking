@@ -7,35 +7,20 @@ exceeded rather than letting a real 403/429 happen mid-run.
 """
 
 import json
-import os
+import sys
 import threading
 from datetime import date
 from pathlib import Path
 
-USAGE_FILE = Path(__file__).parent.parent.parent / "data" / ".api_usage.json"
+from shared import config
+
+USAGE_FILE = config.USAGE_FILE
 
 # batch_fetch_metadata (youtube_api.py) records usage from multiple
 # worker threads concurrently - without this, two threads could both
 # read the same count, increment it, and write back, silently losing one
 # thread's usage from the budget.
 _LOCK = threading.Lock()
-
-# Matches the YouTube Data API's standard free-tier daily quota.
-YOUTUBE_DAILY_QUOTA = int(os.environ.get("YOUTUBE_DAILY_QUOTA", 10000))
-
-# A spend guard, not an estimate of any tier's rate limit. Gemini bills
-# per token, so requests aren't what costs money directly - but a request
-# cap is a blunt circuit-breaker that bounds a runaway loop, and on a
-# small prepaid balance that is the failure worth insuring against.
-#
-# Sized to sit under a typical Gemini API free-tier RPD for Flash models
-# (~100-250 depending on project; check AI Studio). Set GEMINI_DAILY_LIMIT
-# in .env (see .env.example) - that is the intended knob. The 100 below is
-# only a fallback when the env var is unset. Regroup hands leftovers to the
-# CLI agent instead of Gemini, so a sync that stops early loses little.
-# Raise the env var if your AI Studio RPD is higher and incremental syncs
-# are stopping before you want them to.
-GEMINI_DAILY_LIMIT = int(os.environ.get("GEMINI_DAILY_LIMIT", 100))
 
 WARN_THRESHOLD = 0.8
 STOP_THRESHOLD = 0.95
@@ -45,12 +30,27 @@ class QuotaExceededError(Exception):
     """Raised before a call would push usage past STOP_THRESHOLD of budget."""
 
 
-def _load() -> dict:
+_SETTINGS = {
+    "YOUTUBE_DAILY_QUOTA": config.youtube_daily_quota,
+    "GEMINI_DAILY_LIMIT": config.gemini_daily_limit,
+}
+
+
+def __getattr__(name):
+    if name in _SETTINGS:
+        return _SETTINGS[name]()
+    raise AttributeError(name)
+
+
+_module = sys.modules[__name__]
+
+
+def _load(usage_file: Path) -> dict:
     today = date.today().isoformat()
     data = {}
-    if USAGE_FILE.exists():
+    if usage_file.exists():
         try:
-            data = json.loads(USAGE_FILE.read_text(encoding="utf-8"))
+            data = json.loads(usage_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             data = {}
     if data.get("date") != today:
@@ -58,14 +58,15 @@ def _load() -> dict:
     return data
 
 
-def _save(data: dict) -> None:
-    USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    USAGE_FILE.write_text(json.dumps(data), encoding="utf-8")
+def _save(data: dict, usage_file: Path) -> None:
+    usage_file.parent.mkdir(parents=True, exist_ok=True)
+    usage_file.write_text(json.dumps(data), encoding="utf-8")
 
 
-def _record(key: str, amount: int, limit: int, api_name: str) -> None:
+def _record(key: str, amount: int, limit: int, api_name: str, usage_file: Path | None) -> None:
+    path = USAGE_FILE if usage_file is None else usage_file
     with _LOCK:
-        data = _load()
+        data = _load(path)
         previous = data.get(key, 0)
         projected = previous + amount
         ratio = projected / limit
@@ -83,7 +84,7 @@ def _record(key: str, amount: int, limit: int, api_name: str) -> None:
             )
 
         data[key] = projected
-        _save(data)
+        _save(data, path)
 
         # Edge-triggered (only the call that crosses the threshold prints),
         # not level-triggered - otherwise every call for the rest of the day
@@ -92,11 +93,11 @@ def _record(key: str, amount: int, limit: int, api_name: str) -> None:
             print(f"[api_budget] WARNING: {api_name} usage at {projected}/{limit} ({ratio:.0%})")
 
 
-def record_youtube_units(n: int) -> None:
+def record_youtube_units(n: int, *, usage_file: Path | None = None) -> None:
     """Call after every YouTube Data API .execute() with that call's unit cost."""
-    _record("youtube_units", n, YOUTUBE_DAILY_QUOTA, "YouTube Data API")
+    _record("youtube_units", n, _module.YOUTUBE_DAILY_QUOTA, "YouTube Data API", usage_file)
 
 
-def record_gemini_request() -> None:
+def record_gemini_request(*, usage_file: Path | None = None) -> None:
     """Call once per Gemini API request."""
-    _record("gemini_requests", 1, GEMINI_DAILY_LIMIT, "Gemini API")
+    _record("gemini_requests", 1, _module.GEMINI_DAILY_LIMIT, "Gemini API", usage_file)

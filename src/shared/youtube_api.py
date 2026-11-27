@@ -20,19 +20,12 @@ Setup:
 """
 
 import concurrent.futures
-import os
 import re
 from datetime import date, datetime
 
-from shared import api_budget
+from shared import api_budget, config
 from shared.dates import months_since
 from shared.mv_filter import is_valid_mv
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
 
 # Published quota costs. A search is 100x a list - the whole reason the
 # registry is built from channel walks rather than per-artist searches.
@@ -55,7 +48,7 @@ def get_client():
     """
     from googleapiclient.discovery import build  # type: ignore
 
-    api_key = os.environ.get("YOUTUBE_API_KEY", "").strip()
+    api_key = config.youtube_api_key()
     if not api_key:
         raise EnvironmentError("YOUTUBE_API_KEY is not set. Add it to .env.")
     return build("youtube", "v3", developerKey=api_key)
